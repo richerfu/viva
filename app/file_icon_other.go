@@ -1,5 +1,5 @@
-//go:build !darwin
+//go:build !viva_custom_backend && !darwin
 
 package app
 
-func nativeFileIcon(string, int) ([]byte, error) { return nil, ErrUnsupported }
+func defaultNativeFileIcon(string, int) ([]byte, error) { return nil, ErrUnsupported }

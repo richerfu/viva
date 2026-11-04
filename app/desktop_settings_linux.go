@@ -11,7 +11,7 @@ import (
 // change of the desktop's fonts makes it measure again, a change of the preference for reduced
 // motion reaches its transitions, and the window is redrawn. It costs nothing until the
 // desktop says something changed.
-func watchDesktopSettings(canvas *ui.Canvas, waker *platform.Waker) (stop func()) {
+func defaultWatchDesktopSettings(canvas *ui.Canvas, waker *platform.Waker) (stop func()) {
 	platform.SetDesktopObserver(func(changed platform.DesktopSetting) {
 		if changed&platform.SettingMotion != 0 {
 			canvas.SetReduceMotion(nativeReduceMotion())

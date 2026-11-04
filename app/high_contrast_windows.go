@@ -1,7 +1,7 @@
-//go:build windows
+//go:build !viva_custom_backend && windows
 
 package app
 
 import windowsplatform "github.com/vivaui/viva/internal/platform/windows"
 
-func nativeHighContrast() bool { return windowsplatform.HighContrast() }
+func defaultNativeHighContrast() bool { return windowsplatform.HighContrast() }

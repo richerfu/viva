@@ -1,4 +1,4 @@
-//go:build linux && !vivagtk
+//go:build linux && !viva_custom_backend && !vivagtk
 
 package app
 
@@ -7,7 +7,7 @@ import (
 	linuxplatform "github.com/vivaui/viva/internal/platform/linux"
 )
 
-func runNative(config platform.Config) error { return linuxplatform.Run(config) }
-func runNativeApplication(start platform.ApplicationStart) error {
+func defaultRunNative(config platform.Config) error { return linuxplatform.Run(config) }
+func defaultRunNativeApplication(start platform.ApplicationStart) error {
 	return linuxplatform.RunApplication(start)
 }

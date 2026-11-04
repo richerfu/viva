@@ -1,4 +1,4 @@
-//go:build !darwin && !windows && !linux
+//go:build !viva_custom_backend && !darwin && !windows && !linux
 
 package app
 

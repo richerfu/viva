@@ -1,4 +1,4 @@
-//go:build !windows && !darwin && !linux && !(js && wasm)
+//go:build !viva_custom_backend && !windows && !darwin && !linux && !(js && wasm)
 
 package app
 
@@ -8,35 +8,35 @@ import (
 	"github.com/vivaui/viva/ui"
 )
 
-func nativeReduceMotion() bool                                 { return false }
-func nativeTextEngine() ui.TextEngine                          { return nil }
-func nativePreferredLanguages() []string                       { return languagesFromEnvironment(os.Getenv) }
-func nativeClipboardText() (string, error)                     { return "", ErrUnsupported }
-func nativeSetClipboardText(string) error                      { return ErrUnsupported }
-func nativeHasClipboardImage() bool                            { return false }
-func nativeClipboardImagePNG() ([]byte, error)                 { return nil, ErrUnsupported }
-func nativeOnClipboardChange(func()) error                     { return ErrUnsupported }
-func nativeSetCursor(Cursor) error                             { return ErrUnsupported }
-func nativeSetCursorImage(*ui.CursorImage) error               { return ErrUnsupported }
-func nativeOpenFiles(OpenFileOptions) ([]string, error)        { return nil, ErrUnsupported }
-func nativeOpenDirectory(OpenDirectoryOptions) (string, error) { return "", ErrUnsupported }
-func nativeSaveFile(SaveFileOptions) (string, error)           { return "", ErrUnsupported }
-func nativeOpenURL(string) error                               { return ErrUnsupported }
-func nativePlaySystemSound(SystemSound) error                  { return ErrUnsupported }
-func nativeSendNotification(Notification) error                { return ErrUnsupported }
-func nativeStoreSecret(string, string, []byte) error           { return ErrSecretStoreUnavailable }
-func nativeLoadSecret(string, string) ([]byte, error)          { return nil, ErrSecretStoreUnavailable }
-func nativeDeleteSecret(string, string) error                  { return ErrSecretStoreUnavailable }
+func defaultNativeReduceMotion() bool                                 { return false }
+func defaultNativeTextEngine() ui.TextEngine                          { return nil }
+func defaultNativePreferredLanguages() []string                       { return languagesFromEnvironment(os.Getenv) }
+func defaultNativeClipboardText() (string, error)                     { return "", ErrUnsupported }
+func defaultNativeSetClipboardText(string) error                      { return ErrUnsupported }
+func defaultNativeHasClipboardImage() bool                            { return false }
+func defaultNativeClipboardImagePNG() ([]byte, error)                 { return nil, ErrUnsupported }
+func defaultNativeOnClipboardChange(func()) error                     { return ErrUnsupported }
+func defaultNativeSetCursor(Cursor) error                             { return ErrUnsupported }
+func defaultNativeSetCursorImage(*ui.CursorImage) error               { return ErrUnsupported }
+func defaultNativeOpenFiles(OpenFileOptions) ([]string, error)        { return nil, ErrUnsupported }
+func defaultNativeOpenDirectory(OpenDirectoryOptions) (string, error) { return "", ErrUnsupported }
+func defaultNativeSaveFile(SaveFileOptions) (string, error)           { return "", ErrUnsupported }
+func defaultNativeOpenURL(string) error                               { return ErrUnsupported }
+func defaultNativePlaySystemSound(SystemSound) error                  { return ErrUnsupported }
+func defaultNativeSendNotification(Notification) error                { return ErrUnsupported }
+func defaultNativeStoreSecret(string, string, []byte) error           { return ErrSecretStoreUnavailable }
+func defaultNativeLoadSecret(string, string) ([]byte, error)          { return nil, ErrSecretStoreUnavailable }
+func defaultNativeDeleteSecret(string, string) error                  { return ErrSecretStoreUnavailable }
 
-func nativeEnableCrashDumps(string) (string, error) { return "", ErrUnsupported }
+func defaultNativeEnableCrashDumps(string) (string, error) { return "", ErrUnsupported }
 
-func nativeShowFatalError(string, string) {}
+func defaultNativeShowFatalError(string, string) {}
 
-func nativeMonospaceFamilies() []string { return nil }
-func nativeFontFamilies() []string      { return nil }
+func defaultNativeMonospaceFamilies() []string { return nil }
+func defaultNativeFontFamilies() []string      { return nil }
 
-func nativeAppearance() Appearance { return AppearanceUnknown }
+func defaultNativeAppearance() Appearance { return AppearanceUnknown }
 
-func nativeWatchAppearance() {}
+func defaultNativeWatchAppearance() {}
 
-func nativeSetAppearance(Appearance) {}
+func defaultNativeSetAppearance(Appearance) {}

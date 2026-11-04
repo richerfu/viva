@@ -1,4 +1,4 @@
-//go:build darwin
+//go:build !viva_custom_backend && darwin
 
 package app
 
@@ -10,36 +10,36 @@ import (
 	"github.com/vivaui/viva/ui"
 )
 
-func nativeClipboardText() (string, error) { return darwinplatform.ClipboardText() }
+func defaultNativeClipboardText() (string, error) { return darwinplatform.ClipboardText() }
 
-func nativeHasClipboardImage() bool { return darwinplatform.HasClipboardImage() }
+func defaultNativeHasClipboardImage() bool { return darwinplatform.HasClipboardImage() }
 
-func nativeClipboardImagePNG() ([]byte, error) { return darwinplatform.ClipboardImagePNG() }
+func defaultNativeClipboardImagePNG() ([]byte, error) { return darwinplatform.ClipboardImagePNG() }
 
-func nativeReduceMotion() bool { return darwinplatform.ReduceMotion() }
+func defaultNativeReduceMotion() bool { return darwinplatform.ReduceMotion() }
 
 // nativeTextEngine is the platform's text engine; nil keeps the reference metrics.
-func nativeTextEngine() ui.TextEngine { return darwinplatform.SharedTextEngine() }
+func defaultNativeTextEngine() ui.TextEngine { return darwinplatform.SharedTextEngine() }
 
-func nativePreferredLanguages() []string { return darwinplatform.PreferredLanguages() }
+func defaultNativePreferredLanguages() []string { return darwinplatform.PreferredLanguages() }
 
-func nativeOnClipboardChange(notify func()) error {
+func defaultNativeOnClipboardChange(notify func()) error {
 	return darwinplatform.OnClipboardChange(notify)
 }
 
-func nativeSetClipboardText(value string) error {
+func defaultNativeSetClipboardText(value string) error {
 	return darwinplatform.SetClipboardText(value)
 }
 
-func nativeSetCursor(cursor Cursor) error {
+func defaultNativeSetCursor(cursor Cursor) error {
 	return darwinplatform.SetCursorShape(uint8(cursor))
 }
 
-func nativeSetCursorImage(image *ui.CursorImage) error {
+func defaultNativeSetCursorImage(image *ui.CursorImage) error {
 	return darwinplatform.SetCursorImage(image)
 }
 
-func nativeOpenFiles(options OpenFileOptions) ([]string, error) {
+func defaultNativeOpenFiles(options OpenFileOptions) ([]string, error) {
 	filters := make([]darwinplatform.FileFilter, len(options.Filters))
 	for index, filter := range options.Filters {
 		filters[index] = darwinplatform.FileFilter{Name: filter.Name, Pattern: filter.Pattern}
@@ -53,7 +53,7 @@ func nativeOpenFiles(options OpenFileOptions) ([]string, error) {
 	return paths, err
 }
 
-func nativeOpenDirectory(options OpenDirectoryOptions) (string, error) {
+func defaultNativeOpenDirectory(options OpenDirectoryOptions) (string, error) {
 	path, canceled, err := darwinplatform.OpenDirectory(darwinplatform.OpenDirectoryOptions{Title: options.Title})
 	if canceled {
 		return "", ErrCanceled
@@ -61,7 +61,7 @@ func nativeOpenDirectory(options OpenDirectoryOptions) (string, error) {
 	return path, err
 }
 
-func nativeSaveFile(options SaveFileOptions) (string, error) {
+func defaultNativeSaveFile(options SaveFileOptions) (string, error) {
 	filters := make([]darwinplatform.FileFilter, len(options.Filters))
 	for index, filter := range options.Filters {
 		filters[index] = darwinplatform.FileFilter{Name: filter.Name, Pattern: filter.Pattern}
@@ -76,17 +76,17 @@ func nativeSaveFile(options SaveFileOptions) (string, error) {
 	return path, err
 }
 
-func nativeOpenURL(target string) error { return darwinplatform.OpenURL(target) }
+func defaultNativeOpenURL(target string) error { return darwinplatform.OpenURL(target) }
 
-func nativeOpenWith(executable, path string) error {
+func defaultNativeOpenWith(executable, path string) error {
 	return darwinplatform.OpenWith(executable, path)
 }
 
-func nativePlaySystemSound(sound SystemSound) error {
+func defaultNativePlaySystemSound(sound SystemSound) error {
 	return darwinplatform.PlaySystemSound(uint8(sound))
 }
 
-func nativeSendNotification(notification Notification) error {
+func defaultNativeSendNotification(notification Notification) error {
 	return darwinNotificationError(darwinplatform.SendNotification(notification.Title, notification.Body))
 }
 
@@ -97,35 +97,37 @@ func darwinNotificationError(err error) error {
 	return err
 }
 
-func nativeStoreSecret(service, account string, secret []byte) error {
+func defaultNativeStoreSecret(service, account string, secret []byte) error {
 	return secretError(darwinplatform.StoreSecret(service, account, secret))
 }
 
-func nativeLoadSecret(service, account string) ([]byte, error) {
+func defaultNativeLoadSecret(service, account string) ([]byte, error) {
 	secret, err := darwinplatform.LoadSecret(service, account)
 	return secret, secretError(err)
 }
 
-func nativeDeleteSecret(service, account string) error {
+func defaultNativeDeleteSecret(service, account string) error {
 	return secretError(darwinplatform.DeleteSecret(service, account))
 }
 
-func nativeEnableCrashDumps(string) (string, error) { return "", ErrUnsupported }
+func defaultNativeEnableCrashDumps(string) (string, error) { return "", ErrUnsupported }
 
-func nativeShowFatalError(title, message string) { darwinplatform.ShowFatalError(title, message) }
+func defaultNativeShowFatalError(title, message string) {
+	darwinplatform.ShowFatalError(title, message)
+}
 
-func nativeMonospaceFamilies() []string { return darwinplatform.MonospaceFamilies() }
-func nativeFontFamilies() []string      { return darwinplatform.FontFamilies() }
+func defaultNativeMonospaceFamilies() []string { return darwinplatform.MonospaceFamilies() }
+func defaultNativeFontFamilies() []string      { return darwinplatform.FontFamilies() }
 
-func nativeAppearance() Appearance {
+func defaultNativeAppearance() Appearance {
 	if darwinplatform.DarkAppearance() {
 		return AppearanceDark
 	}
 	return AppearanceLight
 }
 
-func nativeWatchAppearance() { darwinplatform.WatchAppearance() }
+func defaultNativeWatchAppearance() { darwinplatform.WatchAppearance() }
 
-func nativeSetAppearance(appearance Appearance) {
+func defaultNativeSetAppearance(appearance Appearance) {
 	darwinplatform.SetAppearance(appearance == AppearanceLight, appearance == AppearanceDark)
 }

@@ -1,4 +1,4 @@
-//go:build windows
+//go:build !viva_custom_backend && windows
 
 package headless
 

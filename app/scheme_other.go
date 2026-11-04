@@ -1,7 +1,7 @@
-//go:build !darwin && !windows && !linux
+//go:build !viva_custom_backend && !darwin && !windows && !linux
 
 package app
 
-func nativeSchemeHandlerAvailable(string) (bool, error) { return false, ErrUnsupported }
+func defaultNativeSchemeHandlerAvailable(string) (bool, error) { return false, ErrUnsupported }
 
 func driverSchemeHandler(string) (available, handled bool) { return false, false }

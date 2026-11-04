@@ -1,4 +1,4 @@
-//go:build !darwin && !windows && !linux && !(js && wasm)
+//go:build !viva_custom_backend && !darwin && !windows && !linux && !(js && wasm)
 
 package app
 

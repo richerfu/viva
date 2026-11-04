@@ -1,4 +1,4 @@
-//go:build !vivadev && (darwin || windows || linux)
+//go:build !vivadev && (darwin || windows || linux || viva_custom_backend)
 
 package app
 

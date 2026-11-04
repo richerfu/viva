@@ -1,4 +1,4 @@
-//go:build js && wasm
+//go:build !viva_custom_backend && js && wasm
 
 package app
 

@@ -189,6 +189,9 @@ WebAssembly backend; its visual direction and measured costs are recorded in
 
 ## Documentation website
 
+External platform hosts can use the [custom backend contracts](docs/custom-backends.md)
+while keeping the normal controls, painter and application APIs.
+
 [vivaui.dev](https://vivaui.dev/en/) is the public site, in English and Chinese:
 guides whose code blocks are files under `examples/guides/` that `go test` builds
 and drives headlessly, an API reference generated from the Go source, and a page

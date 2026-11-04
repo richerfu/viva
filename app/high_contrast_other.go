@@ -1,5 +1,5 @@
-//go:build !windows
+//go:build !viva_custom_backend && !windows
 
 package app
 
-func nativeHighContrast() bool { return false }
+func defaultNativeHighContrast() bool { return false }

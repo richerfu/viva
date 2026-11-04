@@ -1,4 +1,4 @@
-//go:build linux
+//go:build !viva_custom_backend && linux
 
 package app
 

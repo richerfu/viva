@@ -1,4 +1,4 @@
-//go:build js && wasm
+//go:build !viva_custom_backend && js && wasm
 
 package app
 
@@ -10,66 +10,66 @@ import (
 	"github.com/vivaui/viva/ui"
 )
 
-func nativeReduceMotion() bool { return false }
+func defaultNativeReduceMotion() bool { return false }
 
 // nativeTextEngine is the platform's text engine; nil keeps the reference metrics.
-func nativeTextEngine() ui.TextEngine { return nil }
+func defaultNativeTextEngine() ui.TextEngine { return nil }
 
-func nativePreferredLanguages() []string { return webplatform.PreferredLanguages() }
+func defaultNativePreferredLanguages() []string { return webplatform.PreferredLanguages() }
 
-func nativeClipboardText() (string, error) {
+func defaultNativeClipboardText() (string, error) {
 	value, err := webplatform.ClipboardText()
 	return value, webSystemError("read clipboard", err)
 }
 
-func nativeOnClipboardChange(notify func()) error {
+func defaultNativeOnClipboardChange(notify func()) error {
 	if notify == nil {
 		return nil
 	}
 	return webSystemError("watch clipboard", webplatform.ErrUnavailable)
 }
 
-func nativeSetClipboardText(value string) error {
+func defaultNativeSetClipboardText(value string) error {
 	return webSystemError("set clipboard", webplatform.SetClipboardText(value))
 }
 
-func nativeHasClipboardImage() bool { return false }
+func defaultNativeHasClipboardImage() bool { return false }
 
-func nativeClipboardImagePNG() ([]byte, error) {
+func defaultNativeClipboardImagePNG() ([]byte, error) {
 	return nil, webSystemError("read clipboard image", webplatform.ClipboardImagePNG())
 }
 
-func nativeSetCursor(cursor Cursor) error {
+func defaultNativeSetCursor(cursor Cursor) error {
 	return webSystemError("set cursor", webplatform.SetCursorShape(uint8(cursor)))
 }
 
-func nativeSetCursorImage(image *ui.CursorImage) error {
+func defaultNativeSetCursorImage(image *ui.CursorImage) error {
 	return webSystemError("set cursor image", webplatform.SetCursorImage(image))
 }
 
-func nativeOpenFiles(OpenFileOptions) ([]string, error) {
+func defaultNativeOpenFiles(OpenFileOptions) ([]string, error) {
 	paths, err := webplatform.OpenFiles()
 	return paths, webSystemError("open files", err)
 }
 
-func nativeOpenDirectory(OpenDirectoryOptions) (string, error) {
+func defaultNativeOpenDirectory(OpenDirectoryOptions) (string, error) {
 	return "", ErrUnsupported
 }
 
-func nativeSaveFile(SaveFileOptions) (string, error) {
+func defaultNativeSaveFile(SaveFileOptions) (string, error) {
 	path, err := webplatform.SaveFile()
 	return path, webSystemError("save file", err)
 }
 
-func nativeOpenURL(target string) error {
+func defaultNativeOpenURL(target string) error {
 	return webSystemError("open external URL", webplatform.OpenURL(target))
 }
 
-func nativePlaySystemSound(sound SystemSound) error {
+func defaultNativePlaySystemSound(sound SystemSound) error {
 	return webSystemError("play system sound", webplatform.PlaySystemSound(uint8(sound)))
 }
 
-func nativeSendNotification(notification Notification) error {
+func defaultNativeSendNotification(notification Notification) error {
 	return webSystemError("send notification", webplatform.SendNotification(notification.Title, notification.Body))
 }
 
@@ -92,20 +92,20 @@ func webSystemError(action string, err error) error {
 }
 
 // A browser has no store for credentials that is not the page's own storage.
-func nativeStoreSecret(string, string, []byte) error  { return ErrSecretStoreUnavailable }
-func nativeLoadSecret(string, string) ([]byte, error) { return nil, ErrSecretStoreUnavailable }
-func nativeDeleteSecret(string, string) error         { return ErrSecretStoreUnavailable }
+func defaultNativeStoreSecret(string, string, []byte) error  { return ErrSecretStoreUnavailable }
+func defaultNativeLoadSecret(string, string) ([]byte, error) { return nil, ErrSecretStoreUnavailable }
+func defaultNativeDeleteSecret(string, string) error         { return ErrSecretStoreUnavailable }
 
 // A page cannot list the fonts of the machine it runs on.
-func nativeEnableCrashDumps(string) (string, error) { return "", ErrUnsupported }
+func defaultNativeEnableCrashDumps(string) (string, error) { return "", ErrUnsupported }
 
-func nativeShowFatalError(string, string) {}
+func defaultNativeShowFatalError(string, string) {}
 
-func nativeMonospaceFamilies() []string { return nil }
-func nativeFontFamilies() []string      { return nil }
+func defaultNativeMonospaceFamilies() []string { return nil }
+func defaultNativeFontFamilies() []string      { return nil }
 
-func nativeAppearance() Appearance { return appearanceOf(webplatform.DarkAppearance()) }
+func defaultNativeAppearance() Appearance { return appearanceOf(webplatform.DarkAppearance()) }
 
-func nativeWatchAppearance() { webplatform.WatchAppearance() }
+func defaultNativeWatchAppearance() { webplatform.WatchAppearance() }
 
-func nativeSetAppearance(Appearance) {}
+func defaultNativeSetAppearance(Appearance) {}

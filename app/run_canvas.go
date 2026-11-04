@@ -1,4 +1,4 @@
-//go:build darwin || windows || linux
+//go:build darwin || windows || linux || viva_custom_backend
 
 package app
 
@@ -41,14 +41,34 @@ func RunCanvas(config Config, canvas *ui.Canvas) error {
 		return err
 	}
 	painter.setClipboardText = func(value string) { _ = nativeSetClipboardText(value) }
-	painter.setCursor = nativeSetCursor
+	painter.setCursor = optionalNativeCursor
 	painter.setCursorImage = nativeSetCursorImage
 	native, frames := nativeWindowConfig(&normalized, painter)
-	if frames != nil {
-		defer frames.stop()
+	stopWatching := watchDesktopSettings(canvas, native.Waker)
+	var cleanupOnce sync.Once
+	cleanup := func() {
+		cleanupOnce.Do(func() {
+			if frames != nil {
+				frames.stop()
+			}
+			stopWatching()
+		})
 	}
-	defer watchDesktopSettings(canvas, native.Waker)()
-	return runNative(native)
+	closed := native.OnClosed
+	native.OnClosed = func() {
+		cleanup()
+		if closed != nil {
+			closed()
+		}
+	}
+	if !externallyDriven() {
+		defer cleanup()
+	}
+	err = runNative(native)
+	if err != nil {
+		cleanup()
+	}
+	return err
 }
 
 // frameChangeHandler adapts the application's frame callback to the platform's.
@@ -200,7 +220,7 @@ func prepareNativeWindow(config Config, canvas *ui.Canvas) (platform.Config, fun
 		return platform.Config{}, nil, err
 	}
 	painter.setClipboardText = func(value string) { _ = nativeSetClipboardText(value) }
-	painter.setCursor = nativeSetCursor
+	painter.setCursor = optionalNativeCursor
 	painter.setCursorImage = nativeSetCursorImage
 	native, timer := nativeWindowConfig(&normalized, painter)
 	frames = timer

@@ -1,4 +1,4 @@
-//go:build darwin || windows || linux
+//go:build darwin || windows || linux || viva_custom_backend
 
 package headless
 
