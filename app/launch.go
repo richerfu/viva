@@ -27,6 +27,15 @@ type Autostart struct {
 // Windows. Nothing runs until the next login. It records the path of the
 // running executable, so a program that moves must call it again.
 func SetAutostart(entry Autostart, enabled bool) error {
+	if err := autostart.ValidateID(entry.ID); err != nil {
+		return err
+	}
+	if err := autostart.ValidateArgs(entry.Args); err != nil {
+		return err
+	}
+	if handled, err := backendSetAutostart(entry, enabled); handled {
+		return err
+	}
 	executable, err := os.Executable()
 	if err != nil {
 		return err
@@ -35,7 +44,15 @@ func SetAutostart(entry Autostart, enabled bool) error {
 }
 
 // AutostartEnabled reports whether an entry with the id is installed.
-func AutostartEnabled(id string) (bool, error) { return autostart.Enabled(id) }
+func AutostartEnabled(id string) (bool, error) {
+	if err := autostart.ValidateID(id); err != nil {
+		return false, err
+	}
+	if enabled, handled, err := backendAutostartEnabled(id); handled {
+		return enabled, err
+	}
+	return autostart.Enabled(id)
+}
 
 // openURLHost is what a Host implements to receive links the system opens the
 // application with.

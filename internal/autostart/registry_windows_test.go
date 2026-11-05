@@ -1,3 +1,5 @@
+//go:build !viva_custom_backend && windows
+
 package autostart
 
 import "testing"

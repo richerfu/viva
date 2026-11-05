@@ -1,12 +1,8 @@
-//go:build darwin
+//go:build !viva_custom_backend && darwin
 
 package app
 
-// controlsDrawnByViva is false on macOS: the system draws the traffic lights.
-const controlsDrawnByViva = false
+// platformDrawsWindowControls is false on macOS: the system draws the traffic lights.
+func platformDrawsWindowControls() bool { return false }
 
-// TitlebarInsets is how much of a WindowCustomTitlebar's strip the system or Viva
-// covers with window buttons: leading at the start of the strip, trailing at its
-// end, in logical pixels. An application keeps its own content clear of both.
-// On macOS the traffic lights are the system's, at the leading end.
-func TitlebarInsets() (leading, trailing float32) { return 70, 0 }
+func platformTitlebarInsets() (leading, trailing float32) { return 70, 0 }

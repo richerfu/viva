@@ -1,4 +1,4 @@
-//go:build darwin || linux
+//go:build !viva_custom_backend && (darwin || linux)
 
 package autostart
 
