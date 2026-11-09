@@ -1,4 +1,4 @@
-//go:build darwin
+//go:build !viva_custom_backend && darwin
 
 package headless
 

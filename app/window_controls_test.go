@@ -338,8 +338,8 @@ func TestWindowButtonsDoNothingUntilTheAdapterFillsItsActions(t *testing.T) {
 func TestWindowActionsExistOnlyWhereVivaDrawsTheButtons(t *testing.T) {
 	var canvas ui.Canvas
 	painter := newTestPainter(t, &canvas, Config{Title: "plain", Width: 100, Height: 100, WindowMode: WindowCustomTitlebar})
-	if (painter.windowActions() != nil) != controlsDrawnByViva {
-		t.Fatalf("actions %v, controlsDrawnByViva %t", painter.windowActions(), controlsDrawnByViva)
+	if (painter.windowActions() != nil) != drawsWindowControls() {
+		t.Fatalf("actions %v, drawsWindowControls() %t", painter.windowActions(), drawsWindowControls())
 	}
 	painter = newTestPainter(t, &canvas, Config{Title: "titled", Width: 100, Height: 100})
 	if painter.windowActions() != nil {

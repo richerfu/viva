@@ -1,4 +1,4 @@
-//go:build darwin || windows || linux
+//go:build darwin || windows || linux || viva_custom_backend
 
 // Package singleinstance keeps an application to one running copy per user.
 // It is separate from package app because it uses a local socket and the net

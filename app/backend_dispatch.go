@@ -5,6 +5,27 @@ import (
 	"github.com/vivaui/viva/ui"
 )
 
+func backendSetAutostart(entry Autostart, enabled bool) (bool, error) {
+	if b := selectedBackend(); b != nil {
+		if f := b.Services().SetAutostart; f != nil {
+			return true, f(entry, enabled)
+		}
+		return true, ErrUnsupported
+	}
+	return false, nil
+}
+
+func backendAutostartEnabled(id string) (bool, bool, error) {
+	if b := selectedBackend(); b != nil {
+		if f := b.Services().AutostartEnabled; f != nil {
+			enabled, err := f(id)
+			return enabled, true, err
+		}
+		return false, true, ErrUnsupported
+	}
+	return false, false, nil
+}
+
 func nativeReduceMotion() bool {
 	if b := selectedBackend(); b != nil {
 		if f := b.Services().ReduceMotion; f != nil {

@@ -26,19 +26,32 @@ type Entry struct {
 	Args       []string
 }
 
-func (entry Entry) validate() error {
-	if entry.ID == "" || strings.Trim(entry.ID, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-_") != "" {
-		return fmt.Errorf("autostart: invalid id %q", entry.ID)
+// ValidateID checks the identifier before dispatching to a login-start service.
+func ValidateID(id string) error {
+	if id == "" || strings.Trim(id, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-_") != "" {
+		return fmt.Errorf("autostart: invalid id %q", id)
 	}
-	if entry.Executable == "" {
-		return errors.New("autostart: an executable is required")
-	}
-	for _, text := range append([]string{entry.Executable}, entry.Args...) {
-		if strings.ContainsAny(text, "\x00\r\n") {
+	return nil
+}
+
+// ValidateArgs checks command arguments before dispatching to a login-start service.
+func ValidateArgs(args []string) error {
+	for _, arg := range args {
+		if strings.ContainsAny(arg, "\x00\r\n") {
 			return errors.New("autostart: the command contains a control character")
 		}
 	}
 	return nil
+}
+
+func (entry Entry) validate() error {
+	if err := ValidateID(entry.ID); err != nil {
+		return err
+	}
+	if entry.Executable == "" {
+		return errors.New("autostart: an executable is required")
+	}
+	return ValidateArgs(append([]string{entry.Executable}, entry.Args...))
 }
 
 // Set turns starting at login on or off for the entry.
@@ -54,7 +67,7 @@ func Set(entry Entry, enabled bool) error {
 
 // Enabled reports whether an entry with the id is installed.
 func Enabled(id string) (bool, error) {
-	if err := (Entry{ID: id, Executable: "x"}).validate(); err != nil {
+	if err := ValidateID(id); err != nil {
 		return false, err
 	}
 	return enabled(id)

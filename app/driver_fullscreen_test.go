@@ -153,7 +153,7 @@ func TestFullscreenRemovesFrameworkButtonsAndMoveSemantics(t *testing.T) {
 	if driver.PressAt(100, 20) == PressMove || driver.PressAt(100, 20) == PressMoveOnDrag {
 		t.Fatal("fullscreen titlebar retained move semantics")
 	}
-	if controlsDrawnByViva {
+	if drawsWindowControls() {
 		if _, ok := driver.HitTest(driver.Frame().Width-20, 20); ok {
 			t.Fatal("framework caption button remains interactive in fullscreen")
 		}
@@ -164,7 +164,7 @@ func TestFullscreenRemovesFrameworkButtonsAndMoveSemantics(t *testing.T) {
 	if driver.PressAt(100, 20) != PressMove {
 		t.Fatal("normal titlebar did not regain move semantics")
 	}
-	if controlsDrawnByViva {
+	if drawsWindowControls() {
 		if _, ok := driver.HitTest(driver.Frame().Width-20, 20); !ok {
 			t.Fatal("framework caption controls did not return after fullscreen")
 		}

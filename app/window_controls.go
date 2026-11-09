@@ -13,6 +13,29 @@ import (
 // Config.TitlebarHeight.
 const WindowControlWidth = platform.WindowControlWidth
 
+func drawsWindowControls() bool {
+	if b := selectedBackend(); b != nil {
+		if f := b.Services().DrawsWindowControls; f != nil {
+			return f()
+		}
+		return false
+	}
+	return platformDrawsWindowControls()
+}
+
+// TitlebarInsets is how much of a WindowCustomTitlebar's strip the system or Viva
+// covers with window buttons: leading at the start of the strip, trailing at its
+// end, in logical pixels. An application keeps its own content clear of both.
+func TitlebarInsets() (leading, trailing float32) {
+	if b := selectedBackend(); b != nil {
+		if f := b.Services().TitlebarInsets; f != nil {
+			return f()
+		}
+		return 0, 0
+	}
+	return platformTitlebarInsets()
+}
+
 // windowControlsLayer is above every layer an application uses, so the buttons
 // stay in view and clickable under a dialog: a window can be closed or minimized
 // whatever it is showing.

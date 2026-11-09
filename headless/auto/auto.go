@@ -1,4 +1,4 @@
-//go:build darwin || windows || linux
+//go:build darwin || windows || linux || viva_custom_backend
 
 // Package auto, imported for its effect, makes an application's RunCanvas serve
 // the headless line protocol instead of opening a window whenever the process

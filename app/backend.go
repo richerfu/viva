@@ -51,6 +51,8 @@ type BackendServices struct {
 	OpenWith               func(executable, path string) error
 	PlaySystemSound        func(sound SystemSound) error
 	SendNotification       func(notification Notification) error
+	SetAutostart           func(entry Autostart, enabled bool) error
+	AutostartEnabled       func(id string) (bool, error)
 	StoreSecret            func(service, account string, secret []byte) error
 	LoadSecret             func(service, account string) ([]byte, error)
 	DeleteSecret           func(service, account string) error
@@ -67,6 +69,10 @@ type BackendServices struct {
 	FileIcon               func(path string, pixels int) ([]byte, error)
 	HighContrast           func() bool
 	WatchSettings          func(func(BackendSetting)) func()
+	// DrawsWindowControls reports whether Viva should draw custom-titlebar buttons.
+	// A missing callback leaves them to the host; absent TitlebarInsets returns zero.
+	DrawsWindowControls func() bool
+	TitlebarInsets      func() (leading, trailing float32)
 }
 
 var installedBackend struct {

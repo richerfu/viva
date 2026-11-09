@@ -174,7 +174,7 @@ func newPainterWithClock(canvas *ui.Canvas, config *Config, clock func() time.Du
 		regions:       make([]input.Region, 0, len(canvas.Hits())+1),
 	}
 	painter.onTextEvent = painter.applyTextEvent
-	if config.WindowMode == WindowCustomTitlebar && controlsDrawnByViva {
+	if config.WindowMode == WindowCustomTitlebar && drawsWindowControls() {
 		painter.controls = newWindowControls(config)
 	}
 	if _, err := painter.publish(); err != nil {
