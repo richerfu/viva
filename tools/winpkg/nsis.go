@@ -3,6 +3,7 @@ package winpkg
 import (
 	"errors"
 	"fmt"
+	"path"
 	"regexp"
 	"strconv"
 	"strings"
@@ -45,6 +46,10 @@ type Script struct {
 	// the program for their extensions under "Open with", and passes the file's
 	// path as the argument.
 	FileTypes []FileType
+	// Files are shipped beside the program: native runtimes and helpers the
+	// program loads at runtime. They are installed under Destination and removed
+	// with the program.
+	Files []ExtraFile
 }
 
 // FileType is one kind of document: a description and its extensions without
@@ -122,6 +127,10 @@ func (script Script) Generate() ([]byte, error) {
 			}
 		}
 	}
+	files, err := checkedExtraFiles(script.Files)
+	if err != nil {
+		return nil, err
+	}
 	scope := script.Scope
 	if scope == "" {
 		scope = ScopeUser
@@ -166,6 +175,10 @@ func (script Script) Generate() ([]byte, error) {
 	line("Unicode true")
 	line("SetCompressor /SOLID lzma")
 	line("ManifestDPIAware true")
+	// The WinVer checks read GetVersionEx, which Windows 8.1 and later fake to
+	// 6.2 unless the manifest names the running version. Naming every version
+	// the installer can run on keeps ${AtLeastWin10} true on Windows 10.
+	line("ManifestSupportedOS Win7 Win8 Win8.1 Win10")
 	line("")
 	line(`!define APP_NAME "%s"`, fields["name"])
 	line(`!define APP_VERSION "%s"`, fields["version"])
@@ -177,9 +190,11 @@ func (script Script) Generate() ([]byte, error) {
 	line(`!define APP_EXE "%s"`, fields["executable"])
 	line(`!define APP_ICON "%s"`, iconFile)
 	line(`!define UNINSTALL_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP_ID}"`)
+	line(`!define APP_CAPABILITIES "Software\${APP_ID}\Capabilities"`)
 	line("")
 	line(`!include "MUI2.nsh"`)
 	line(`!include "LogicLib.nsh"`)
+	line(`!include "WinVer.nsh"`)
 	line(`!include "x64.nsh"`)
 	line(`!include "Sections.nsh"`)
 	line("")
@@ -220,6 +235,11 @@ func (script Script) Generate() ([]byte, error) {
 		line(`LangString NEEDS_ARCH ${LANG_ENGLISH} "This ${APP_NAME} is built for Windows on ARM64."`)
 		line(`LangString NEEDS_ARCH ${LANG_SIMPCHINESE} "此 ${APP_NAME} 适用于 ARM64 版 Windows。"`)
 	}
+	// Every Viva program is built with a Go runtime that needs Windows 10 or
+	// Windows Server 2016, so the program would crash before it could log or
+	// show a message on an older system. Stop at the installer instead.
+	line(`LangString NEEDS_WINDOWS ${LANG_ENGLISH} "${APP_NAME} needs Windows 10 or Windows Server 2016 or later."`)
+	line(`LangString NEEDS_WINDOWS ${LANG_SIMPCHINESE} "${APP_NAME} 需要 Windows 10 或 Windows Server 2016 或更高版本。"`)
 	line("")
 	line(`VIProductVersion "%s"`, numeric)
 	line(`VIFileVersion "%s"`, numeric)
@@ -235,6 +255,13 @@ func (script Script) Generate() ([]byte, error) {
 
 	// The installer and the uninstaller each need their own copy of this
 	// function, and a macro keeps the two the same.
+	//
+	// Windows refuses to delete or overwrite the image of a running program but
+	// does allow renaming it: the process keeps running the old image and the
+	// next launch gets the new one. Asking the user would end a silent install
+	// (/S), where the message box answers itself with cancel, and any process
+	// that outlives its window (an agent's MCP server, say) would block every
+	// update, so move the file aside first and only ask when even that failed.
 	line(`!macro EnsureClosed un`)
 	line(`Function ${un}EnsureClosed`)
 	line(`  retry:`)
@@ -246,6 +273,16 @@ func (script Script) Generate() ([]byte, error) {
 	line(`  ${IfNot} ${Errors}`)
 	line(`    Return`)
 	line(`  ${EndIf}`)
+	line(`  ; A running image can be renamed but not deleted, so move it aside.`)
+	line(`  Push $1`)
+	line(`  System::Call 'kernel32::GetTickCount()i .r1'`)
+	line(`  ClearErrors`)
+	line(`  Rename "$INSTDIR\${APP_EXE}" "$INSTDIR\${APP_EXE}.$1.old"`)
+	line(`  ${IfNot} ${Errors}`)
+	line(`    Pop $1`)
+	line(`    Return`)
+	line(`  ${EndIf}`)
+	line(`  Pop $1`)
 	line(`  MessageBox MB_RETRYCANCEL|MB_ICONEXCLAMATION "$(CLOSE_APP)" /SD IDCANCEL IDRETRY retry`)
 	line(`  Abort`)
 	line(`FunctionEnd`)
@@ -274,6 +311,10 @@ func (script Script) Generate() ([]byte, error) {
 	line("")
 
 	line(`Function .onInit`)
+	line(`  ${IfNot} ${AtLeastWin10}`)
+	line(`    MessageBox MB_OK|MB_ICONSTOP "$(NEEDS_WINDOWS)" /SD IDOK`)
+	line(`    Abort`)
+	line(`  ${EndIf}`)
 	if script.Arch == "amd64" {
 		line(`  ${IfNot} ${RunningX64}`)
 	} else {
@@ -315,6 +356,9 @@ func (script Script) Generate() ([]byte, error) {
 	line(`Section "${APP_NAME}" SecMain`)
 	line(`  SectionIn RO`)
 	line(`  Call EnsureClosed`)
+	line(`  ; What an earlier update moved aside goes once nothing holds it.`)
+	line(`  ClearErrors`)
+	line(`  Delete "$INSTDIR\${APP_EXE}.*.old"`)
 	line(`  SetOutPath "$INSTDIR"`)
 	line(`  ; The program's modification time would otherwise be stored in the installer`)
 	line(`  ; and make every build of the same program differ.`)
@@ -325,6 +369,24 @@ func (script Script) Generate() ([]byte, error) {
 		line(`  CreateShortcut "$SMPROGRAMS\${APP_NAME}.lnk" "$INSTDIR\${APP_EXE}" "" "$INSTDIR\${APP_ICON}"`)
 	} else {
 		line(`  CreateShortcut "$SMPROGRAMS\${APP_NAME}.lnk" "$INSTDIR\${APP_EXE}"`)
+	}
+	if len(files) > 0 {
+		line(`  ; Native files the program loads at runtime.`)
+	}
+	for _, file := range files {
+		source, err := text("file", file.Source)
+		if err != nil {
+			return nil, err
+		}
+		directory := `$INSTDIR`
+		if parent := path.Dir(file.Destination); parent != "." {
+			directory += `\` + strings.ReplaceAll(parent, "/", `\`)
+		}
+		line(`  SetOutPath "%s"`, directory)
+		line(`  File "/oname=%s" "%s"`, path.Base(file.Destination), source)
+	}
+	if len(files) > 0 {
+		line(`  SetOutPath "$INSTDIR"`)
 	}
 	line(`  WriteUninstaller "$INSTDIR\Uninstall.exe"`)
 	line(`  WriteRegStr %s "${UNINSTALL_KEY}" "DisplayName" "${APP_NAME}"`, root)
@@ -350,6 +412,17 @@ func (script Script) Generate() ([]byte, error) {
 		line(`  WriteRegStr %s "%s\DefaultIcon" "" '"$INSTDIR\${APP_EXE}",0'`, root, key)
 		line(`  WriteRegStr %s "%s\shell\open\command" "" '"$INSTDIR\${APP_EXE}" "%%1"'`, root, key)
 	}
+	if len(script.FileTypes) > 0 {
+		appKey := `Software\Classes\Applications\${APP_EXE}`
+		line(`  WriteRegStr %s "%s" "FriendlyAppName" "${APP_NAME}"`, root, appKey)
+		line(`  WriteRegStr %s "%s" "ApplicationCompany" "${APP_PUBLISHER}"`, root, appKey)
+		line(`  WriteRegStr %s "%s\DefaultIcon" "" '"$INSTDIR\${APP_EXE}",0'`, root, appKey)
+		line(`  WriteRegStr %s "%s\shell\open\command" "" '"$INSTDIR\${APP_EXE}" "%%1"'`, root, appKey)
+		line(`  WriteRegStr %s "${APP_CAPABILITIES}" "ApplicationName" "${APP_NAME}"`, root)
+		line(`  WriteRegStr %s "${APP_CAPABILITIES}" "ApplicationDescription" "${APP_NAME}"`, root)
+		line(`  WriteRegStr %s "${APP_CAPABILITIES}" "ApplicationIcon" '"$INSTDIR\${APP_EXE}",0'`, root)
+		line(`  WriteRegStr %s "Software\RegisteredApplications" "${APP_ID}" "${APP_CAPABILITIES}"`, root)
+	}
 	for _, kind := range script.FileTypes {
 		name, err := text("file type", kind.Name)
 		if err != nil {
@@ -358,10 +431,13 @@ func (script Script) Generate() ([]byte, error) {
 		progID := script.ID + "." + kind.Extensions[0]
 		key := `Software\Classes\` + progID
 		line(`  WriteRegStr %s "%s" "" "%s"`, root, key, name)
+		line(`  WriteRegStr %s "%s" "FriendlyTypeName" "%s"`, root, key, name)
 		line(`  WriteRegStr %s "%s\DefaultIcon" "" '"$INSTDIR\${APP_EXE}",0'`, root, key)
 		line(`  WriteRegStr %s "%s\shell\open\command" "" '"$INSTDIR\${APP_EXE}" "%%1"'`, root, key)
 		for _, extension := range kind.Extensions {
+			line(`  WriteRegStr %s "Software\Classes\Applications\${APP_EXE}\SupportedTypes" ".%s" ""`, root, extension)
 			line(`  WriteRegStr %s "Software\Classes\.%s\OpenWithProgids" "%s" ""`, root, extension, progID)
+			line(`  WriteRegStr %s "${APP_CAPABILITIES}\FileAssociations" ".%s" "%s"`, root, extension, progID)
 		}
 	}
 	if len(script.FileTypes) > 0 || len(script.URLSchemes) > 0 {
@@ -376,9 +452,17 @@ func (script Script) Generate() ([]byte, error) {
 	// leaves it empty.
 	line(`Section "Uninstall"`)
 	line(`  Call un.EnsureClosed`)
+	line(`  ClearErrors`)
+	line(`  Delete "$INSTDIR\${APP_EXE}.*.old"`)
 	line(`  Delete "$INSTDIR\${APP_EXE}"`)
 	if script.Icon != "" {
 		line(`  Delete "$INSTDIR\${APP_ICON}"`)
+	}
+	for _, file := range files {
+		line(`  Delete "$INSTDIR\%s"`, strings.ReplaceAll(file.Destination, "/", `\`))
+	}
+	for _, directory := range extraDirs(files) {
+		line(`  RMDir "$INSTDIR\%s"`, strings.ReplaceAll(directory, "/", `\`))
 	}
 	line(`  Delete "$SMPROGRAMS\${APP_NAME}.lnk"`)
 	line(`  ReadRegDWORD $0 %s "${UNINSTALL_KEY}" "DesktopShortcut"`, root)
@@ -396,6 +480,11 @@ func (script Script) Generate() ([]byte, error) {
 			line(`  DeleteRegValue %s "Software\Classes\.%s\OpenWithProgids" "%s"`, root, extension, progID)
 		}
 		line(`  DeleteRegKey %s "Software\Classes\%s"`, root, progID)
+	}
+	if len(script.FileTypes) > 0 {
+		line(`  DeleteRegKey %s "Software\Classes\Applications\${APP_EXE}"`, root)
+		line(`  DeleteRegValue %s "Software\RegisteredApplications" "${APP_ID}"`, root)
+		line(`  DeleteRegKey %s "${APP_CAPABILITIES}"`, root)
 	}
 	if len(script.FileTypes) > 0 || len(script.URLSchemes) > 0 {
 		line(`  System::Call 'shell32::SHChangeNotify(i 0x08000000, i 0, p 0, p 0)'`)

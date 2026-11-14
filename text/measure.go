@@ -7,10 +7,15 @@ type Metrics struct {
 	Ascent  float32
 	Descent float32
 	Leading float32
+	// Rule and HeavyRule are the thicknesses, in logical pixels, of the strokes the font
+	// draws with a light and a heavy box drawing line: the weights a fixed-pitch cell
+	// glyph's strokes take. Zero where the platform's measurement does not include them.
+	Rule      float32
+	HeavyRule float32
 }
 
 // MeasureFunc shapes and measures one line at a logical font size and weight
-// (ui.TextStyle.Weight: 0 is regular) with a platform's own text engine: how wide
+// (gfx.TextStyle.Weight: 0 is regular) with a platform's own text engine: how wide
 // the platform would draw it, which is not how wide Viva lays it out (layout uses the
 // reference metrics every platform shares). Tools compare the two.
 type MeasureFunc func(value string, fontSize, weight float32) (Metrics, error)

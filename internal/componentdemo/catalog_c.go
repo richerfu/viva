@@ -1,6 +1,7 @@
 package componentdemo
 
 var groupCComponents = []Component{
+	columnResizeComponent,
 	navigationMenuComponent,
 	paginationComponent,
 	popoverComponent,
@@ -27,5 +28,6 @@ var groupCComponents = []Component{
 	toggleGroupComponent,
 	tooltipComponent,
 	treeComponent,
+	treeNavigationComponent,
 	typographyComponent,
 }

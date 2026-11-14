@@ -5,9 +5,9 @@ import (
 	"unicode/utf16"
 	"unsafe"
 
+	"github.com/vivaui/viva/gfx"
 	"github.com/vivaui/viva/internal/input"
 	"github.com/vivaui/viva/internal/platform"
-	"github.com/vivaui/viva/ui"
 )
 
 const (
@@ -113,6 +113,29 @@ func typedText(char uintptr) string {
 	return string(rune(char))
 }
 
+// modifierTap reports the press or release of a modifier key to the runtime
+// when the application listens for a modifier pressed on its own
+// (platform.Config.ModifierTaps). It only tells the runtime: the message goes
+// on to the text system, the input method and the system menu as before, so
+// nothing about typing or Alt's menu changes. A terminal that asked for the
+// whole keyboard gets the same events from keyDown and keyUp.
+func (state *windowState) modifierTap(first, second uintptr, release bool, mods input.Modifiers) {
+	if !state.config.ModifierTaps || state.config.OnKey == nil || state.imeComposing {
+		return
+	}
+	key := modifierKey(first, second)
+	if key == input.KeyUnknown {
+		return
+	}
+	event := platform.KeyEvent{Key: key, Release: release, Code: keyCode(first, second)}
+	if release {
+		event.Modifiers = mods &^ key.Modifier()
+	} else {
+		event.Modifiers, event.Repeat = mods|key.Modifier(), second&(1<<30) != 0
+	}
+	state.sendKey(event)
+}
+
 // keyDown handles WM_KEYDOWN and WM_SYSKEYDOWN for a terminal that wants
 // presses and releases, and reports whether it consumed the message. A plain
 // space is held for its WM_CHAR like any other character, so the release can
@@ -136,7 +159,14 @@ func (state *windowState) keyDown(first, second uintptr, mods input.Modifiers) b
 		return true
 	}
 	chord := mods&(input.ModifierControl|input.ModifierMeta) != 0
-	if text := shortcutText(first); chord && text != "" {
+	text := shortcutText(first)
+	if chord && text == "" && !altGrHeld() {
+		// A punctuation key names its chord by the character the layout gives
+		// it: Control+minus and Control+comma type no text of their own. AltGr
+		// is left alone, because WM_CHAR delivers the character it types.
+		text = chordKeyText(first, second, false)
+	}
+	if chord && text != "" {
 		state.sendKey(platform.KeyEvent{Modifiers: mods, Repeat: repeat, Code: code, Text: text, Win32: win32Key(first, second, 0, uint16(second&0xffff))})
 		return true
 	}
@@ -175,7 +205,7 @@ func (state *windowState) textKey(first, second uintptr, mods input.Modifiers) b
 	repeat := second&(1<<30) != 0
 	editKey := platform.KeyEvent{Key: normalizedKey(first), Modifiers: mods, Repeat: repeat, Text: shortcutText(first)}
 	if action := platform.TextClipboardAction(editKey); action != 0 {
-		event, changed, err := platform.TextClipboardEvent(state.textState, state.textInput.Secure, action, ClipboardText, SetClipboardText)
+		event, changed, err := platform.TextClipboardEvent(state.textInput.ClipboardState(action), state.textInput.Secure, action, ClipboardText, SetClipboardText)
 		if err != nil {
 			messageBeep.Call(0) // a busy clipboard must not close the window or delete a selection
 		} else if changed {
@@ -210,7 +240,14 @@ func (state *windowState) terminalKeyEvent(first, second uintptr, mods input.Mod
 		return platform.KeyEvent{Key: key, Modifiers: mods, Repeat: repeat, Code: keyCode(first, second), Win32: win32Key(first, second, 0, uint16(second&0xffff))}, true
 	}
 	if mods&(input.ModifierControl|input.ModifierMeta) != 0 && mods&input.ModifierAlt == 0 {
-		if text := shortcutText(first); text != "" {
+		if text := chordKeyText(first, second, false); text != "" {
+			return platform.KeyEvent{Modifiers: mods, Repeat: repeat, Text: text, Code: keyCode(first, second), Win32: win32Key(first, second, 0, uint16(second&0xffff))}, true
+		}
+	}
+	// Alt+printable arrives as WM_SYSCHAR, so the terminal needs the key
+	// here to encode it. Control+Alt can be AltGr and still uses WM_CHAR.
+	if mods&input.ModifierAlt != 0 && mods&(input.ModifierControl|input.ModifierMeta) == 0 && printableKey(first) {
+		if text, ok := baseCharacter(first); ok {
 			return platform.KeyEvent{Modifiers: mods, Repeat: repeat, Text: text, Code: keyCode(first, second), Win32: win32Key(first, second, 0, uint16(second&0xffff))}, true
 		}
 	}
@@ -314,7 +351,7 @@ func win32ControlState(second uintptr) uint16 {
 }
 
 // win32Key is the console INPUT_RECORD identity of one key message.
-func win32Key(first, second uintptr, unicode, repeat uint16) ui.Win32Key {
+func win32Key(first, second uintptr, unicode, repeat uint16) gfx.Win32Key {
 	return win32KeyRecord(first, second, unicode, repeat, unicode == 0 && altGrHeld())
 }
 
@@ -322,7 +359,7 @@ func win32Key(first, second uintptr, unicode, repeat uint16) ui.Win32Key {
 // held for a message that named no character: AltGr types a layout character
 // that WM_CHAR delivers as text, so translating it here as well would hand the
 // terminal that character twice. Named keys keep their console character.
-func win32KeyRecord(first, second uintptr, unicode, repeat uint16, altGr bool) ui.Win32Key {
+func win32KeyRecord(first, second uintptr, unicode, repeat uint16, altGr bool) gfx.Win32Key {
 	scan := uint16((second >> 16) & 0xff)
 	if scan == 0 {
 		scan = uint16(keyCode(first, second) & 0xff)
@@ -340,7 +377,7 @@ func win32KeyRecord(first, second uintptr, unicode, repeat uint16, altGr bool) u
 			unicode = consoleKeyCharacter(first, scan, &keys)
 		}
 	}
-	return ui.Win32Key{
+	return gfx.Win32Key{
 		VirtualKey: uint16(first), ScanCode: scan, Unicode: unicode,
 		ControlState: win32ControlState(second), Repeat: repeat,
 	}

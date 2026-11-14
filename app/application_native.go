@@ -5,14 +5,15 @@ package app
 import (
 	"runtime"
 
+	"github.com/vivaui/viva/gfx"
 	"github.com/vivaui/viva/internal/platform"
-	"github.com/vivaui/viva/ui"
 )
 
 // RunApplication starts the native application loop. start runs once on the
 // locked native event-loop thread and must open at least one window. The call
 // blocks until the final window closes or a platform error terminates the loop.
 func RunApplication(start func(*Application) error) error {
+	attendFaults()
 	if applicationRunner != nil {
 		return applicationRunner(func(host Host) error {
 			application := &Application{host: host}
@@ -43,7 +44,7 @@ func RunApplication(start func(*Application) error) error {
 // nativeHost is the Host over a platform adapter.
 type nativeHost struct{ native platform.Application }
 
-func (host nativeHost) OpenWindow(config Config, canvas *ui.Canvas, closed func()) (WindowControl, error) {
+func (host nativeHost) OpenWindow(config Config, canvas *gfx.Canvas, closed func()) (WindowControl, error) {
 	windowConfig, cleanup, err := prepareNativeWindow(config, canvas)
 	if err != nil {
 		return nil, err
@@ -64,11 +65,25 @@ func (host nativeHost) OpenWindow(config Config, canvas *ui.Canvas, closed func(
 	return window, nil
 }
 
+// CanPreview says whether the adapter's windows can be a DragPreview.
+func (host nativeHost) CanPreview() bool {
+	_, ok := host.native.(interface{ SupportsDragPreview() })
+	return ok
+}
+
 // SetOpenURLHandler passes the handler to adapters whose system delivers links
 // to the running program.
 func (host nativeHost) SetOpenURLHandler(handler func(string)) {
 	if native, ok := host.native.(interface{ SetOpenURLHandler(func(string)) }); ok {
 		native.SetOpenURLHandler(handler)
+	}
+}
+
+// SetOpenFileHandler passes the handler to adapters whose system delivers
+// documents to the running program.
+func (host nativeHost) SetOpenFileHandler(handler func(string)) {
+	if native, ok := host.native.(interface{ SetOpenFileHandler(func(string)) }); ok {
+		native.SetOpenFileHandler(handler)
 	}
 }
 
@@ -110,6 +125,8 @@ func (host nativeHost) AddStatusItem(config StatusItemConfig) (StatusItemControl
 }
 
 func (host nativeHost) SetDockBadge(text string) { host.native.SetDockBadge(text) }
+
+func (host nativeHost) SetProgress(fraction float32) { host.native.SetProgress(fraction) }
 
 func (host nativeHost) Quit() { host.native.Quit() }
 

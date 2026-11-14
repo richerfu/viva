@@ -8,9 +8,10 @@ import (
 	"sync/atomic"
 	"unicode/utf8"
 
+	"github.com/vivaui/viva/gfx"
 	"github.com/vivaui/viva/internal/grapheme"
+	"github.com/vivaui/viva/internal/platform"
 	"github.com/vivaui/viva/internal/textcache"
-	"github.com/vivaui/viva/ui"
 )
 
 // The Linux text engine: every proportional line is shaped once by Pango into a
@@ -20,7 +21,7 @@ import (
 // calls into no library and allocates nothing; the same layout is the one the label is drawn
 // from, so what is measured is what is on screen.
 
-// engineCacheLimit is the number of shaped lines a generation of the cache holds.
+// engineCacheLimit is the line limit of each cache segment (twice as many are kept).
 const engineCacheLimit = 512
 
 // shapedLine is one line as Pango shaped it, at one font size. The size is a logical one
@@ -43,19 +44,20 @@ type shapedLine struct {
 	extents []float32
 }
 
-// textEngine is the ui.TextEngine over Pango. It is safe for concurrent use: the Pango
+// textEngine is the gfx.TextEngine over Pango. It is safe for concurrent use: the Pango
 // context it shapes with is not, so every use of it, including drawing a line, is
 // under mu.
 type textEngine struct {
-	mu        sync.Mutex
-	services  *textServices
-	cache     *textcache.Cache[*shapedLine]
-	reference ui.TextEngine
+	mu          sync.Mutex
+	services    *textServices
+	cache       *textcache.Cache[*shapedLine]
+	italicCache *textcache.Cache[*shapedLine]
+	reference   gfx.TextEngine
 	// family is the family the interface's text is shaped in, "" for the sans
 	// alias, which is the desktop's own interface font. Guarded by mu; a change
 	// forgets the cache.
 	family string
-	// generation moves whenever a line shapes differently from before (ui.FontFamilyAware).
+	// generation moves whenever a line shapes differently from before (gfx.FontFamilyAware).
 	generation atomic.Uint32
 
 	strong, weak, cell pangoRectangle
@@ -66,7 +68,7 @@ func newTextEngine() (*textEngine, error) {
 	if err != nil {
 		return nil, err
 	}
-	engine := &textEngine{services: services, reference: ui.ReferenceTextEngine()}
+	engine := &textEngine{services: services, reference: gfx.ReferenceTextEngine()}
 	engine.cache = textcache.New(engineCacheLimit, engine.release)
 	return engine, nil
 }
@@ -82,6 +84,9 @@ func (engine *textEngine) close() {
 	engine.mu.Lock()
 	defer engine.mu.Unlock()
 	engine.cache.Clear()
+	if engine.italicCache != nil {
+		engine.italicCache.Clear()
+	}
 	engine.services.close()
 }
 
@@ -90,9 +95,27 @@ var systemEngine struct {
 	engine *textEngine
 }
 
-var _ ui.FontFamilyAware = (*textEngine)(nil)
+var _ gfx.FontFamilyAware = (*textEngine)(nil)
+var _ gfx.TextRasterizer = (*textEngine)(nil)
+var _ gfx.MonoCellEngine = (*textEngine)(nil)
 
-// SetFontFamily implements ui.FontFamilyAware: the family the interface's text is
+// RasterizeText implements gfx.TextRasterizer using the same Pango shaped line
+// and Cairo text path as the native label renderer.
+func (engine *textEngine) RasterizeText(value string, style gfx.TextStyle, scale float32, width, height int) (gfx.Bitmap, error) {
+	pixels, err := engine.services.draw(platform.TextLabel{
+		Value: value, FontSize: style.Size, Weight: style.Weight, Italic: style.Italic,
+		Color: platform.Color{
+			Red: float64(style.Color.Red), Green: float64(style.Color.Green),
+			Blue: float64(style.Color.Blue), Alpha: float64(style.Color.Alpha),
+		},
+	}, scale, width, height, false)
+	if err != nil {
+		return gfx.Bitmap{}, err
+	}
+	return gfx.Bitmap{Pix: pixels, Width: width, Height: height, Stride: width * 4}, nil
+}
+
+// SetFontFamily implements gfx.FontFamilyAware: the family the interface's text is
 // shaped in, "" for the desktop's own interface font (Pango's sans alias).
 // Everything shaped with another family is forgotten.
 func (engine *textEngine) SetFontFamily(family string) {
@@ -104,10 +127,32 @@ func (engine *textEngine) SetFontFamily(family string) {
 	}
 	engine.family = family
 	engine.cache.Clear()
+	if engine.italicCache != nil {
+		engine.italicCache.Clear()
+	}
 	engine.generation.Add(1)
 }
 
-// FontGeneration implements ui.FontFamilyAware.
+// MonoCell implements gfx.MonoCellEngine: the cell of the face's own font, which is the
+// cell a terminal is laid out on and stands on.
+func (engine *textEngine) MonoCell(size float32, face gfx.MonoFace) gfx.MonoCellMetrics {
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+	metrics, err := engine.services.configureMonoLayout(monoFamily(face), size)
+	if err != nil {
+		return gfx.MonoCellMetrics{}
+	}
+	return gfx.MonoCellMetrics{
+		Advance:   metrics.Width,
+		Ascent:    metrics.Ascent,
+		Descent:   metrics.Descent,
+		LineGap:   max(metrics.Height-metrics.Ascent-metrics.Descent, 0),
+		Rule:      metrics.Rule,
+		HeavyRule: metrics.HeavyRule,
+	}
+}
+
+// FontGeneration implements gfx.FontFamilyAware.
 func (engine *textEngine) FontGeneration() uint32 { return engine.generation.Load() }
 
 // sharedTextEngine is the process's engine, created when text is first measured or drawn;
@@ -121,8 +166,8 @@ func sharedTextEngine() *textEngine {
 	return systemEngine.engine
 }
 
-// TextEngine is the Linux ui.TextEngine, or nil when the system's Pango is not available.
-func TextEngine() ui.TextEngine {
+// TextEngine is the Linux gfx.TextEngine, or nil when the system's Pango is not available.
+func TextEngine() gfx.TextEngine {
 	if engine := sharedTextEngine(); engine != nil {
 		return engine
 	}
@@ -132,19 +177,34 @@ func TextEngine() ui.TextEngine {
 // lineLocked is the shaped line of value at a font size, shaped now when it has not been. mu
 // is held.
 func (engine *textEngine) lineLocked(value string, size, weight float32) (*shapedLine, error) {
+	return engine.lineStyleLocked(value, size, weight, false)
+}
+
+func (engine *textEngine) lineStyleLocked(value string, size, weight float32, italic bool) (*shapedLine, error) {
+	cache := engine.cache
+	if italic {
+		if engine.italicCache == nil {
+			engine.italicCache = textcache.New(engineCacheLimit, engine.release)
+		}
+		cache = engine.italicCache
+	}
 	key := textcache.Key{Value: value, Size: size, Weight: weight}
-	if line, ok := engine.cache.Get(key); ok {
+	if line, ok := cache.Get(key); ok {
 		return line, nil
 	}
-	line, err := engine.shape(value, size, weight)
+	line, err := engine.shapeStyle(value, size, weight, italic)
 	if err != nil {
 		return nil, err
 	}
-	engine.cache.Put(key, line)
+	cache.Put(key, line)
 	return line, nil
 }
 
 func (engine *textEngine) shape(value string, size, weight float32) (*shapedLine, error) {
+	return engine.shapeStyle(value, size, weight, false)
+}
+
+func (engine *textEngine) shapeStyle(value string, size, weight float32, italic bool) (*shapedLine, error) {
 	services := engine.services
 	if !validFontSize(size) {
 		return nil, fmt.Errorf("linux: invalid font size")
@@ -156,7 +216,7 @@ func (engine *textEngine) shape(value string, size, weight float32) (*shapedLine
 	if family == "" {
 		family = proportionalFamily
 	}
-	description, err := services.description(family, size, weight, false)
+	description, err := services.description(family, size, weight, italic)
 	if err != nil {
 		return nil, err
 	}
@@ -216,7 +276,11 @@ func (engine *textEngine) tablesLocked(line *shapedLine, value string) {
 // shaped is the line of value at the logical size, with its tables, or nil when Pango
 // cannot shape it (the caller then answers with the reference metrics). mu is held.
 func (engine *textEngine) shaped(value string, size, weight float32) *shapedLine {
-	line, err := engine.lineLocked(value, size, weight)
+	return engine.shapedStyle(value, size, weight, false)
+}
+
+func (engine *textEngine) shapedStyle(value string, size, weight float32, italic bool) *shapedLine {
+	line, err := engine.lineStyleLocked(value, size, weight, italic)
 	if err != nil {
 		return nil
 	}
@@ -238,43 +302,55 @@ func (line *shapedLine) boundary(offset int) int {
 	return low
 }
 
-// Width implements ui.TextEngine.
+// Width implements gfx.TextEngine.
 func (engine *textEngine) Width(value string, size, weight float32) float32 {
+	return engine.WidthStyle(value, size, weight, false)
+}
+
+func (engine *textEngine) WidthStyle(value string, size, weight float32, italic bool) float32 {
 	if value == "" {
 		return 0
 	}
 	engine.mu.Lock()
 	defer engine.mu.Unlock()
-	line, err := engine.lineLocked(value, size, weight)
+	line, err := engine.lineStyleLocked(value, size, weight, italic)
 	if err != nil {
 		return engine.reference.Width(value, size, weight)
 	}
 	return line.width
 }
 
-// Caret implements ui.TextEngine.
+// Caret implements gfx.TextEngine.
 func (engine *textEngine) Caret(value string, size, weight float32, offset int) float32 {
+	return engine.CaretStyle(value, size, weight, false, offset)
+}
+
+func (engine *textEngine) CaretStyle(value string, size, weight float32, italic bool, offset int) float32 {
 	if value == "" {
 		return 0
 	}
 	engine.mu.Lock()
 	defer engine.mu.Unlock()
-	line := engine.shaped(value, size, weight)
+	line := engine.shapedStyle(value, size, weight, italic)
 	if line == nil {
 		return engine.reference.Caret(value, size, weight, offset)
 	}
 	return line.carets[line.boundary(max(0, min(offset, len(value))))]
 }
 
-// Selection implements ui.TextEngine: the extents of the characters of [start, end), joined
+// Selection implements gfx.TextEngine: the extents of the characters of [start, end), joined
 // where they touch, left to right.
-func (engine *textEngine) Selection(dst []ui.TextSpan, value string, size, weight float32, start, end int) []ui.TextSpan {
+func (engine *textEngine) Selection(dst []gfx.TextSpan, value string, size, weight float32, start, end int) []gfx.TextSpan {
+	return engine.SelectionStyle(dst, value, size, weight, false, start, end)
+}
+
+func (engine *textEngine) SelectionStyle(dst []gfx.TextSpan, value string, size, weight float32, italic bool, start, end int) []gfx.TextSpan {
 	if value == "" {
-		return append(dst, ui.TextSpan{})
+		return append(dst, gfx.TextSpan{})
 	}
 	engine.mu.Lock()
 	defer engine.mu.Unlock()
-	line := engine.shaped(value, size, weight)
+	line := engine.shapedStyle(value, size, weight, italic)
 	if line == nil {
 		return engine.reference.Selection(dst, value, size, weight, start, end)
 	}
@@ -284,7 +360,7 @@ func (engine *textEngine) Selection(dst []ui.TextSpan, value string, size, weigh
 		first, last = last, first
 	}
 	if first == last {
-		return append(dst, ui.TextSpan{X: line.carets[first]})
+		return append(dst, gfx.TextSpan{X: line.carets[first]})
 	}
 	base := len(dst)
 	for cluster := first; cluster < last; cluster++ {
@@ -301,7 +377,7 @@ func (engine *textEngine) Selection(dst []ui.TextSpan, value string, size, weigh
 			}
 		}
 		if !joined {
-			dst = append(dst, ui.TextSpan{X: left, Width: right - left})
+			dst = append(dst, gfx.TextSpan{X: left, Width: right - left})
 		}
 	}
 	// A cluster can bridge two spans that did not touch before it: join them, then order them.
@@ -328,14 +404,18 @@ func (engine *textEngine) Selection(dst []ui.TextSpan, value string, size, weigh
 	return dst
 }
 
-// OffsetAt implements ui.TextEngine: the cluster boundary whose caret is nearest x.
+// OffsetAt implements gfx.TextEngine: the cluster boundary whose caret is nearest x.
 func (engine *textEngine) OffsetAt(value string, size, weight, x float32) int {
+	return engine.OffsetAtStyle(value, size, weight, false, x)
+}
+
+func (engine *textEngine) OffsetAtStyle(value string, size, weight float32, italic bool, x float32) int {
 	if value == "" {
 		return 0
 	}
 	engine.mu.Lock()
 	defer engine.mu.Unlock()
-	line := engine.shaped(value, size, weight)
+	line := engine.shapedStyle(value, size, weight, italic)
 	if line == nil {
 		return engine.reference.OffsetAt(value, size, weight, x)
 	}

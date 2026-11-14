@@ -4,10 +4,10 @@ import (
 	"errors"
 	"sync"
 
+	"github.com/vivaui/viva/gfx"
 	"github.com/vivaui/viva/internal/platform"
 	"github.com/vivaui/viva/internal/render"
 	"github.com/vivaui/viva/internal/scene"
-	"github.com/vivaui/viva/ui"
 )
 
 // Backend is a native platform implementation. A host installs it before
@@ -17,7 +17,7 @@ import (
 type Backend interface {
 	Run(BackendConfig) error
 	RunApplication(BackendApplicationStart) error
-	TextEngine() ui.TextEngine
+	TextEngine() gfx.TextEngine
 	Services() BackendServices
 }
 
@@ -34,6 +34,14 @@ type HostedBackend interface {
 // Functions run on the backend's serial event-loop thread unless documented
 // otherwise by the corresponding public app API.
 type BackendServices struct {
+	Capabilities           func() Capabilities
+	ClipboardFiles         func() ([]string, error)
+	SetClipboardFiles      func(paths []string) error
+	SetClipboardHTML       func(html, alt string) error
+	SaveFileWithCheckbox   func(options SaveFileOptions, checkbox SaveFileCheckbox) (SaveFileSelection, error)
+	RevealPath             func(path string) error
+	RegisterGlobalShortcut func(s GlobalShortcut, pressed func()) (func(), error)
+
 	RequestClipboardImage  func(func([]byte, error))
 	ReduceMotion           func() bool
 	PreferredLanguages     func() []string
@@ -43,7 +51,7 @@ type BackendServices struct {
 	ClipboardImagePNG      func() ([]byte, error)
 	OnClipboardChange      func(notify func()) error
 	SetCursor              func(cursor Cursor) error
-	SetCursorImage         func(image *ui.CursorImage) error
+	SetCursorImage         func(image *gfx.CursorImage) error
 	OpenFiles              func(options OpenFileOptions) ([]string, error)
 	OpenDirectory          func(options OpenDirectoryOptions) (string, error)
 	SaveFile               func(options SaveFileOptions) (string, error)

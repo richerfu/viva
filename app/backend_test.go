@@ -12,8 +12,8 @@ import (
 	"testing"
 
 	"github.com/vivaui/viva/app"
+	"github.com/vivaui/viva/gfx"
 	"github.com/vivaui/viva/internal/scene"
-	"github.com/vivaui/viva/ui"
 )
 
 type externalBackend struct {
@@ -25,7 +25,7 @@ func (b *externalBackend) Run(c app.BackendConfig) error { return b.run(c) }
 func (*externalBackend) RunApplication(start app.BackendApplicationStart) error {
 	return app.ErrUnsupported
 }
-func (*externalBackend) TextEngine() ui.TextEngine       { return ui.ReferenceTextEngine() }
+func (*externalBackend) TextEngine() gfx.TextEngine      { return gfx.ReferenceTextEngine() }
 func (b *externalBackend) Services() app.BackendServices { return b.services }
 
 func TestExternalBackendReceivesProductionFrames(t *testing.T) {
@@ -49,9 +49,9 @@ func TestExternalBackendReceivesProductionFrames(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = app.UseBackend(nil) })
-	err := app.RunCanvas(app.Config{Width: 320, Height: 240, Paint: func(c *ui.Canvas, s ui.Size) {
-		c.Fill(ui.Rect{Width: s.Width, Height: s.Height}, ui.RGB(20, 30, 40))
-		c.Label("custom backend", ui.Rect{Width: 200, Height: 30}, ui.TextStyle{Size: 16, Color: ui.RGB(255, 255, 255)})
+	err := app.RunCanvas(app.Config{Width: 320, Height: 240, Paint: func(c *gfx.Canvas, s gfx.Size) {
+		c.Fill(gfx.Rect{Width: s.Width, Height: s.Height}, gfx.RGB(20, 30, 40))
+		c.Label("custom backend", gfx.Rect{Width: 200, Height: 30}, gfx.TextStyle{Size: 16, Color: gfx.RGB(255, 255, 255)})
 	}}, nil)
 	if err != nil || frames != 1 {
 		t.Fatalf("custom RunCanvas: frames=%d err=%v", frames, err)
@@ -59,6 +59,11 @@ func TestExternalBackendReceivesProductionFrames(t *testing.T) {
 }
 
 func TestSelectedBackendOwnsServices(t *testing.T) {
+	driver, err := app.NewDriver(app.Config{Width: 100, Height: 100}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(driver.Close)
 	clipboard := "external"
 	b := &externalBackend{services: app.BackendServices{
 		ClipboardText:      func() (string, error) { return clipboard, nil },
@@ -183,7 +188,7 @@ func TestRasterOffscreenTextPlacementClippingAndLayers(t *testing.T) {
 	label := app.BackendTextLabel{
 		Value: "text", X: 0.8, Y: 1, OriginX: 0.2, OriginY: 0.3, Width: 2.2, Height: 1.1,
 		FontSize: 12, Weight: 600, Layer: 1, Color: app.BackendColor{Green: 1, Alpha: 1},
-		Clipped: true, Clip: ui.Rect{X: 1.8, Y: 1, Width: 1, Height: 2},
+		Clipped: true, Clip: gfx.Rect{X: 1.8, Y: 1, Width: 1, Height: 2},
 	}
 	target := newRasterOffscreen(t, app.BackendOffscreenConfig{Width: 6, Height: 4, Scale: 1.5},
 		func(got app.BackendTextLabel, scale float32, width, height int) ([]byte, error) {
@@ -266,13 +271,13 @@ func TestRasterOffscreenActiveTextInput(t *testing.T) {
 	for _, test := range []struct {
 		name   string
 		secure bool
-		mono   ui.MonoFace
+		mono   gfx.MonoFace
 		term   bool
 		value  string
 	}{
 		{name: "plain", value: "a界🙂"},
 		{name: "secure", secure: true, value: "•••"},
-		{name: "mono", mono: ui.MonoClassic, value: "a界🙂"},
+		{name: "mono", mono: gfx.MonoClassic, value: "a界🙂"},
 		{name: "terminal", term: true, value: "a界🙂"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -288,7 +293,7 @@ func TestRasterOffscreenActiveTextInput(t *testing.T) {
 					want := app.BackendTextLabel{
 						Value: test.value, X: 1, Y: 1, Width: 2, Height: 1, FontSize: 12, Weight: 400, Layer: 3,
 						Mono: test.mono != 0 || test.term, MonoFace: test.mono, Color: input.Color,
-						Clipped: true, Clip: ui.Rect{X: 1, Y: 1, Width: 2, Height: 1},
+						Clipped: true, Clip: gfx.Rect{X: 1, Y: 1, Width: 2, Height: 1},
 					}
 					if !reflect.DeepEqual(label, want) || scale != 2 || width != 4 || height != 2 {
 						t.Fatalf("editor label = %+v at %gx, %dx%d; want %+v", label, scale, width, height, want)
@@ -356,10 +361,10 @@ func TestRasterOffscreenNativeViewHoles(t *testing.T) {
 				{Bounds: scene.Rect{X: 2, Y: 2, Width: 1, Height: 1}, Color: scene.Color{Blue: 1, Alpha: 1}, Layer: 3},
 			},
 			NativeViews: []app.BackendNativeView{
-				{Bounds: ui.Rect{X: 0.8, Y: 0.8, Width: 2.2, Height: 2.2}, Layer: 1},
-				{Bounds: ui.Rect{Width: -1, Height: 4}, Layer: 4},
-				{Bounds: ui.Rect{Width: 4}, Layer: 4},
-				{Bounds: ui.Rect{X: 10, Y: 10, Width: 1, Height: 1}, Layer: 4},
+				{Bounds: gfx.Rect{X: 0.8, Y: 0.8, Width: 2.2, Height: 2.2}, Layer: 1},
+				{Bounds: gfx.Rect{Width: -1, Height: 4}, Layer: 4},
+				{Bounds: gfx.Rect{Width: 4}, Layer: 4},
+				{Bounds: gfx.Rect{X: 10, Y: 10, Width: 1, Height: 1}, Layer: 4},
 			},
 		}
 		if err := target.Set(frame); err != nil {
@@ -497,7 +502,7 @@ func TestBackendWindowControlsAndTitlebarInsets(t *testing.T) {
 			for _, mode := range []app.WindowMode{app.WindowCustomTitlebar, app.WindowTitled} {
 				driver, err := app.NewDriver(app.Config{
 					Title: "controls", Width: 300, Height: 200, WindowMode: mode,
-					Paint: func(*ui.Canvas, ui.Size) {},
+					Paint: func(*gfx.Canvas, gfx.Size) {},
 				}, nil)
 				if err != nil {
 					t.Fatal(err)

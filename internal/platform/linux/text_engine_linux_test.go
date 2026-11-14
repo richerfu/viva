@@ -6,9 +6,23 @@ import (
 	"math"
 	"testing"
 
+	"github.com/vivaui/viva/gfx"
 	"github.com/vivaui/viva/internal/platform"
 	"github.com/vivaui/viva/internal/textenginetest"
 )
+
+var _ gfx.StyledTextEngine = (*textEngine)(nil)
+
+func TestItalicPangoLineHasSeparateCacheEntry(t *testing.T) {
+	engine := newTestEngine(t)
+	engine.mu.Lock()
+	regular, regularErr := engine.lineStyleLocked("Italic 本文", 16, 0, false)
+	italic, italicErr := engine.lineStyleLocked("Italic 本文", 16, 0, true)
+	engine.mu.Unlock()
+	if regularErr != nil || italicErr != nil || regular == italic {
+		t.Fatalf("Pango regular/italic lines = %p/%p, errs=%v/%v", regular, italic, regularErr, italicErr)
+	}
+}
 
 func newTestEngine(t *testing.T) *textEngine {
 	t.Helper()
@@ -22,6 +36,23 @@ func newTestEngine(t *testing.T) *textEngine {
 
 func TestEnginePassesTheTextEngineContract(t *testing.T) {
 	textenginetest.Run(t, newTestEngine(t))
+}
+
+func TestTextEngineRasterizesProportionalText(t *testing.T) {
+	engine := newTestEngine(t)
+	bitmap, err := engine.RasterizeText("Privacy 中文", gfx.TextStyle{
+		Size: 14, Weight: gfx.WeightSemibold, Color: gfx.Color{Red: 1, Green: 1, Blue: 1, Alpha: 1},
+	}, 2, 240, 56)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ink := false
+	for index := 3; index < len(bitmap.Pix); index += 4 {
+		ink = ink || bitmap.Pix[index] != 0
+	}
+	if bitmap.Width != 240 || bitmap.Height != 56 || bitmap.Stride != 960 || !ink {
+		t.Fatalf("rasterized bitmap = %dx%d stride %d, ink=%v", bitmap.Width, bitmap.Height, bitmap.Stride, ink)
+	}
 }
 
 // The Linux editor must measure what the label draws: a line's ink ends where its width

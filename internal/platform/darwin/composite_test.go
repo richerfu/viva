@@ -15,14 +15,14 @@ func TestCompositeABI(t *testing.T) {
 	if rectangleSize != 80 || rectangleLayerOffset != 36 {
 		t.Fatalf("viva_rectangle ABI = size %d layer offset %d, want 80 and 36", rectangleSize, rectangleLayerOffset)
 	}
-	if textSize != 160 || textLayerOffset != 56 {
-		t.Fatalf("viva_text_label ABI = size %d layer offset %d, want 160 and 56", textSize, textLayerOffset)
+	if textSize != 264 || textLayerOffset != 56 {
+		t.Fatalf("viva_text_label ABI = size %d layer offset %d, want 264 and 56", textSize, textLayerOffset)
 	}
-	if labelSize, runsOffset, runSize := labelABI(); labelSize != 160 || runsOffset != 64 || runSize != 36 {
-		t.Fatalf("label ABI = size %d runs offset %d run size %d, want 160, 64 and 36", labelSize, runsOffset, runSize)
+	if labelSize, runsOffset, runSize := labelABI(); labelSize != 264 || runsOffset != 64 || runSize != 36 {
+		t.Fatalf("label ABI = size %d runs offset %d run size %d, want 264, 64 and 36", labelSize, runsOffset, runSize)
 	}
-	if commandSize != 32 {
-		t.Fatalf("viva_composite_command size = %d, want 32", commandSize)
+	if commandSize != 36 {
+		t.Fatalf("viva_composite_command size = %d, want 36", commandSize)
 	}
 }
 
@@ -60,25 +60,29 @@ func TestPlanCompositeOrdersLayersAndPreservesSameLayerOrder(t *testing.T) {
 		{Layer: 2},
 		{Layer: 1},
 	}
+	// Labels arrive in paint order, each saying how many shapes were painted
+	// before it: one after the first shape, then after the third, the fourth
+	// and the fifth.
 	labels := []TextLabel{
-		{Layer: 2},
-		{Layer: 0},
-		{Layer: 1},
-		{Layer: 2},
+		{Layer: 2, ShapesBefore: 1},
+		{Layer: 0, ShapesBefore: 3},
+		{Layer: 1, ShapesBefore: 4},
+		{Layer: 2, ShapesBefore: 5},
 	}
 	got, err := planComposite(rectangles, labels)
 	if err != nil {
 		t.Fatal(err)
 	}
 	want := []compositeCommand{
-		{Layer: 0, Kind: 0, First: 1, Count: 1},
-		{Layer: 0, Kind: 1, First: 1, Count: 1},
-		{Layer: 1, Kind: 0, First: 4, Count: 1},
-		{Layer: 1, Kind: 1, First: 2, Count: 1},
-		{Layer: 2, Kind: 0, First: 0, Count: 1},
-		{Layer: 2, Kind: 0, First: 2, Count: 2},
-		{Layer: 2, Kind: 1, First: 0, Count: 1},
-		{Layer: 2, Kind: 1, First: 3, Count: 1},
+		{Layer: 0, Kind: 0, First: 1, Count: 1, Sequence: 2},
+		{Layer: 0, Kind: 1, First: 1, Count: 1, Sequence: 4},
+		{Layer: 1, Kind: 1, First: 2, Count: 1, Sequence: 6},
+		{Layer: 1, Kind: 0, First: 4, Count: 1, Sequence: 7},
+		{Layer: 2, Kind: 0, First: 0, Count: 1, Sequence: 0},
+		{Layer: 2, Kind: 1, First: 0, Count: 1, Sequence: 1},
+		{Layer: 2, Kind: 0, First: 2, Count: 1, Sequence: 3},
+		{Layer: 2, Kind: 0, First: 3, Count: 1, Sequence: 5},
+		{Layer: 2, Kind: 1, First: 3, Count: 1, Sequence: 8},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("composite plan = %#v, want %#v", got, want)
@@ -102,12 +106,12 @@ func TestPlanCompositeSplitsRectangleRunsOnClip(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := []compositeCommand{
-		{Layer: 0, Kind: 0, First: 0, Count: 2},
-		{Layer: 0, Kind: 0, First: 2, Count: 2, Clipped: true, Clip: a},
-		{Layer: 0, Kind: 0, First: 4, Count: 1, Clipped: true, Clip: b},
-		{Layer: 0, Kind: 0, First: 5, Count: 1},
-		{Layer: 0, Kind: 1, First: 0, Count: 1},
-		{Layer: 1, Kind: 0, First: 6, Count: 1, Clipped: true, Clip: b},
+		{Layer: 0, Kind: 1, First: 0, Count: 1, Sequence: 0},
+		{Layer: 0, Kind: 0, First: 0, Count: 2, Sequence: 1},
+		{Layer: 0, Kind: 0, First: 2, Count: 2, Clipped: true, Clip: a, Sequence: 2},
+		{Layer: 0, Kind: 0, First: 4, Count: 1, Clipped: true, Clip: b, Sequence: 3},
+		{Layer: 0, Kind: 0, First: 5, Count: 1, Sequence: 4},
+		{Layer: 1, Kind: 0, First: 6, Count: 1, Clipped: true, Clip: b, Sequence: 5},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("composite plan = %#v, want %#v", got, want)
@@ -124,22 +128,20 @@ func TestPlanCompositeEmpty(t *testing.T) {
 	}
 }
 
-func TestRunStateCapturesRectangleLayersForNativeUpdates(t *testing.T) {
-	state := runState{}
-	state.captureRectangleLayers([]render.Rectangle{{Layer: 1}, {Layer: 4}})
-	state.captureFrameLayers(Frame{
-		Update:     render.Update{First: 0, Count: 2},
-		Rectangles: []render.Rectangle{{Layer: 3}, {Layer: 7}},
-	}, nil)
-	if !reflect.DeepEqual(state.rectangleLayers, []uint16{3, 7}) {
-		t.Fatalf("captured layers = %v, want [3 7]", state.rectangleLayers)
+// The native composite plan reads each instance's layer from reserved0, and
+// the update paths no longer patch it from Go: the staged bytes must carry it
+// for both kinds, or every instance silently composites at layer 0.
+func TestStagedRectanglesCarryTheirLayer(t *testing.T) {
+	rectangle := makeNativeRectangle(render.Rectangle{Layer: 7})
+	if got := float32(rectangle.reserved0); got != 7 {
+		t.Fatalf("staged rectangle layer = %v, want 7", got)
 	}
-
-	state.captureFrameLayers(Frame{
-		Rectangles: []render.Rectangle{{Layer: 9}},
-	}, nil)
-	if !reflect.DeepEqual(state.rectangleLayers, []uint16{3, 7}) {
-		t.Fatalf("empty update replaced layers with %v", state.rectangleLayers)
+	triangle := makeNativeRectangle(render.Rectangle{
+		Kind: scene.KindTriangle, Layer: 5,
+		Points: [3]scene.Point{{X: 1, Y: 2}, {X: 3, Y: 4}, {X: 5, Y: 6}},
+	})
+	if got := float32(triangle.reserved0); got != 5 {
+		t.Fatalf("staged triangle layer = %v, want 5", got)
 	}
 }
 

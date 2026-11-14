@@ -6,9 +6,13 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"unsafe"
+
+	"github.com/vivaui/viva/internal/platform"
 )
 
 // WebView2 without WebView2Loader.dll: the loader's job is to find the installed runtime and call
@@ -67,29 +71,40 @@ func registryString(root uintptr, path, name string) (string, bool) {
 	return syscall.UTF16ToString(buffer), true
 }
 
-// webViewClientLibrary finds the runtime's client library: the stable channel first, then the
-// preview channels, for all users and then for this one.
-func webViewClientLibrary() (string, error) {
+// webViewChannels are the EdgeUpdate ClientState channels that install the WebView2 runtime, in
+// the order the runtime is looked for: the stable channel first, then the preview channels.
+var webViewChannels = []string{
+	"{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}", "{2CD8A007-E189-409D-A2C8-9AF4EF3C72AA}",
+	"{0D50BFEC-CD6A-4F9A-964C-C7416E3ACB10}", "{65C35B14-6C1D-4122-AC46-7148CC9D6497}",
+}
+
+// webViewInstalls are the registry views a runtime is installed in: all users, then this one.
+var webViewInstalls = []uintptr{hkeyLocalMachine, hkeyCurrentUser}
+
+// webViewInstall finds the runtime's client library and the version of the runtime it belongs to:
+// the stable channel first, then the preview channels, for all users and then for this one. The
+// version is read from the install folder the library was found in, so it always describes the
+// runtime that will load; it is empty when that folder does not name a version, and the caller must
+// then try the runtime itself rather than judge it.
+func webViewInstall() (library, version string, err error) {
 	arch := map[string]string{"amd64": "x64", "arm64": "arm64", "386": "x86"}[runtime.GOARCH]
 	if arch == "" {
-		return "", fmt.Errorf("windows: WebView2 does not run on %s", runtime.GOARCH)
+		return "", "", fmt.Errorf("windows: WebView2 does not run on %s", runtime.GOARCH)
 	}
-	for _, channel := range []string{
-		"{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}", "{2CD8A007-E189-409D-A2C8-9AF4EF3C72AA}",
-		"{0D50BFEC-CD6A-4F9A-964C-C7416E3ACB10}", "{65C35B14-6C1D-4122-AC46-7148CC9D6497}",
-	} {
-		for _, root := range []uintptr{hkeyLocalMachine, hkeyCurrentUser} {
+	for _, channel := range webViewChannels {
+		for _, root := range webViewInstalls {
 			folder, ok := registryString(root, `Software\Microsoft\EdgeUpdate\ClientState\`+channel, "EBWebView")
 			if !ok || folder == "" {
 				continue
 			}
 			library := filepath.Join(folder, "EBWebView", arch, "EmbeddedBrowserWebView.dll")
 			if _, err := os.Stat(library); err == nil {
-				return library, nil
+				version, _ := installVersionFromFolder(folder)
+				return library, version, nil
 			}
 		}
 	}
-	return "", errNoWebView2
+	return "", "", errNoWebView2
 }
 
 // A handler is an object the runtime calls back. All of them share a vtable: IUnknown and one
@@ -131,19 +146,89 @@ func newHandler(invoke func(first, second uintptr) uintptr) uintptr {
 	return uintptr(unsafe.Pointer(h))
 }
 
-// webEnvironment is the process's one environment: the runtime's browser process and its settings.
+// webEnvironment is one environment: a browser process of the runtime and its settings. Pages without
+// a proxy share one for the life of the process. Each proxy has its own, since the runtime fixes a
+// browser's arguments when it starts, in a folder of its own, since a folder takes one browser at a
+// time; it goes when its last page closes.
 type webEnvironment struct {
+	key     string
+	proxy   string
+	slot    int // the proxy's folder under the user data folder, from 1
+	pages   int
 	object  uintptr
 	failed  error
 	started bool
 	waiting []func(object uintptr, err error)
 }
 
-var sharedEnvironment webEnvironment
+var webEnvironments = map[string]*webEnvironment{}
 
-// withEnvironment calls then once the environment exists (at once if it does), on this thread.
-func withEnvironment(userData string, then func(object uintptr, err error)) {
-	env := &sharedEnvironment
+// withEnvironment calls then once the environment for proxy exists (at once if it does), on this
+// thread. The caller holds the environment until it calls leave.
+func withEnvironment(userData, proxy string, then func(object uintptr, err error)) *webEnvironment {
+	key := userData + "\x00" + proxy
+	env := webEnvironments[key]
+	if env == nil {
+		env = &webEnvironment{key: key, proxy: proxy}
+		if proxy != "" {
+			env.slot = freeProxySlot(userData)
+		}
+		webEnvironments[key] = env
+	}
+	env.pages++
+	env.join(userData, then)
+	return env
+}
+
+// freeProxySlot is the first proxy folder under userData that no environment here uses and no
+// browser holds: one that is ending, or another process's, still has its lock file open.
+func freeProxySlot(userData string) int {
+	used := map[int]bool{}
+	for key, env := range webEnvironments {
+		if strings.HasPrefix(key, userData+"\x00") {
+			used[env.slot] = true
+		}
+	}
+	slot := 1
+	for used[slot] || browserHolds(proxyFolder(userData, slot)) {
+		slot++
+	}
+	return slot
+}
+
+func proxyFolder(userData string, slot int) string {
+	return filepath.Join(userData, "Proxy"+strconv.Itoa(slot))
+}
+
+// browserHolds reports whether a running browser has the folder: it keeps its lock file open to
+// itself.
+func browserHolds(folder string) bool {
+	name, err := syscall.UTF16PtrFromString(filepath.Join(folder, "EBWebView", "lockfile"))
+	if err != nil {
+		return false
+	}
+	handle, err := syscall.CreateFile(name, syscall.GENERIC_READ|syscall.GENERIC_WRITE, 0, nil, syscall.OPEN_EXISTING, 0, 0)
+	if err != nil {
+		return err == errorSharingViolation
+	}
+	syscall.CloseHandle(handle)
+	return false
+}
+
+// leave lets go of the environment for one page. The last page of a proxy's environment ends it.
+func (env *webEnvironment) leave() {
+	env.pages--
+	if env.pages > 0 || env.proxy == "" {
+		return
+	}
+	delete(webEnvironments, env.key)
+	if env.object != 0 {
+		comCall(env.object, 2)
+		env.object = 0
+	}
+}
+
+func (env *webEnvironment) join(userData string, then func(object uintptr, err error)) {
 	switch {
 	case env.object != 0 || env.failed != nil:
 		then(env.object, env.failed)
@@ -155,6 +240,10 @@ func withEnvironment(userData string, then func(object uintptr, err error)) {
 	env.started = true
 	env.waiting = append(env.waiting, then)
 	finish := func(object uintptr, err error) {
+		if object != 0 && env.pages == 0 && env.proxy != "" {
+			comCall(object, 2) // every page closed while it started
+			object = 0
+		}
 		env.object, env.failed = object, err
 		waiting := env.waiting
 		env.waiting = nil
@@ -162,7 +251,7 @@ func withEnvironment(userData string, then func(object uintptr, err error)) {
 			wait(object, err)
 		}
 	}
-	library, err := webViewClientLibrary()
+	library, _, err := webViewInstall()
 	if err != nil {
 		finish(0, err)
 		return
@@ -177,10 +266,23 @@ func withEnvironment(userData string, then func(object uintptr, err error)) {
 		finish(0, fmt.Errorf("windows: the WebView2 runtime lacks its entry point: %w", err))
 		return
 	}
+	if env.proxy != "" {
+		userData = proxyFolder(userData, env.slot)
+	}
 	folder, err := syscall.UTF16PtrFromString(userData)
 	if err != nil {
 		finish(0, err)
 		return
+	}
+	if env.proxy != "" {
+		// The runtime reads its browser's extra arguments from the process environment when it
+		// starts one; they are set for that moment only.
+		previous, had := syscall.Getenv(browserArgumentsVariable)
+		if err := setProcessVariable(browserArgumentsVariable, proxyBrowserArguments(previous, env.proxy), true); err != nil {
+			finish(0, err)
+			return
+		}
+		defer setProcessVariable(browserArgumentsVariable, previous, had)
 	}
 	handler := newHandler(func(status, object uintptr) uintptr {
 		if int32(uint32(status)) < 0 || object == 0 {
@@ -196,6 +298,56 @@ func withEnvironment(userData string, then func(object uintptr, err error)) {
 	if int32(uint32(status)) < 0 {
 		finish(0, fmt.Errorf("windows: start the WebView2 environment: HRESULT %#x", uint32(status)))
 	}
+}
+
+const browserArgumentsVariable = "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"
+
+var setEnvironmentVariable = kernel.NewProc("SetEnvironmentVariableW")
+
+// setProcessVariable sets the variable in the process environment, which the runtime reads, or
+// removes it when set is false.
+func setProcessVariable(name, value string, set bool) error {
+	key, err := syscall.UTF16PtrFromString(name)
+	if err != nil {
+		return err
+	}
+	var text *uint16
+	if set {
+		if text, err = syscall.UTF16PtrFromString(value); err != nil {
+			return err
+		}
+	}
+	if ok, _, err := setEnvironmentVariable.Call(uintptr(unsafe.Pointer(key)), uintptr(unsafe.Pointer(text))); ok == 0 {
+		return fmt.Errorf("windows: set %s: %w", name, err)
+	}
+	return nil
+}
+
+// proxyBrowserArguments sends every request through the SOCKS5 proxy, loopback included, with
+// names resolved by the proxy: the browser resolves nothing itself and WebRTC sends no UDP around
+// it. The arguments already set come first, so these win.
+func proxyBrowserArguments(existing, proxy string) string {
+	arguments := "--proxy-server=socks5://" + proxy +
+		" --proxy-bypass-list=<-loopback>" +
+		` "--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE ` + proxyHost(proxy) + `"` +
+		" --force-webrtc-ip-handling-policy=disable_non_proxied_udp"
+	if proxy == platform.WebProxyDirect {
+		arguments = "--no-proxy-server"
+	}
+	if existing = strings.TrimSpace(existing); existing != "" {
+		return existing + " " + arguments
+	}
+	return arguments
+}
+
+const errorSharingViolation = syscall.Errno(32)
+
+// proxyHost is the IP of a host:port the application has checked.
+func proxyHost(address string) string {
+	if colon := strings.LastIndexByte(address, ':'); colon >= 0 {
+		address = address[:colon]
+	}
+	return strings.Trim(address, "[]")
 }
 
 // wideString copies a string the runtime allocated and frees it.
@@ -225,31 +377,64 @@ func wide(text string) *uint16 {
 
 // The vtable slots used, counted from IUnknown's three.
 const (
-	envCreateController     = 3
-	envCreateResponse       = 4
-	controllerPutVisible    = 4
-	controllerPutBounds     = 6
-	controllerMoveFocus     = 12
-	controllerClose         = 24
-	controllerGetWebView    = 25
-	viewNavigate            = 5
-	viewNavigateToString    = 6
-	viewAddNavStarting      = 7
-	viewAddContentLoading   = 9
-	viewAddNavCompleted     = 15
-	viewAddScriptOnCreate   = 27
-	viewExecuteScript       = 29
-	viewReload              = 31
-	viewAddMessageReceived  = 34
-	viewGoBack              = 40
-	viewGoForward           = 41
-	viewGetSource           = 4
-	viewAddWebResourceReq   = 55
-	viewAddResourceFilter   = 57
-	messageTryGetString     = 5
-	startingGetURI          = 3
-	resourceArgsGetRequest  = 3
-	resourceArgsPutResponse = 5
-	resourceRequestGetURI   = 3
-	resourceContextAll      = 0
+	envCreateController = 3
+	envCreateResponse   = 4
+	// ICoreWebView2Environment10 offers controller options and a controller made with them. It
+	// comes from the WebView2 SDK 1.0.1210.39 and Runtime 101:
+	// CreateCoreWebView2ControllerOptions and CreateCoreWebView2ControllerWithOptions.
+	envCreateControllerOptions     = 20
+	envCreateControllerWithOptions = 21
+	// ICoreWebView2ControllerOptions, in IDL order: get_ProfileName 3, put_ProfileName 4,
+	// get_IsInPrivateModeEnabled 5, put_IsInPrivateModeEnabled 6.
+	optionsPutProfileName     = 4
+	optionsPutInPrivateMode   = 6
+	controllerPutVisible      = 4
+	controllerPutBounds       = 6
+	controllerMoveFocus       = 12
+	controllerClose           = 24
+	controllerGetWebView      = 25
+	viewNavigate              = 5
+	viewNavigateToString      = 6
+	viewAddNavStarting        = 7
+	viewAddContentLoading     = 9
+	viewAddNavCompleted       = 15
+	viewAddFrameNavStarting   = 17
+	viewAddNewWindowRequested = 44
+	viewAddScriptOnCreate     = 27
+	viewExecuteScript         = 29
+	viewReload                = 31
+	viewAddMessageReceived    = 34
+	viewGoBack                = 40
+	viewGoForward             = 41
+	viewGetSource             = 4
+	viewAddWebResourceReq     = 55
+	viewAddResourceFilter     = 57
+	// ICoreWebView2_4 adds DownloadStarting after every ICoreWebView2_3 method.
+	viewAddDownloadStarting   = 75
+	messageTryGetString       = 5
+	startingGetURI            = 3
+	startingGetUserGesture    = 4
+	startingGetRedirected     = 5
+	startingPutCancel         = 8
+	newWindowGetURI           = 3
+	newWindowPutHandled       = 6
+	downloadArgsGetOperation  = 3
+	downloadArgsPutCancel     = 5
+	downloadArgsGetResultPath = 6
+	downloadArgsPutResultPath = 7
+	downloadArgsPutHandled    = 9
+	downloadGetURI            = 9
+	resourceArgsGetRequest    = 3
+	resourceArgsPutResponse   = 5
+	// ICoreWebView2WebResourceRequestedEventArgs::GetDeferral holds the request open.
+	resourceArgsGetDeferral = 6
+	// ICoreWebView2Deferral::Complete says the request may continue.
+	deferralComplete      = 3
+	resourceRequestGetURI = 3
+	resourceContextAll    = 0
 )
+
+// iidEnvironment10 is ICoreWebView2Environment10, which offers the controller options an InPrivate
+// page is made with. It comes from the WebView2 SDK 1.0.1210.39 and Runtime 101 (Edge 101); a
+// runtime older than that does not answer for it.
+var iidEnvironment10 = guid{0xee0eb9df, 0x6f12, 0x46ce, [8]byte{0xb5, 0x3f, 0x3f, 0x47, 0xb9, 0xc9, 0x28, 0xe0}}

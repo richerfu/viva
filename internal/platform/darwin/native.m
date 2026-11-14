@@ -10,6 +10,8 @@
 #include <string.h>
 
 #include "native.h"
+#include "cursor_owner_darwin.h"
+#include "label_geometry.h"
 #include "main_menu_darwin.h"
 
 static uint64_t viva_process_start_ticks;
@@ -32,12 +34,39 @@ static uint64_t viva_scroll_event_count;
 static double viva_scroll_last_pixel_y;
 static NSUInteger viva_label_initial_count;
 
+/* The compiled shader library the application passes as it opens its windows,
+ * kept after the first one compiled its pipelines: a window that makes its
+ * Metal resources again builds a library from these bytes on the device it is
+ * given, which need not be the device the first library was compiled for. */
+static void *viva_shader_library_bytes = NULL;
+static size_t viva_shader_library_length = 0;
+
+static int viva_remember_shader_library(const unsigned char *bytes, size_t length) {
+    if (bytes == NULL || length == 0) {
+        return 0;
+    }
+    if (viva_shader_library_bytes != NULL && viva_shader_library_length == length &&
+        memcmp(viva_shader_library_bytes, bytes, length) == 0) {
+        return 1;
+    }
+    void *copy = malloc(length);
+    if (copy == NULL) {
+        return 0;
+    }
+    memcpy(copy, bytes, length);
+    free(viva_shader_library_bytes);
+    viva_shader_library_bytes = copy;
+    viva_shader_library_length = length;
+    return 1;
+}
+
 /* Window chrome modes. */
 enum {
     VIVA_WINDOW_TITLED = 0,
     VIVA_WINDOW_FRAMELESS = 1,
     VIVA_WINDOW_CUSTOM_TITLEBAR = 2,
     VIVA_WINDOW_PANEL = 3,
+    VIVA_WINDOW_PREVIEW = 4,
 };
 
 /* How far from the status item a panel opens, the margin it keeps from the edge
@@ -109,18 +138,20 @@ static CGFloat viva_traffic_light_center(NSWindow *window) {
  * inside it and clickable, and each button is set that far below the top.
  * Idempotent. AppKit puts the buttons back at the system's height on every
  * layout, so callers place them again whenever a button or the container
- * reports a frame change (see keepTrafficLightsCentered). A strip no taller
- * than the system's, and a full screen window, keep the system's layout. */
-static void viva_place_traffic_lights(NSWindow *window, CGFloat stripHeight) {
-    if (window == nil || stripHeight <= VIVA_DEFAULT_TITLEBAR_HEIGHT ||
-        (window.styleMask & NSWindowStyleMaskFullScreen) != 0) {
+ * reports a frame change (see keepTrafficLightsCentered). A scale in (0, 1)
+ * shrinks the buttons around their original centers whether or not the strip
+ * is taller; a strip no taller than the system's keeps the system's positions,
+ * and a full screen window keeps the system's layout. */
+static void viva_place_traffic_lights(NSWindow *window, CGFloat stripHeight, CGFloat scale) {
+    if (window == nil || (window.styleMask & NSWindowStyleMaskFullScreen) != 0) {
         return;
     }
+    BOOL taller = stripHeight > VIVA_DEFAULT_TITLEBAR_HEIGHT;
     NSView *container = viva_titlebar_container(window);
     if (container == nil || container.superview == nil) {
         return;
     }
-    if (fabs(NSHeight(container.frame) - stripHeight) > 0.25) {
+    if (taller && fabs(NSHeight(container.frame) - stripHeight) > 0.25) {
         NSRect frame = container.frame;
         frame.size.height = stripHeight;
         frame.origin.y = NSHeight(container.superview.bounds) - stripHeight;
@@ -129,6 +160,26 @@ static void viva_place_traffic_lights(NSWindow *window, CGFloat stripHeight) {
     for (int index = 0; index < 3; index++) {
         NSView *button = [window standardWindowButton:viva_traffic_buttons[index]];
         if (button == nil || button.superview == nil) {
+            continue;
+        }
+        // Keep the original drawing coordinates while shrinking the view frame.
+        // Using bounds makes repeated AppKit layout notifications idempotent.
+        if (isfinite(scale) && scale > 0 && scale < 1) {
+            NSSize originalSize = button.bounds.size;
+            NSSize targetSize = NSMakeSize(originalSize.width * scale, originalSize.height * scale);
+            if (fabs(NSWidth(button.frame) - targetSize.width) > 0.01 ||
+                fabs(NSHeight(button.frame) - targetSize.height) > 0.01) {
+                NSRect frame = button.frame;
+                frame.origin.x += (frame.size.width - targetSize.width) / 2.0;
+                // Keep the vertical center too, so the shrink holds in a strip of the
+                // system's height where the placement below does not run.
+                frame.origin.y += (frame.size.height - targetSize.height) / 2.0;
+                frame.size = targetSize;
+                button.frame = frame;
+                button.bounds = NSMakeRect(0, 0, originalSize.width, originalSize.height);
+            }
+        }
+        if (!taller) {
             continue;
         }
         CGFloat y = NSHeight(button.superview.bounds) - stripHeight / 2.0 - NSHeight(button.frame) / 2.0;
@@ -145,6 +196,7 @@ enum {
     VIVA_POINTER_MOVE = 2,
     VIVA_POINTER_UP = 3,
     VIVA_POINTER_EXIT = 4,
+    VIVA_POINTER_CANCEL = 5,
 	VIVA_REDRAW_EVENT = 0x4752,
 	VIVA_CLOSE_EVENT = 0x4743,
 	VIVA_HIDE_EVENT = 0x4748,
@@ -168,6 +220,9 @@ static int viva_compare_composite_commands(const void *left, const void *right) 
     const viva_composite_command *b = right;
     if (a->layer != b->layer) {
         return a->layer < b->layer ? -1 : 1;
+    }
+    if (a->sequence != b->sequence) {
+        return a->sequence < b->sequence ? -1 : 1;
     }
     if (a->kind != b->kind) {
         return a->kind < b->kind ? -1 : 1;
@@ -202,11 +257,32 @@ static int viva_same_batch(
            clips[left].height == clips[right].height;
 }
 
+/* viva_rectangle_capacity answers the instance slots the renderer's rectangle
+ * buffers need to hold count instances, given the slots they already hold. A
+ * buffer that has room keeps it, so an append landing in the headroom of an
+ * earlier growth costs nothing; a buffer that must grow doubles, so a scene
+ * that appends one instance at a time allocates a logarithmic number of times
+ * and the buffers stay within twice the instances that exist. */
+size_t viva_rectangle_capacity(size_t capacity, size_t count) {
+    if (capacity >= count) {
+        return capacity;
+    }
+    size_t next = capacity > 0 ? capacity : 64;
+    while (next < count) {
+        if (next > SIZE_MAX / 2) {
+            return count;
+        }
+        next *= 2;
+    }
+    return next;
+}
+
 int viva_plan_composite(
     const viva_rectangle *rectangles,
     const viva_clip *clips,
     size_t rectangle_count,
     const uint16_t *text_layers,
+    const uint32_t *text_shapes_before,
     size_t text_count,
     viva_composite_command *commands,
     size_t command_capacity,
@@ -214,39 +290,57 @@ int viva_plan_composite(
 ) {
     if (command_count == NULL ||
         (rectangle_count > 0 && (rectangles == NULL || clips == NULL)) ||
-        (text_count > 0 && text_layers == NULL) ||
+        (text_count > 0 && (text_layers == NULL || text_shapes_before == NULL)) ||
         rectangle_count > UINT32_MAX || text_count > UINT32_MAX) {
         return 1;
     }
 
-    size_t required = text_count;
-    for (size_t index = 0; index < rectangle_count;) {
-        size_t head = index;
-        index++;
-        while (index < rectangle_count &&
-               viva_same_batch(rectangles, clips, head, index)) {
-            index++;
-        }
-        required++;
+    // At most one command per shape and one per label: a shape batch can be cut
+    // at every label boundary.
+    if (rectangle_count > SIZE_MAX - text_count) {
+        return 2;
     }
-    *command_count = required;
+    size_t required = rectangle_count + text_count;
     if (required > command_capacity || (required > 0 && commands == NULL)) {
         return 2;
     }
 
+    // Shapes and labels arrive in paint order. A label that says k shapes were
+    // painted before it belongs after instance k-1 and before instance k, so
+    // the plan walks both lists by that boundary, cutting a shape batch when a
+    // label falls inside it.
     size_t command_index = 0;
-    for (size_t first = 0; first < rectangle_count;) {
-        uint16_t layer = viva_rectangle_layer(rectangles[first]);
+    size_t rectangle_index = 0;
+    size_t text_index = 0;
+    while (rectangle_index < rectangle_count || text_index < text_count) {
+        if (text_index < text_count &&
+            (text_shapes_before[text_index] <= rectangle_index || rectangle_index >= rectangle_count)) {
+            uint32_t sequence = (uint32_t)command_index;
+            commands[command_index++] = (viva_composite_command){
+                .layer = text_layers[text_index],
+                .kind = VIVA_COMPOSITE_TEXT,
+                .first = (uint32_t)text_index,
+                .count = 1,
+                .sequence = sequence,
+            };
+            text_index++;
+            continue;
+        }
+        size_t first = rectangle_index;
         size_t end = first + 1;
         while (end < rectangle_count &&
-               viva_same_batch(rectangles, clips, first, end)) {
+               viva_same_batch(rectangles, clips, first, end) &&
+               (text_index >= text_count || end < text_shapes_before[text_index])) {
             end++;
         }
+        uint16_t layer = viva_rectangle_layer(rectangles[first]);
+        uint32_t sequence = (uint32_t)command_index;
         viva_composite_command command = {
             .layer = layer,
             .kind = VIVA_COMPOSITE_RECTANGLES,
             .first = (uint32_t)first,
             .count = (uint32_t)(end - first),
+            .sequence = sequence,
         };
         if (clips[first].clipped != 0) {
             command.clipped = 1;
@@ -256,18 +350,11 @@ int viva_plan_composite(
             command.clip_height = clips[first].height;
         }
         commands[command_index++] = command;
-        first = end;
+        rectangle_index = end;
     }
-    for (size_t index = 0; index < text_count; index++) {
-        commands[command_index++] = (viva_composite_command){
-            .layer = text_layers[index],
-            .kind = VIVA_COMPOSITE_TEXT,
-            .first = (uint32_t)index,
-            .count = 1,
-        };
-    }
-    qsort(commands, required, sizeof(viva_composite_command),
+    qsort(commands, command_index, sizeof(viva_composite_command),
           viva_compare_composite_commands);
+    *command_count = command_index;
     return 0;
 }
 
@@ -315,6 +402,7 @@ enum {
     VIVA_TEXT_SET_SELECTION = 5,
     VIVA_TEXT_PASTE = 6,
     VIVA_TEXT_PASTE_NO_TEXT = 7,
+    VIVA_TEXT_CANCEL_COMPOSITION = 8,
 };
 
 enum {
@@ -402,6 +490,7 @@ extern void vivaRawKeyEvent(
 // vivaTerminalCells is how many terminal cells a character occupies, answered by the
 // terminal's own table in Go.
 extern int vivaTerminalCells(uint32_t character);
+extern void vivaWindowActivated(uintptr_t callbackHandle);
 extern void vivaFocusLost(
     uintptr_t callbackHandle,
     void *view
@@ -434,6 +523,7 @@ extern int vivaShortcutEvent(
 // phase: 0 over, 1 leave, 2 drop. paths is the dropped paths joined by NUL, with
 // length bytes; the result is nonzero when the point takes files.
 extern void vivaOpenURL(const char *url);
+extern void vivaOpenFile(const char *path);
 extern int vivaApplicationQuitRequested(void);
 extern int vivaApplicationReopenRequested(void);
 extern int vivaFileDropEvent(
@@ -473,6 +563,7 @@ extern void vivaFrameChanged(
 );
 
 extern void vivaWindowMinimized(uintptr_t callbackHandle, void *view, int minimized);
+extern void vivaWindowOccluded(uintptr_t callbackHandle, void *view, int visible);
 extern void vivaWindowFullscreen(uintptr_t callbackHandle, void *view, int fullscreen);
 extern int vivaWindowReopenRequested(uintptr_t callbackHandle, void *view);
 
@@ -489,10 +580,7 @@ extern void vivaTextInput(
     int command
 );
 
-extern uint16_t vivaRectangleLayer(
-    uintptr_t callbackHandle,
-    size_t index
-);
+extern unsigned char *vivaCopyText(uintptr_t callbackHandle, void *view, size_t *length);
 
 extern int vivaPressAt(
     uintptr_t callbackHandle,
@@ -777,11 +865,19 @@ int viva_text_input_navigation_key_is_raw(int navigation_keys, int composing, in
     return 0;
 }
 
-int viva_text_input_should_interpret_key(int enabled, int multiline, int key) {
-    if (enabled == 0 || key == VIVA_KEY_TAB || key == VIVA_KEY_ESCAPE) {
+int viva_text_input_should_interpret_key(int enabled, int multiline, int composing, int key) {
+    if (enabled == 0 || key == VIVA_KEY_TAB || (key == VIVA_KEY_ESCAPE && composing == 0)) {
         return 0;
     }
-    return key != VIVA_KEY_ENTER || multiline != 0;
+    // The function keys belong to the application, as they do on Windows and
+    // Linux: a focused field has no editing command for F1-F12, so sending them
+    // to the text system only drops them. An input method that does use them
+    // (a Japanese conversion on F6-F10) holds the keyboard while it composes, so
+    // they stay with the text system for as long as it does.
+    if (composing == 0 && key >= VIVA_KEY_F1 && key <= VIVA_KEY_F1 + 11) {
+        return 0;
+    }
+    return key != VIVA_KEY_ENTER || multiline != 0 || composing != 0;
 }
 
 static BOOL viva_test_pointer_enabled(void) {
@@ -848,6 +944,45 @@ static double viva_elapsed_milliseconds(uint64_t start, uint64_t end) {
     return nanoseconds / 1000000.0;
 }
 
+static BOOL viva_key_is_named(unichar character) {
+    switch (character) {
+        case NSTabCharacter:
+        case NSBackTabCharacter:
+        case NSCarriageReturnCharacter:
+        case NSEnterCharacter:
+        case 0x1b:
+        case NSBackspaceCharacter:
+        case NSDeleteCharacter:
+            return YES;
+        default:
+            // The function keys (arrows, Home, End, page, insert, F1-F35) keep
+            // their NSEvent character above U+F700.
+            return character >= NSUpArrowFunctionKey;
+    }
+}
+
+static NSString *viva_key_characters(NSEvent *event) {
+    // Command's character belongs to the shortcut layout, not the input
+    // method's text layout. Preserve Command and Shift when removing Control
+    // codes and Option-produced text; AppKit resolves the active layout.
+    NSEventModifierFlags modifiers = event.modifierFlags;
+    if (!(modifiers & NSEventModifierFlagCommand)) {
+        return event.charactersIgnoringModifiers;
+    }
+    NSEventModifierFlags textModifiers = NSEventModifierFlagControl | NSEventModifierFlagOption;
+    if (!(modifiers & textModifiers)) {
+        return event.characters;
+    }
+    NSString *characters = event.charactersIgnoringModifiers;
+    if (characters.length > 0 && viva_key_is_named([characters characterAtIndex:0])) {
+        // Re-applying the modifiers would turn a named key into the control
+        // code with the same low bits (Up becomes U+001E, Forward Delete
+        // becomes U+007F) and lose the key's identity.
+        return characters;
+    }
+    return [event charactersByApplyingModifiers:modifiers & ~textModifiers];
+}
+
 static int viva_key_code(unichar key) {
     switch (key) {
         case NSTabCharacter: return VIVA_KEY_TAB;
@@ -898,6 +1033,7 @@ static NSRange viva_clamp_range(NSRange range, NSUInteger length) {
 // lands on. The engine in Go (text_engine.go) caches the lines; vivaShapedLine is how the
 // drawing here reaches the same cache.
 extern viva_text_line *vivaShapedLine(const unsigned char *utf8, size_t length, double size, double weight);
+extern viva_text_line *vivaShapedLineStyle(const unsigned char *utf8, size_t length, double size, double weight, int italic);
 
 // viva_interface_family is the family viva_text_set_family last named, "" for the
 // system font. A plain C buffer, not an NSString: nothing here manages memory for
@@ -930,6 +1066,22 @@ static CTFontRef viva_system_font(CGFloat size, CGFloat weight) {
     return font != nil ? (CTFontRef)CFRetain(font) : NULL;
 }
 
+static CTFontRef viva_system_font_style(CGFloat size, CGFloat weight, BOOL italic) {
+    CTFontRef base = viva_system_font(size, weight);
+    if (!italic || base == NULL) {
+        return base;
+    }
+    // The family's own italic face when it has one. When it has none the base font is
+    // kept and the glyphs are slanted as they are drawn (viva_draw_text_line), the same
+    // slant the fallback fonts of a line get.
+    CTFontRef face = CTFontCreateCopyWithSymbolicTraits(base, size, NULL, kCTFontItalicTrait, kCTFontItalicTrait);
+    if (face == NULL) {
+        return base;
+    }
+    CFRelease(base);
+    return face;
+}
+
 void viva_text_set_family(const char *family) {
     if (family == NULL) {
         viva_interface_family[0] = '\0';
@@ -939,7 +1091,7 @@ void viva_text_set_family(const char *family) {
     viva_interface_family[sizeof(viva_interface_family) - 1] = '\0';
 }
 
-viva_text_line *viva_text_line_create(const unsigned char *utf8, size_t length, double font_size, double font_weight) {
+viva_text_line *viva_text_line_create_style(const unsigned char *utf8, size_t length, double font_size, double font_weight, int italic) {
     @autoreleasepool {
         static const unsigned char empty[1] = {0};
         CFStringRef string = CFStringCreateWithBytes(
@@ -947,7 +1099,7 @@ viva_text_line *viva_text_line_create(const unsigned char *utf8, size_t length, 
         if (string == NULL) {
             return NULL;
         }
-        CTFontRef font = viva_system_font(font_size, font_weight);
+        CTFontRef font = viva_system_font_style(font_size, font_weight, italic != 0);
         if (font == NULL) {
             CFRelease(string);
             return NULL;
@@ -983,9 +1135,14 @@ viva_text_line *viva_text_line_create(const unsigned char *utf8, size_t length, 
         shaped->line = (void *)line;
         shaped->string = (void *)string;
         shaped->references = 1;
+        shaped->italic = italic != 0;
         CFRelease(font);
         return shaped;
     }
+}
+
+viva_text_line *viva_text_line_create(const unsigned char *utf8, size_t length, double font_size, double font_weight) {
+    return viva_text_line_create_style(utf8, length, font_size, font_weight, 0);
 }
 
 void viva_text_line_retain(viva_text_line *line) {
@@ -1118,13 +1275,49 @@ static viva_text_line *viva_shared_text_line(NSString *shown, CGFloat fontSize, 
     return vivaShapedLine(bytes != nil ? (const unsigned char *)bytes.bytes : NULL, bytes != nil ? bytes.length : 0, fontSize, weight);
 }
 
+static viva_text_line *viva_shared_text_line_style(NSString *shown, CGFloat fontSize, CGFloat weight, BOOL italic) {
+    NSData *bytes = [shown dataUsingEncoding:NSUTF8StringEncoding];
+    return vivaShapedLineStyle(bytes != nil ? (const unsigned char *)bytes.bytes : NULL, bytes != nil ? bytes.length : 0, fontSize, weight, italic ? 1 : 0);
+}
+
 // viva_draw_text_line draws the shaped line in one call, its origin at x on baseline, in
 // color (the line carries none, so the same line serves every color).
+// VIVA_SYNTHETIC_ITALIC_SLANT is the shear of a glyph drawn in italics from a font that has
+// no italic face: about eleven degrees, as the tilt of the system font's own italic.
+#define VIVA_SYNTHETIC_ITALIC_SLANT 0.2
+
+// viva_run_needs_slant says whether a run of an italic line must be slanted: its font has no
+// italic face, as a CJK fallback font has none. A font of color glyphs (emoji) is left upright.
+static BOOL viva_run_needs_slant(CTRunRef run) {
+    CFDictionaryRef attributes = CTRunGetAttributes(run);
+    CTFontRef font = attributes != NULL ? (CTFontRef)CFDictionaryGetValue(attributes, kCTFontAttributeName) : NULL;
+    if (font == NULL) {
+        return NO;
+    }
+    CTFontSymbolicTraits traits = CTFontGetSymbolicTraits(font);
+    return (traits & (kCTFontItalicTrait | kCTFontColorGlyphsTrait)) == 0;
+}
+
 static void viva_draw_text_line(CGContextRef context, const viva_text_line *line, CGColorRef color, CGFloat x, CGFloat baseline) {
     CGContextSaveGState(context);
     CGContextSetFillColorWithColor(context, color);
-    CGContextSetTextPosition(context, x, baseline);
-    CTLineDraw((CTLineRef)line->line, context);
+    if (!line->italic) {
+        CGContextSetTextPosition(context, x, baseline);
+        CTLineDraw((CTLineRef)line->line, context);
+    } else {
+        // Run by run: the runs whose font has no italic face are drawn under a shear about
+        // the baseline. The glyph positions of a run are relative to the line's origin, so
+        // the shear leaves them where the line put them and only tilts the glyphs.
+        CFArrayRef runs = CTLineGetGlyphRuns((CTLineRef)line->line);
+        for (CFIndex index = 0, count = CFArrayGetCount(runs); index < count; index++) {
+            CTRunRef run = (CTRunRef)CFArrayGetValueAtIndex(runs, index);
+            CGFloat slant = viva_run_needs_slant(run) ? VIVA_SYNTHETIC_ITALIC_SLANT : 0;
+            CGContextSetTextMatrix(context, CGAffineTransformMake(1, 0, slant, 1, x, baseline));
+            CTRunDraw(run, context, CFRangeMake(0, 0));
+        }
+        // The text matrix is not part of the saved state, and other labels set only a position.
+        CGContextSetTextMatrix(context, CGAffineTransformIdentity);
+    }
     CGContextRestoreGState(context);
 }
 
@@ -1232,7 +1425,7 @@ static NSUInteger viva_text_index_at(viva_editor_line line, NSString *shown, CGF
 //
 // A face from 2 up stands for an installed family and the families that draw what it
 // lacks; viva_register_mono_family teaches the numbers, in registration order.
-#define VIVA_MONO_FAMILY_SLOTS 4098 /* the 2 built-in faces and ui.MaxMonoFaces */
+#define VIVA_MONO_FAMILY_SLOTS 4098 /* the 2 built-in faces and gfx.MaxMonoFaces */
 static NSString *viva_mono_families[VIVA_MONO_FAMILY_SLOTS];
 static NSArray<NSString *> *viva_mono_fallbacks[VIVA_MONO_FAMILY_SLOTS];
 static BOOL viva_mono_classic[VIVA_MONO_FAMILY_SLOTS];
@@ -1794,25 +1987,40 @@ static CTLineRef viva_mono_fallback_line(NSString *value, NSFont *base, int face
     return line;
 }
 
-// viva_font_smoothing_enabled is whether the user leaves font smoothing on. AppKit turns it
-// off for its own text when AppleFontSmoothing is 0 (or not a number); a Core Graphics
-// bitmap context does not look at the setting, so the text Viva rasterizes into one has to
-// (measured against AppKit text: off draws the glyphs 13 to 28 percent lighter,
-// the lighter the text color the more, and every other value leaves smoothing on).
-static BOOL viva_font_smoothing_enabled(void) {
-    id value = [[NSUserDefaults standardUserDefaults] objectForKey:@"AppleFontSmoothing"];
-    if (value == nil) {
-        return YES;
+// viva_text_system_thickening reports whether the user leaves the system's own font
+// smoothing on, the weight AppKit's text starts at: AppleFontSmoothing absent or nonzero
+// means on, zero (or a value that is not a number, as AppKit reads it) off. A bitmap
+// context does not heed the setting, so the engine asks for it here, once, at its start;
+// standardUserDefaults reads the argument domain too, which is how tests pin it.
+int viva_text_system_thickening(void) {
+    @autoreleasepool {
+        NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+        if ([defaults objectForKey:@"AppleFontSmoothing"] == nil) {
+            return 1;
+        }
+        return [defaults integerForKey:@"AppleFontSmoothing"] != 0;
     }
-    // A number or a numeric string, as integerForKey: reads it; anything else is 0.
-    return [value respondsToSelector:@selector(integerValue)] && [value integerValue] != 0;
+}
+
+// viva_text_thickening is whether Viva draws its text with a thicker stroke, as AppKit draws
+// the system's own text: CoreText's font smoothing, which darkens the stems. Off is the
+// font's own outlines, so the glyphs stay the weight the font gives them (measured against
+// AppKit text: smoothing draws 16 to 45 percent more ink, the lighter the text the more).
+// It starts at the system's own weight (viva_text_system_thickening) and is then the
+// weight the application asked for.
+static int viva_text_thickening = 0;
+
+int viva_text_set_thickening(int thickening) {
+    int previous = viva_text_thickening;
+    viva_text_thickening = thickening;
+    return previous != thickening;
 }
 
 // viva_prepare_text_context sets a bitmap context up to draw text the way AppKit draws it.
 static void viva_prepare_text_context(CGContextRef context, CGFloat scale) {
     CGContextScaleCTM(context, scale, scale);
     CGContextSetTextMatrix(context, CGAffineTransformIdentity);
-    CGContextSetShouldSmoothFonts(context, viva_font_smoothing_enabled());
+    CGContextSetShouldSmoothFonts(context, viva_text_thickening != 0);
 }
 
 // viva_draw_terminal_preedit draws a terminal's preedit text the way the terminal draws its
@@ -1858,15 +2066,30 @@ static void viva_draw_terminal_preedit(
 // viva_new_editor_line is the geometry of the text the editor shows: one shaped line
 // shared with layout for proportional text, the terminal's cells for a terminal. A line
 // that was not made could not be shaped.
-static viva_editor_line viva_new_editor_line(NSString *shown, CGFloat fontSize, BOOL terminal, CGFloat cellWidth) {
+static viva_editor_line viva_new_editor_line(NSString *shown, CGFloat fontSize, CGFloat fontWeight, BOOL terminal, CGFloat cellWidth) {
     viva_editor_line line = {NULL, nil, 0};
     if (terminal) {
         line.grid = [shown copy];
         line.cell = cellWidth;
     } else {
-        line.shaped = viva_shared_text_line(shown, fontSize, 0);
+        line.shaped = viva_shared_text_line(shown, fontSize, fontWeight);
     }
     return line;
+}
+
+static CGFloat viva_editor_alignment_inset(viva_editor_line line, CGFloat width, int alignment, BOOL terminal) {
+    if (terminal || line.shaped == NULL || (alignment != 1 && alignment != 2)) {
+        return 0;
+    }
+    CGFloat free = MAX(0, width - line.shaped->width);
+    return alignment == 1 ? free / 2 : free;
+}
+
+static CGFloat viva_editor_visible_caret(CGFloat offset, CGFloat width, int alignment, BOOL terminal) {
+    if (alignment != 2 || terminal) {
+        return offset;
+    }
+    return MIN(offset, MAX(0, width - 2));
 }
 
 // viva_baseline is the height of the baseline above the bottom of a label's texture,
@@ -1879,6 +2102,53 @@ static CGFloat viva_baseline(CGFloat height, CGFloat fontSize, CGFloat pixelScal
     return (rows - fromTop) / pixelScale;
 }
 
+// viva_fixed_baseline is the height above a texture's bottom of the row a canvas worked out
+// for a fixed-pitch line, counted from the texture's top in points
+// (platform.TextLabel.Baseline), on a whole physical pixel.
+static CGFloat viva_fixed_baseline(CGFloat height, CGFloat fromTop, CGFloat pixelScale) {
+    CGFloat rows = MAX(1.0, ceil(height * pixelScale));
+    return (rows - floor(fromTop * pixelScale + 0.5)) / pixelScale;
+}
+
+int viva_text_line_rasterize(
+    const viva_text_line *line,
+    double font_size,
+    double scale,
+    size_t width,
+    size_t height,
+    double red,
+    double green,
+    double blue,
+    double alpha,
+    unsigned char *pixels
+) {
+    if (line == NULL || pixels == NULL || font_size <= 0 || scale <= 0 ||
+        width < 1 || height < 1 || width > 16384 || height > 16384 ||
+        width > SIZE_MAX / 4 || height > SIZE_MAX / (width * 4)) {
+        return 1;
+    }
+    @autoreleasepool {
+        memset(pixels, 0, width * height * 4);
+        CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
+        CGContextRef context = CGBitmapContextCreate(
+            pixels, width, height, 8, width * 4, colorSpace,
+            kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little
+        );
+        CGColorSpaceRelease(colorSpace);
+        if (context == NULL) {
+            return 1;
+        }
+        viva_prepare_text_context(context, scale);
+        CGColorRef color = CGColorCreateSRGB(red, green, blue, alpha);
+        CGFloat logicalHeight = (CGFloat)height / (CGFloat)scale;
+        CGFloat baseline = viva_baseline(logicalHeight, font_size, scale);
+        viva_draw_text_line(context, line, color, 0, baseline);
+        CGColorRelease(color);
+        CGContextRelease(context);
+        return 0;
+    }
+}
+
 // viva_text_input_texture rasterizes the native editor's current appearance:
 // the shown text (bullets for a password), the selection or composition, and
 // the caret when it is in its visible phase. It returns a retained texture, or
@@ -1888,6 +2158,7 @@ static id<MTLTexture> viva_text_input_texture(
     CGFloat scale,
     NSString *shown,
     CGFloat fontSize,
+    CGFloat fontWeight,
     NSColor *color,
     NSSize frameSize,
     NSRange selectedRange,
@@ -1897,7 +2168,9 @@ static id<MTLTexture> viva_text_input_texture(
     BOOL terminal,
     BOOL hideNativeOverlays,
     int monoFace,
-    CGFloat cellWidth
+    CGFloat cellWidth,
+    CGFloat cellBaseline,
+    int alignment
 ) {
     size_t pixelWidth = (size_t)MAX(1.0, ceil(frameSize.width * scale));
     size_t pixelHeight = (size_t)MAX(1.0, ceil(frameSize.height * scale));
@@ -1930,26 +2203,28 @@ static id<MTLTexture> viva_text_input_texture(
     }
 
     viva_prepare_text_context(context, scale);
-    viva_editor_line line = viva_new_editor_line(shown, fontSize, terminal, cellWidth);
+    viva_editor_line line = viva_new_editor_line(shown, fontSize, fontWeight, terminal, cellWidth);
     if (!viva_editor_line_made(line)) {
         CGContextRelease(context);
         free(pixels);
         return nil;
     }
+    CGFloat inset = viva_editor_alignment_inset(line, frameSize.width, alignment, terminal);
 
     CGFloat ascent = 0;
     CGFloat descent = 0;
     CGFloat baseline = 0;
     if (terminal) {
-        // Sit on the same baseline as the terminal's own text, whatever the
-        // composed characters' fallback fonts measure.
-        // The primary font alone: the fallbacks never take part in the metrics.
+        // Sit on the same row as the terminal's own text, whatever the composed
+        // characters' fallback fonts measure. The primary font alone stands in for the
+        // ascent and descent of the caret and selection, the fallbacks never taking part.
         CTFontRef gridFont = CTFontCreateWithName((CFStringRef)viva_mono_font_primary(fontSize, 0, monoFace).fontName, fontSize, NULL);
         ascent = CTFontGetAscent(gridFont);
         descent = CTFontGetDescent(gridFont);
         CFRelease(gridFont);
-        CGFloat pixelScale = ceil(scale);
-        baseline = ceil(((frameSize.height - ascent - descent) * 0.5 + descent) * pixelScale) / pixelScale;
+        baseline = cellBaseline > 0
+            ? viva_fixed_baseline(frameSize.height, cellBaseline, ceil(scale))
+            : viva_baseline(frameSize.height, fontSize, ceil(scale));
     } else {
         ascent = line.shaped->ascent;
         descent = line.shaped->descent;
@@ -1972,7 +2247,7 @@ static id<MTLTexture> viva_text_input_texture(
         for (size_t piece = 0; piece < count; piece++) {
             CGContextFillRect(
                 context,
-                CGRectMake(spans[2 * piece], baseline - descent, MAX(1.0, spans[2 * piece + 1]), ascent + descent)
+                CGRectMake(inset + spans[2 * piece], baseline - descent, MAX(1.0, spans[2 * piece + 1]), ascent + descent)
             );
         }
     }
@@ -1982,7 +2257,7 @@ static id<MTLTexture> viva_text_input_texture(
     } else {
         // The text is drawn as the one line the offsets above and below are read from, so
         // selection, caret and glyphs agree.
-        viva_draw_text_line(context, line.shaped, color.CGColor, 0, baseline);
+        viva_draw_text_line(context, line.shaped, color.CGColor, inset, baseline);
     }
 
     if (invisible) {
@@ -1994,10 +2269,10 @@ static id<MTLTexture> viva_text_input_texture(
         for (size_t piece = 0; piece < count; piece++) {
             // A terminal's row is only as tall as its text, so below the descenders is the
             // edge of the row, not two points further down, where nothing would be drawn.
-            CGContextFillRect(context, CGRectMake(spans[2 * piece], MAX(baseline - descent - 2.0, 0.0), MAX(1.0, spans[2 * piece + 1]), 1.0));
+            CGContextFillRect(context, CGRectMake(inset + spans[2 * piece], MAX(baseline - descent - 2.0, 0.0), MAX(1.0, spans[2 * piece + 1]), 1.0));
         }
     } else if (selected.length == 0 && caretVisible && !terminal && !hideNativeOverlays) {
-        CGFloat caret = viva_text_offset(line, selected.location, terminal);
+        CGFloat caret = viva_editor_visible_caret(inset + viva_text_offset(line, selected.location, terminal), frameSize.width, alignment, terminal);
         NSColor *caretColor = [color colorUsingColorSpace:[NSColorSpace sRGBColorSpace]];
         CGContextSetRGBFillColor(
             context,
@@ -2200,7 +2475,7 @@ static uint64_t viva_label_content_hash(viva_text_label config) {
     BOOL bitmap = (config.flags & VIVA_LABEL_BITMAP) != 0;
     float values[] = {bitmap ? 0 : config.width, bitmap ? 0 : config.height, config.font_size, config.font_weight,
                       config.red, config.green, config.blue, config.alpha, config.cell_width,
-                      viva_quantized_origin(config.origin_x), viva_quantized_origin(config.origin_y)};
+                      viva_quantized_origin(config.origin_x), viva_quantized_origin(config.origin_y), config.baseline};
     hash = viva_hash_bytes(hash, values, sizeof(values));
     uint32_t contentFlags = config.flags & ~VIVA_LABEL_CLIPPED;
     hash = viva_hash_bytes(hash, &contentFlags, sizeof(contentFlags));
@@ -2230,6 +2505,7 @@ static uint64_t viva_label_content_hash(viva_text_label config) {
     BOOL _clipped;
     CGFloat _fontSize;
     CGFloat _fontWeight;
+    BOOL _italic;
     CGFloat _red;
     CGFloat _green;
     CGFloat _blue;
@@ -2244,6 +2520,7 @@ static uint64_t viva_label_content_hash(viva_text_label config) {
     BOOL _mono;
     int _monoFace;
     CGFloat _cellWidth;
+    CGFloat _baseline;
     NSData *_utf8;       // the text as bytes, to slice into runs; only for run labels
     viva_text_run *_runs; // owned copy; NULL for an ordinary label
     size_t _runCount;
@@ -2254,6 +2531,20 @@ static uint64_t viva_label_content_hash(viva_text_label config) {
     uint64_t _bitmapID;
     uint32_t _bitmapVersion;
     id<MTLTexture> _texture;
+    NSMutableArray<id<MTLTexture>> *_additionalTextures;
+    // A text label wider than a texture holds is rasterized in part: its textures hold the
+    // device pixels _windowLeft to _windowRight of it, on the _windowPixelScale grid and
+    // counted from the frame's left edge. Unset, the texture holds the whole label.
+    BOOL _windowed;
+    size_t _windowLeft;
+    size_t _windowRight;
+    CGFloat _windowPixelScale;
+    BOOL _hasQuad;
+    // The shape the label's picture is drawn into this frame, and the colour
+    // multiplied into each of its corners (viva_text_label.quad, .tint). An
+    // ordinary label holds the corners of its box and opaque white.
+    float _quad[8];
+    float _tint[16];
 }
 - (instancetype)initWithConfig:(viva_text_label)config;
 - (BOOL)matchesConfig:(viva_text_label)config;
@@ -2261,15 +2552,23 @@ static uint64_t viva_label_content_hash(viva_text_label config) {
 - (BOOL)contentMatchesSizeAgnostic:(viva_text_label)config;
 - (void)updateFrame:(NSRect)frame;
 - (void)updateClipFromConfig:(viva_text_label)config;
+- (void)updateQuadFromConfig:(viva_text_label)config;
+- (const float *)quad;
+- (const float *)tint;
+- (NSRect)frame;
 - (BOOL)clipped;
 - (NSRect)clip;
-- (void)forceTextureRebuildWithDevice:(id<MTLDevice>)device scale:(CGFloat)scale;
+- (BOOL)forceTextureRebuildWithDevice:(id<MTLDevice>)device scale:(CGFloat)scale viewport:(NSSize)viewport;
 - (void)markContentRebuild;
-- (BOOL)rebuildWithDevice:(id<MTLDevice>)device scale:(CGFloat)scale;
+- (BOOL)rebuildWithDevice:(id<MTLDevice>)device scale:(CGFloat)scale viewport:(NSSize)viewport;
+- (BOOL)refreshWindowWithDevice:(id<MTLDevice>)device scale:(CGFloat)scale viewport:(NSSize)viewport;
 - (void)drawLineInContext:(CGContextRef)context pixelScale:(CGFloat)pixelScale;
 - (void)drawRunsInContext:(CGContextRef)context pixelScale:(CGFloat)pixelScale;
-- (id<MTLTexture>)texture;
-- (NSRect)frame;
+- (id<MTLTexture>)textureAtIndex:(NSUInteger)index;
+- (NSUInteger)textureCount;
+- (NSRect)quadAtIndex:(NSUInteger)index;
+- (NSRect)textureFrameAtIndex:(NSUInteger)index;
+- (CGFloat)rasterWidthScale:(CGFloat)scale;
 @end
 
 static NSData *viva_downsample_bitmap(NSData *source, uint32_t sourceWidth, uint32_t sourceHeight, uint32_t sourceStride, size_t width, size_t height) {
@@ -2337,6 +2636,63 @@ static BOOL viva_bitmap_extent_stale(size_t have, size_t need) {
     return need > have || have >= 2 * need;
 }
 
+// VIVA_LABEL_TEXTURE_LIMIT is the widest and tallest texture a label is rasterized into, in
+// pixels: the 2D texture limit of every Metal device Viva runs on.
+#define VIVA_LABEL_TEXTURE_LIMIT 16384
+#define VIVA_LABEL_TILE_WIDTH (VIVA_LABEL_TEXTURE_LIMIT - 2)
+
+// viva_label_visible_span clips the destination triangles to the clip and viewport,
+// then maps their visible UV range to source pixels, at most full.
+// NO when none of the label can be seen.
+static BOOL viva_label_visible_span(const float *quad, const float *tint, BOOL clipped, NSRect clip, NSSize viewport,
+                                    size_t full, size_t *left, size_t *right) {
+    NSRect visible = NSMakeRect(0, 0, viewport.width, viewport.height);
+    if (clipped) {
+        visible = NSIntersectionRect(visible, clip);
+    }
+    if (NSIsEmptyRect(visible)) {
+        return NO;
+    }
+    float sourceLeft, sourceRight;
+    if (!viva_label_source_span(quad, tint, NSMinX(visible), NSMinY(visible), NSMaxX(visible), NSMaxY(visible), &sourceLeft, &sourceRight)) {
+        return NO;
+    }
+    CGFloat from = floor((double)sourceLeft * full);
+    CGFloat to = ceil((double)sourceRight * full);
+    *left = (size_t)MIN(MAX(from, 0), (CGFloat)full);
+    *right = (size_t)MIN(MAX(to, 0), (CGFloat)full);
+    return *right > *left;
+}
+
+// viva_label_window chooses the device pixels of a label full pixels wide that a texture of
+// at most limit pixels holds. The visible span left to right is kept with as much margin on
+// both sides as the span itself, so a scroll of up to a viewport keeps the texture; at an
+// end of the label the margin goes to the other side. A span wider than limit is split
+// across textures, without a margin. A label none of which is visible keeps its start.
+static void viva_label_window(size_t full, size_t limit, BOOL visible, size_t left, size_t right,
+                              size_t *windowLeft, size_t *windowRight) {
+    size_t width = MIN(full, limit);
+    if (!visible) {
+        *windowLeft = 0;
+        *windowRight = width;
+        return;
+    }
+    size_t span = right - left;
+    if (span >= width) {
+        *windowLeft = left;
+        *windowRight = right;
+        return;
+    }
+    size_t margin = MIN(span, (width - span) / 2);
+    width = span + 2 * margin;
+    size_t low = left > margin ? left - margin : 0;
+    if (low + width > full) {
+        low = full - width;
+    }
+    *windowLeft = low;
+    *windowRight = low + width;
+}
+
 @implementation VivaTextLayer
 
 - (instancetype)initWithConfig:(viva_text_label)config {
@@ -2360,8 +2716,10 @@ static BOOL viva_bitmap_extent_stale(size_t have, size_t need) {
         }
         _frame = NSMakeRect(config.x, config.y, config.width, config.height);
         [self updateClipFromConfig:config];
+        [self updateQuadFromConfig:config];
         _fontSize = config.font_size;
         _fontWeight = config.font_weight;
+        _italic = (config.flags & VIVA_LABEL_ITALIC) != 0;
         _red = config.red;
         _green = config.green;
         _blue = config.blue;
@@ -2374,6 +2732,7 @@ static BOOL viva_bitmap_extent_stale(size_t have, size_t need) {
         _mono = (config.flags & VIVA_LABEL_MONO) != 0;
         _monoFace = config.mono_face;
         _cellWidth = config.cell_width;
+        _baseline = config.baseline;
         if (config.run_count > 0 && config.runs != NULL) {
             _runs = malloc(config.run_count * sizeof(viva_text_run));
             if (_runs == NULL) {
@@ -2404,6 +2763,7 @@ static BOOL viva_bitmap_extent_stale(size_t have, size_t need) {
 
 - (void)dealloc {
     [_texture release];
+    [_additionalTextures release];
     [_value release];
     [_utf8 release];
     [_bitmap release];
@@ -2432,6 +2792,9 @@ static BOOL viva_bitmap_extent_stale(size_t have, size_t need) {
     if (_fontSize != config.font_size || _fontWeight != config.font_weight || _fontGeneration != config.font_generation) {
         return NO;
     }
+    if (_italic != ((config.flags & VIVA_LABEL_ITALIC) != 0)) {
+        return NO;
+    }
     if (_originX != viva_quantized_origin(config.origin_x) || _originY != viva_quantized_origin(config.origin_y)) {
         return NO;
     }
@@ -2440,7 +2803,7 @@ static BOOL viva_bitmap_extent_stale(size_t have, size_t need) {
         return NO;
     }
     if (_mono != ((config.flags & VIVA_LABEL_MONO) != 0) ||
-        _monoFace != config.mono_face || _cellWidth != config.cell_width ||
+        _monoFace != config.mono_face || _cellWidth != config.cell_width || _baseline != config.baseline ||
         _runCount != (config.runs == NULL ? 0 : config.run_count) ||
         (_runCount > 0 && memcmp(_runs, config.runs, _runCount * sizeof(viva_text_run)) != 0)) {
         return NO;
@@ -2477,6 +2840,44 @@ static BOOL viva_bitmap_extent_stale(size_t have, size_t need) {
     _clip = _clipped ? NSMakeRect(config.clip_x, config.clip_y, config.clip_width, config.clip_height) : NSZeroRect;
 }
 
+- (void)updateQuadFromConfig:(viva_text_label)config {
+    // The quad is where the label lands, not what it looks like: it changes
+    // every frame of an animation while the texture stays the same one.
+    BOOL hasQuad = NO;
+    for (int index = 0; index < 8; index++) {
+        _quad[index] = config.quad[index];
+        hasQuad = hasQuad || config.quad[index] != 0;
+    }
+    for (int index = 0; index < 16; index++) {
+        _tint[index] = config.tint[index];
+    }
+    _hasQuad = hasQuad;
+    if (hasQuad) {
+        return;
+    }
+    // An ordinary label keeps its box as the quad and opaque white as its tint,
+    // so the renderer has no case to special-case per frame.
+    _quad[0] = config.x;
+    _quad[1] = config.y;
+    _quad[2] = config.x + config.width;
+    _quad[3] = config.y;
+    _quad[4] = config.x;
+    _quad[5] = config.y + config.height;
+    _quad[6] = config.x + config.width;
+    _quad[7] = config.y + config.height;
+    for (int index = 0; index < 16; index++) {
+        _tint[index] = 1;
+    }
+}
+
+- (const float *)quad {
+    return _quad;
+}
+
+- (const float *)tint {
+    return _tint;
+}
+
 - (BOOL)clipped {
     return _clipped;
 }
@@ -2489,16 +2890,55 @@ static BOOL viva_bitmap_extent_stale(size_t have, size_t need) {
     _frame = frame;
 }
 
-- (void)forceTextureRebuildWithDevice:(id<MTLDevice>)device scale:(CGFloat)scale {
+- (BOOL)forceTextureRebuildWithDevice:(id<MTLDevice>)device scale:(CGFloat)scale viewport:(NSSize)viewport {
     _lastScale = 0;
-    [self rebuildWithDevice:device scale:scale];
+    return [self rebuildWithDevice:device scale:scale viewport:viewport];
 }
 
 - (void)markContentRebuild {
     viva_label_texture_rebuild_count++;
 }
 
-- (BOOL)rebuildWithDevice:(id<MTLDevice>)device scale:(CGFloat)scale {
+// refreshWindowWithDevice rasterizes a label held in part again when the part of it that
+// can be seen in viewport is no longer all in its texture: it moved, or its clip or the
+// viewport did. Any other label is left as it is.
+- (BOOL)refreshWindowWithDevice:(id<MTLDevice>)device scale:(CGFloat)scale viewport:(NSSize)viewport {
+    CGFloat widthScale = [self rasterWidthScale:scale];
+    if (_texture == nil || _lastScale != scale ||
+        viva_bitmap_extent_stale((size_t)ceil(_frame.size.width * _windowPixelScale), (size_t)ceil(_frame.size.width * widthScale))) {
+        _lastScale = 0;
+        BOOL rebuilt = [self rebuildWithDevice:device scale:scale viewport:viewport];
+        if (rebuilt) [self markContentRebuild];
+        return rebuilt;
+    }
+    if (!_windowed) {
+        return YES;
+    }
+    size_t full = (size_t)MAX(1.0, ceil(_frame.size.width * _windowPixelScale));
+    size_t left = 0, right = 0;
+    if (!viva_label_visible_span(_quad, _tint, _clipped, _clip, viewport, full, &left, &right) ||
+        (left >= _windowLeft && right <= _windowRight)) {
+        return YES;
+    }
+    _lastScale = 0;
+    if (![self rebuildWithDevice:device scale:scale viewport:viewport]) {
+        return NO;
+    }
+    [self markContentRebuild];
+    return YES;
+}
+
+- (CGFloat)rasterWidthScale:(CGFloat)scale {
+    CGFloat pixelScale = ceil(scale);
+    if (!_hasQuad || _frame.size.width <= 0) {
+        return pixelScale;
+    }
+    CGFloat top = hypot((double)_quad[2] - _quad[0], (double)_quad[3] - _quad[1]);
+    CGFloat bottom = hypot((double)_quad[6] - _quad[4], (double)_quad[7] - _quad[5]);
+    return MIN(pixelScale, MAX(1, ceil(MAX(top, bottom) * pixelScale)) / _frame.size.width);
+}
+
+- (BOOL)rebuildWithDevice:(id<MTLDevice>)device scale:(CGFloat)scale viewport:(NSSize)viewport {
     size_t wantWidth = 0, wantHeight = 0;
     if (_bitmap != nil) {
         viva_bitmap_texture_extent(_frame, scale, _bitmapWidth, _bitmapHeight, &wantWidth, &wantHeight);
@@ -2557,69 +2997,106 @@ static BOOL viva_bitmap_extent_stale(size_t have, size_t need) {
     // Rasterize on the integer physical-pixel grid: a fractional frame origin
     // must not bleed anti-aliasing across texel boundaries.
     CGFloat pixelScale = ceil(scale);
-    size_t pixelWidth = (size_t)MAX(1.0, ceil(_frame.size.width * pixelScale));
+    CGFloat widthScale = [self rasterWidthScale:scale];
+    size_t fullWidth = (size_t)MAX(1.0, ceil(_frame.size.width * widthScale));
     size_t pixelHeight = (size_t)MAX(1.0, ceil(_frame.size.height * pixelScale));
-    if (pixelWidth > 16384 || pixelHeight > 16384 || pixelWidth > SIZE_MAX / 4) {
+    if (pixelHeight > VIVA_LABEL_TEXTURE_LIMIT) {
         return NO;
     }
-    size_t rowBytes = pixelWidth * 4;
-    if (pixelHeight > SIZE_MAX / rowBytes) {
-        return NO;
+    // A line wider than a texture holds (a long line laid out at its full width and
+    // scrolled) is rasterized only around the part of it that can be seen.
+    BOOL windowed = fullWidth > VIVA_LABEL_TEXTURE_LIMIT;
+    size_t windowLeft = 0, windowRight = fullWidth;
+    if (windowed) {
+        size_t left = 0, right = 0;
+        BOOL visible = viva_label_visible_span(_quad, _tint, _clipped, _clip, viewport, fullWidth, &left, &right);
+        viva_label_window(fullWidth, VIVA_LABEL_TEXTURE_LIMIT, visible, left, right, &windowLeft, &windowRight);
     }
-    void *pixels = calloc(pixelHeight, rowBytes);
-    if (pixels == NULL) {
-        return NO;
-    }
-
-    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
-    CGContextRef context = CGBitmapContextCreate(
-        pixels,
-        pixelWidth,
-        pixelHeight,
-        8,
-        rowBytes,
-        colorSpace,
-        kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little
-    );
-    CGColorSpaceRelease(colorSpace);
-    if (context == NULL) {
+    id<MTLTexture> texture = nil;
+    NSMutableArray<id<MTLTexture>> *additionalTextures = nil;
+    for (size_t tileLeft = windowLeft; tileLeft < windowRight;) {
+        size_t tileRight = tileLeft + MIN(windowRight - tileLeft, VIVA_LABEL_TILE_WIDTH);
+        size_t textureLeft = tileLeft > 0 ? tileLeft - 1 : 0;
+        size_t textureRight = MIN(tileRight + 1, fullWidth);
+        size_t pixelWidth = textureRight - textureLeft;
+        size_t rowBytes = pixelWidth * 4;
+        if (pixelHeight > SIZE_MAX / rowBytes) {
+            [texture release];
+            [additionalTextures release];
+            return NO;
+        }
+        void *pixels = calloc(pixelHeight, rowBytes);
+        if (pixels == NULL) {
+            [texture release];
+            [additionalTextures release];
+            return NO;
+        }
+        CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
+        CGContextRef context = CGBitmapContextCreate(
+            pixels, pixelWidth, pixelHeight, 8, rowBytes, colorSpace,
+            kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little
+        );
+        CGColorSpaceRelease(colorSpace);
+        if (context == NULL) {
+            free(pixels);
+            [texture release];
+            [additionalTextures release];
+            return NO;
+        }
+        viva_prepare_text_context(context, pixelScale);
+        CGContextScaleCTM(context, widthScale / pixelScale, 1);
+        if (textureLeft > 0) {
+            CGContextTranslateCTM(context, -(CGFloat)textureLeft / widthScale, 0);
+        }
+        if (_runCount > 0) {
+            [self drawRunsInContext:context pixelScale:pixelScale];
+        } else {
+            [self drawLineInContext:context pixelScale:pixelScale];
+        }
+        MTLTextureDescriptor *descriptor = [MTLTextureDescriptor
+            texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                         width:pixelWidth
+                                        height:pixelHeight
+                                     mipmapped:NO];
+        descriptor.storageMode = MTLStorageModeShared;
+        descriptor.usage = MTLTextureUsageShaderRead;
+        id<MTLTexture> nextTexture = [device newTextureWithDescriptor:descriptor];
+        if (nextTexture != nil) {
+            [nextTexture replaceRegion:MTLRegionMake2D(0, 0, pixelWidth, pixelHeight)
+                           mipmapLevel:0 withBytes:pixels bytesPerRow:rowBytes];
+        }
+        CGContextRelease(context);
         free(pixels);
-        return NO;
-    }
-
-    // The bitmap is on the ceil(scale) grid and the texture is sampled down to the frame, so
-    // the context is scaled to that grid: scaling by the display scale draws the text too small
-    // wherever it is fractional.
-    viva_prepare_text_context(context, pixelScale);
-    if (_runCount > 0) {
-        [self drawRunsInContext:context pixelScale:pixelScale];
-    } else {
-        [self drawLineInContext:context pixelScale:pixelScale];
-    }
-
-    MTLTextureDescriptor *descriptor = [MTLTextureDescriptor
-        texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
-                                     width:pixelWidth
-                                    height:pixelHeight
-                                 mipmapped:NO];
-    descriptor.storageMode = MTLStorageModeShared;
-    descriptor.usage = MTLTextureUsageShaderRead;
-    id<MTLTexture> texture = [device newTextureWithDescriptor:descriptor];
-    if (texture != nil) {
-        [texture replaceRegion:MTLRegionMake2D(0, 0, pixelWidth, pixelHeight)
-                   mipmapLevel:0
-                     withBytes:pixels
-                   bytesPerRow:rowBytes];
-    }
-
-    CGContextRelease(context);
-    free(pixels);
-    if (texture == nil) {
-        return NO;
+        if (nextTexture == nil) {
+            [texture release];
+            [additionalTextures release];
+            return NO;
+        }
+        if (texture == nil) {
+            texture = nextTexture;
+        } else {
+            if (additionalTextures == nil) {
+                additionalTextures = [[NSMutableArray alloc] init];
+                if (additionalTextures == nil) {
+                    [nextTexture release];
+                    [texture release];
+                    return NO;
+                }
+            }
+            [additionalTextures addObject:nextTexture];
+            [nextTexture release];
+        }
+        tileLeft = tileRight;
     }
     [_texture release];
     _texture = texture;
+    [_additionalTextures release];
+    _additionalTextures = additionalTextures;
     _lastScale = scale;
+    _windowed = windowed;
+    _windowLeft = windowLeft;
+    _windowRight = windowRight;
+    _windowPixelScale = widthScale;
     return YES;
 }
 
@@ -2627,7 +3104,9 @@ static BOOL viva_bitmap_extent_stale(size_t have, size_t need) {
 // vertically centered.
 - (void)drawLineInContext:(CGContextRef)context pixelScale:(CGFloat)pixelScale {
     CGColorRef foreground = CGColorCreateSRGB(_red, _green, _blue, _alpha);
-    CGFloat baseline = viva_baseline(_frame.size.height, _fontSize, pixelScale);
+    CGFloat baseline = _baseline > 0
+        ? viva_fixed_baseline(_frame.size.height, _baseline, pixelScale)
+        : viva_baseline(_frame.size.height, _fontSize, pixelScale);
     // Text laid out at a fraction of a pixel below the frame: Core Graphics puts a baseline
     // on the next device row down (it floors in its y-up space, so AppKit does), and a
     // glyph at a fraction of a pixel across (it quantizes the position, in drawing the line).
@@ -2645,7 +3124,7 @@ static BOOL viva_bitmap_extent_stale(size_t have, size_t need) {
             CFRelease(line);
         }
     } else {
-        viva_text_line *shaped = viva_shared_text_line(_value, _fontSize, _fontWeight);
+        viva_text_line *shaped = viva_shared_text_line_style(_value, _fontSize, _fontWeight, _italic);
         if (shaped != NULL) {
             viva_draw_text_line(context, shaped, foreground, _originX, baseline);
             viva_text_line_release(shaped);
@@ -2660,7 +3139,9 @@ static BOOL viva_bitmap_extent_stale(size_t have, size_t need) {
 // one baseline taken from the base font.
 - (void)drawRunsInContext:(CGContextRef)context pixelScale:(CGFloat)pixelScale {
     NSFont *baseFont = viva_mono_font(_fontSize, _fontWeight, _monoFace);
-    CGFloat baseline = viva_baseline(_frame.size.height, _fontSize, pixelScale);
+    CGFloat baseline = _baseline > 0
+        ? viva_fixed_baseline(_frame.size.height, _baseline, pixelScale)
+        : viva_baseline(_frame.size.height, _fontSize, pixelScale);
     CGFloat hairline = 1.0 / pixelScale;
     const unsigned char *bytes = (const unsigned char *)_utf8.bytes;
     size_t length = _utf8.length;
@@ -2710,7 +3191,7 @@ static BOOL viva_bitmap_extent_stale(size_t have, size_t need) {
         CGColorRef foreground = CGColorCreateSRGB(run->red, run->green, run->blue, run->alpha);
         CGFloat cellLeft = (CGFloat)run->column * _cellWidth;
         CGFloat span = (CGFloat)run->cells * _cellWidth;
-        BOOL ascii = count <= kMaxGlyphRun;
+        BOOL ascii = YES;
         for (size_t at = 0; ascii && at < count; at++) {
             ascii = start[at] >= 0x20 && start[at] < 0x7F;
         }
@@ -2739,19 +3220,27 @@ static BOOL viva_bitmap_extent_stale(size_t have, size_t need) {
             }
         } else if (ascii) {
             // Plain ASCII needs no shaping in a fixed-pitch font: map the
-            // characters to glyphs and put glyph i exactly on cell i.
+            // characters to glyphs and put glyph i exactly on cell i. The run
+            // is drawn in pieces of kMaxGlyphRun, every glyph still on its
+            // own cell.
             UniChar characters[kMaxGlyphRun];
             CGGlyph glyphs[kMaxGlyphRun];
             CGPoint positions[kMaxGlyphRun];
-            for (size_t at = 0; at < count; at++) {
-                characters[at] = start[at];
-                positions[at] = CGPointMake(cellLeft + (CGFloat)at * _cellWidth, baseline);
-            }
-            CTFontGetGlyphsForCharacters(font, characters, glyphs, (CFIndex)count);
             CGContextSetFillColorWithColor(context, foreground);
             // Glyph positions are relative to the text position.
             CGContextSetTextPosition(context, 0, 0);
-            CTFontDrawGlyphs(font, glyphs, positions, (CFIndex)count, context);
+            for (size_t first = 0; first < count; first += kMaxGlyphRun) {
+                size_t piece = count - first;
+                if (piece > kMaxGlyphRun) {
+                    piece = kMaxGlyphRun;
+                }
+                for (size_t at = 0; at < piece; at++) {
+                    characters[at] = start[first + at];
+                    positions[at] = CGPointMake(cellLeft + (CGFloat)(first + at) * _cellWidth, baseline);
+                }
+                CTFontGetGlyphsForCharacters(font, characters, glyphs, (CFIndex)piece);
+                CTFontDrawGlyphs(font, glyphs, positions, (CFIndex)piece, context);
+            }
         } else {
             NSString *shown = [[NSString alloc] initWithBytes:start
                                                        length:count
@@ -2805,23 +3294,53 @@ static BOOL viva_bitmap_extent_stale(size_t have, size_t need) {
     }
 }
 
-- (id<MTLTexture>)texture {
-    return _texture;
+- (id<MTLTexture>)textureAtIndex:(NSUInteger)index {
+    return index == 0 ? _texture : [_additionalTextures objectAtIndex:index - 1];
+}
+
+- (NSUInteger)textureCount {
+    return 1 + _additionalTextures.count;
 }
 
 - (NSRect)frame {
     return _frame;
 }
 
+- (NSRect)quadAtIndex:(NSUInteger)index {
+    if (_bitmap != nil) {
+        return _frame;
+    }
+    size_t full = (size_t)MAX(1.0, ceil(_frame.size.width * _windowPixelScale));
+    size_t tileLeft = _windowLeft + index * VIVA_LABEL_TILE_WIDTH;
+    size_t tileRight = tileLeft + MIN(_windowRight - tileLeft, VIVA_LABEL_TILE_WIDTH);
+    CGFloat left = (CGFloat)tileLeft / _windowPixelScale;
+    CGFloat right = tileRight >= full ? _frame.size.width : (CGFloat)tileRight / _windowPixelScale;
+    return NSMakeRect(_frame.origin.x + left, _frame.origin.y, right - left, _frame.size.height);
+}
+
+- (NSRect)textureFrameAtIndex:(NSUInteger)index {
+    if (_bitmap != nil) return _frame;
+    size_t full = (size_t)MAX(1.0, ceil(_frame.size.width * _windowPixelScale));
+    size_t tileLeft = _windowLeft + index * VIVA_LABEL_TILE_WIDTH;
+    size_t tileRight = tileLeft + MIN(_windowRight - tileLeft, VIVA_LABEL_TILE_WIDTH);
+    size_t textureLeft = tileLeft > 0 ? tileLeft - 1 : 0;
+    size_t textureRight = MIN(tileRight + 1, full);
+    CGFloat left = (CGFloat)textureLeft / _windowPixelScale;
+    CGFloat right = textureRight >= full ? _frame.size.width : (CGFloat)textureRight / _windowPixelScale;
+    return NSMakeRect(_frame.origin.x + left, _frame.origin.y, right - left, _frame.size.height);
+}
+
 @end
 
 // Keep native windows and offscreen frames on the same retained-texture path.
+// viewport is the size of the window or frame the labels are drawn in, logical pixels.
 static int viva_update_label_layers(
     NSArray<VivaTextLayer *> *previous,
     const viva_text_label *labels,
     NSUInteger count,
     id<MTLDevice> device,
     CGFloat scale,
+    NSSize viewport,
     NSMutableArray<VivaTextLayer *> **updated
 ) {
     NSMutableArray<VivaTextLayer *> *replacement =
@@ -2861,8 +3380,13 @@ static int viva_update_label_layers(
                 labels[index].x, labels[index].y,
                 labels[index].width, labels[index].height)];
             [existing updateClipFromConfig:labels[index]];
-            // An image drawn at a new size may need a texture of another resolution.
-            if ((labels[index].flags & VIVA_LABEL_BITMAP) != 0 && ![existing rebuildWithDevice:device scale:scale]) {
+            [existing updateQuadFromConfig:labels[index]];
+            // An image drawn at a new size may need a texture of another resolution, and a
+            // line held in part another part of it.
+            BOOL rebuilt = (labels[index].flags & VIVA_LABEL_BITMAP) != 0
+                ? [existing rebuildWithDevice:device scale:scale viewport:viewport]
+                : [existing refreshWindowWithDevice:device scale:scale viewport:viewport];
+            if (!rebuilt) {
                 free(source);
                 [replacement release];
                 return 3;
@@ -2871,7 +3395,7 @@ static int viva_update_label_layers(
             continue;
         }
         VivaTextLayer *layer = [[VivaTextLayer alloc] initWithConfig:labels[index]];
-        if (layer == nil || ![layer rebuildWithDevice:device scale:scale]) {
+        if (layer == nil || ![layer rebuildWithDevice:device scale:scale viewport:viewport]) {
             int failure = layer == nil ? 2 : 3;
             free(source);
             [layer release];
@@ -2887,6 +3411,50 @@ static int viva_update_label_layers(
     return 0;
 }
 
+// viva_label_box_quad writes the four corners of an axis-aligned box in the
+// order the text vertex shader expects them: top-left, top-right, bottom-left,
+// bottom-right.
+static void viva_label_box_quad(float *quad, float x, float y, float width, float height) {
+    quad[0] = x;
+    quad[1] = y;
+    quad[2] = x + width;
+    quad[3] = y;
+    quad[4] = x;
+    quad[5] = y + height;
+    quad[6] = x + width;
+    quad[7] = y + height;
+}
+
+// viva_label_plain_tint writes the colour that leaves a label's pixels as they
+// are: opaque white at every corner.
+static void viva_label_plain_tint(float *tint) {
+    for (int index = 0; index < 16; index++) {
+        tint[index] = 1;
+    }
+}
+
+// viva_label_tile_mesh maps one texture tile's part of the label's triangles. A
+// label wider than a texture holds arrives in several tiles, each a horizontal
+// slice of the same picture; clipping the original triangles preserves their
+// affine texture coordinates and tints across tile boundaries.
+static size_t viva_label_tile_mesh(
+    const float *quad,
+    const float *tint,
+    NSRect frame,
+    NSRect tile,
+    NSRect texture,
+    viva_label_vertex *vertices
+) {
+    CGFloat width = frame.size.width > 0 ? frame.size.width : 1;
+    float left = (float)((tile.origin.x - frame.origin.x) / width);
+    float right = (float)((tile.origin.x + tile.size.width - frame.origin.x) / width);
+    left = fminf(fmaxf(left, 0), 1);
+    right = fminf(fmaxf(right, 0), 1);
+    float textureLeft = (float)((texture.origin.x - frame.origin.x) / width);
+    float textureRight = (float)((texture.origin.x + texture.size.width - frame.origin.x) / width);
+    return viva_label_tile_vertices(quad, tint, left, right, textureLeft, textureRight, vertices);
+}
+
 // viva_encode_input draws the native editor's texture.
 static void viva_encode_input(
     id<MTLRenderCommandEncoder> encoder,
@@ -2896,14 +3464,16 @@ static void viva_encode_input(
     NSSize viewport
 ) {
     float viewportSize[2] = {(float)viewport.width, (float)viewport.height};
-    float bounds[4] = {
-        (float)inputFrame.origin.x,
-        (float)inputFrame.origin.y,
-        (float)inputFrame.size.width,
-        (float)inputFrame.size.height,
-    };
+    float quad[8];
+    viva_label_box_quad(quad,
+                        (float)inputFrame.origin.x, (float)inputFrame.origin.y,
+                        (float)inputFrame.size.width, (float)inputFrame.size.height);
+    float tint[16];
+    viva_label_plain_tint(tint);
+    viva_label_vertex vertices[6];
+    viva_label_vertices(quad, tint, vertices);
     [encoder setRenderPipelineState:textPipeline];
-    [encoder setVertexBytes:&bounds length:sizeof(bounds) atIndex:0];
+    [encoder setVertexBytes:vertices length:sizeof(vertices) atIndex:2];
     [encoder setVertexBytes:&viewportSize length:sizeof(viewportSize) atIndex:1];
     [encoder setFragmentTexture:inputTexture atIndex:0];
     [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
@@ -2978,7 +3548,6 @@ static void viva_encode_scene(
         }
 
         VivaTextLayer *layer = [labels objectAtIndex:command.first];
-        NSRect frame = [layer frame];
         BOOL scissored = NO;
         if ([layer clipped]) {
             NSRect clip = [layer clip];
@@ -2993,18 +3562,18 @@ static void viva_encode_scene(
             [encoder setScissorRect:scissor];
             scissored = YES;
         }
-        float bounds[4] = {
-            (float)frame.origin.x,
-            (float)frame.origin.y,
-            (float)frame.size.width,
-            (float)frame.size.height,
-        };
         [encoder setRenderPipelineState:textPipeline];
-        [encoder setVertexBytes:&bounds length:sizeof(bounds) atIndex:0];
         [encoder setVertexBytes:&viewportSize length:sizeof(viewportSize) atIndex:1];
-        [encoder setFragmentTexture:[layer texture] atIndex:0];
-        [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
-        viva_gpu_draw_call_count++;
+        for (NSUInteger tile = 0; tile < [layer textureCount]; tile++) {
+            viva_label_vertex vertices[18];
+            size_t count = viva_label_tile_mesh([layer quad], [layer tint], [layer frame],
+                [layer quadAtIndex:tile], [layer textureFrameAtIndex:tile], vertices);
+            if (count == 0) continue;
+            [encoder setVertexBytes:vertices length:count * sizeof(viva_label_vertex) atIndex:2];
+            [encoder setFragmentTexture:[layer textureAtIndex:tile] atIndex:0];
+            [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:count];
+            viva_gpu_draw_call_count++;
+        }
         if (scissored) {
             [encoder setScissorRect:fullTarget];
         }
@@ -3229,10 +3798,15 @@ static void viva_encode_scene(
     id<MTLRenderPipelineState> _rectanglePipeline;
     id<MTLBuffer> _rectangleBuffer;
     NSUInteger _rectangleCount;
+    // Capacity is the slots the buffers hold; count is the instances the scene
+    // owns. An append past the capacity grows it by doubling; rebuilds
+    // re-tighten it to the exact count.
+    NSUInteger _rectangleCapacity;
     viva_clip *_rectangleClips;
     id<MTLRenderPipelineState> _textPipeline;
     NSMutableArray<VivaTextLayer *> *_textLabels;
     uint16_t *_textLabelLayers;
+    uint32_t *_textLabelShapesBefore;
     NSUInteger _textLabelCount;
     viva_composite_command *_compositeCommands;
     NSUInteger _compositeCommandCount;
@@ -3241,24 +3815,32 @@ static void viva_encode_scene(
     NSRect _textFrame;
     uint16_t _textLayer;
     CGFloat _textFontSize;
+    CGFloat _textFontWeight;
+    int _textAlignment;
     NSColor *_textColor;
     NSRange _selectedRange;
     NSRange _markedRange;
     BOOL _hasMarkedText;
+    BOOL _cancelingComposition;
+    BOOL _compositionCancelEmitted;
     BOOL _textInputEnabled;
     BOOL _textInputMultiline;
     BOOL _textPlaced;
     BOOL _textNavigationKeys;
     NSRect _textCaretFrame;
     BOOL _textSecure;
+    BOOL _textCopyOverride;
     BOOL _textTerminal;
     BOOL _textHideNativeOverlays;
     int _textMonoFace;
     CGFloat _textCellWidth; // a terminal's cell, which its preedit is laid on
+    CGFloat _textBaseline;  // the row of that cell its preedit stands on
     BOOL _textAltSendsEscape;
     BOOL _textKeyReleases;
     BOOL _interpretingKey;
     BOOL _interpretedConsumed;
+    BOOL _interpretedInsert;
+    NSRange _interpretedReplacement;
     NSString *_interpretedPlain;
     BOOL _secureEventInputOn;
     BOOL _dynamicTextInput;
@@ -3273,6 +3855,7 @@ static void viva_encode_scene(
     BOOL _keyEventsEnabled;
     BOOL _scrollEventsEnabled;
     BOOL _fileDropEnabled;
+    BOOL _modifierTapsEnabled;
     int _windowMode;
     CGFloat _titlebarHeight;
     BOOL _titlebarDragPending;
@@ -3286,6 +3869,7 @@ static void viva_encode_scene(
     BOOL _reportedFirstFrame;
     BOOL _profileEnabled;
     NSCursor *_cursor;
+    BOOL _nativeCursorActive;
 }
 
 - (instancetype)initWithFrame:(NSRect)frame
@@ -3310,8 +3894,10 @@ static void viva_encode_scene(
                      callbackHandle:(uintptr_t)callbackHandle
                         clearColor:(MTLClearColor)clearColor;
 - (void)enableFileDrops;
+- (void)setModifierTapsEnabled:(BOOL)enabled;
 - (void)render;
 - (void)renderWaitingForSchedule:(BOOL)wait;
+- (BOOL)recoverResources;
 - (int)updateRectangles:(const viva_rectangle *)rectangles
                   clips:(const viva_clip *)clips
               totalCount:(NSUInteger)totalCount
@@ -3325,6 +3911,7 @@ static void viva_encode_scene(
                                     clips:(const viva_clip *)clips
                             rectangleCount:(NSUInteger)rectangleCount
                                  textLayers:(const uint16_t *)textLayers
+                           textShapesBefore:(const uint32_t *)textShapesBefore
                                   textCount:(NSUInteger)textCount;
 - (int)updateAccessibility:(const viva_accessibility_node *)nodes
                      count:(NSUInteger)count;
@@ -3334,6 +3921,7 @@ static void viva_encode_scene(
        markedRange:(NSRange)markedRange
      hasMarkedText:(BOOL)hasMarkedText;
 - (int)updateTextInput:(viva_text_input_config)textInput;
+- (int)updateTextInput:(viva_text_input_config)textInput keepComposition:(BOOL)keep;
 - (void)setTitlebarHeight:(CGFloat)height;
 - (void)cancelTitlebarDrag;
 - (int)moveTextInputToFrame:(NSRect)frame;
@@ -3353,6 +3941,8 @@ static void viva_encode_scene(
        selectedRange:(NSRange)selectedRange
      replacementRange:(NSRange)replacementRange
              command:(int)command;
+- (void)cancelMarkedComposition;
+- (void)interpretKeyEvent:(NSEvent *)event;
 - (NSUInteger)textIndexForEvent:(NSEvent *)event;
 - (NSUInteger)textIndexForLocalPoint:(NSPoint)point;
 - (BOOL)eventIsInsideTextInput:(NSEvent *)event;
@@ -3435,6 +4025,7 @@ static int viva_navigation_command(SEL selector) {
         _rectanglePipeline = [rectanglePipeline retain];
         _rectangleBuffer = [rectangleBuffer retain];
         _rectangleCount = rectangleCount;
+        _rectangleCapacity = rectangleCount;
         if (rectangleCount > 0) {
             _rectangleClips = malloc(rectangleCount * sizeof(viva_clip));
             if (_rectangleClips == NULL) {
@@ -3451,10 +4042,12 @@ static int viva_navigation_command(SEL selector) {
         _textLayer = textInput.layer;
         _textCaretFrame = NSMakeRect(textInput.caret_x, textInput.caret_y, textInput.caret_width, textInput.caret_height);
         _textSecure = textInput.secure != 0;
+        _textCopyOverride = textInput.copy_override != 0;
         _textTerminal = textInput.terminal != 0;
         _textHideNativeOverlays = textInput.hide_native_overlays != 0;
         _textMonoFace = textInput.mono_face;
         _textCellWidth = textInput.cell_width;
+        _textBaseline = textInput.baseline;
         _textAltSendsEscape = textInput.alt_sends_escape != 0;
         _textKeyReleases = textInput.key_releases != 0;
         [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(keyWindowChanged:) name:NSWindowDidBecomeKeyNotification object:nil];
@@ -3474,6 +4067,8 @@ static int viva_navigation_command(SEL selector) {
             textInput.height
         );
         _textFontSize = textInput.font_size;
+        _textFontWeight = textInput.font_weight;
+        _textAlignment = textInput.placed || textInput.terminal ? 0 : textInput.alignment;
         _textColor = [[NSColor colorWithSRGBRed:textInput.red
                                           green:textInput.green
                                            blue:textInput.blue
@@ -3503,7 +4098,7 @@ static int viva_navigation_command(SEL selector) {
         _metalLayer.framebufferOnly = YES;
         /* A transparent clear color must reach the desktop through a frameless
          * surface. Opaque titled windows keep the normal fast path. */
-        _metalLayer.opaque = clearColor.alpha >= 1.0 && windowMode != VIVA_WINDOW_PANEL;
+        _metalLayer.opaque = clearColor.alpha >= 1.0 && windowMode != VIVA_WINDOW_PANEL && windowMode != VIVA_WINDOW_PREVIEW;
         _metalLayer.maximumDrawableCount = 2;
         _metalLayer.allowsNextDrawableTimeout = YES;
 
@@ -3529,12 +4124,14 @@ static int viva_navigation_command(SEL selector) {
         [tracking release];
         if (textLabelCount > 0) {
             _textLabelLayers = malloc(textLabelCount * sizeof(uint16_t));
-            if (_textLabelLayers == NULL) {
+            _textLabelShapesBefore = malloc(textLabelCount * sizeof(uint32_t));
+            if (_textLabelLayers == NULL || _textLabelShapesBefore == NULL) {
                 [self release];
                 return nil;
             }
             for (NSUInteger index = 0; index < textLabelCount; index++) {
                 _textLabelLayers[index] = textLabels[index].layer;
+                _textLabelShapesBefore[index] = textLabels[index].shapes_before;
             }
         }
         _textLabelCount = textLabelCount;
@@ -3557,6 +4154,7 @@ static int viva_navigation_command(SEL selector) {
                                                clips:_rectangleClips
                                       rectangleCount:rectangleCount
                                            textLayers:_textLabelLayers
+                                     textShapesBefore:_textLabelShapesBefore
                                             textCount:_textLabelCount]) {
             [self release];
             return nil;
@@ -3594,6 +4192,7 @@ static int viva_navigation_command(SEL selector) {
     free(_compositeCommands);
     free(_rectangleClips);
     free(_textLabelLayers);
+    free(_textLabelShapesBefore);
     [_cursor release];
     [_rectangleBuffer release];
     [_rectanglePipeline release];
@@ -3612,6 +4211,7 @@ static int viva_navigation_command(SEL selector) {
                                     clips:(const viva_clip *)clips
                             rectangleCount:(NSUInteger)rectangleCount
                                  textLayers:(const uint16_t *)textLayers
+                           textShapesBefore:(const uint32_t *)textShapesBefore
                                   textCount:(NSUInteger)textCount {
     if (rectangleCount > SIZE_MAX - textCount) {
         return NO;
@@ -3633,6 +4233,7 @@ static int viva_navigation_command(SEL selector) {
         clips,
         rectangleCount,
         textLayers,
+        textShapesBefore,
         textCount,
         replacement,
         capacity,
@@ -3649,7 +4250,7 @@ static int viva_navigation_command(SEL selector) {
 }
 
 - (BOOL)isOpaque {
-    return _windowMode != VIVA_WINDOW_PANEL;
+    return _windowMode != VIVA_WINDOW_PANEL && _windowMode != VIVA_WINDOW_PREVIEW;
 }
 
 - (BOOL)acceptsFirstResponder {
@@ -3687,7 +4288,9 @@ static int viva_navigation_command(SEL selector) {
 // resetCursorRects keeps the chosen shape across layout changes, after which
 // AppKit calls it having discarded the old rectangles.
 - (void)resetCursorRects {
-    if (_cursor != nil) {
+    NSPoint point = [self convertPoint:self.window.mouseLocationOutsideOfEventStream fromView:nil];
+    // A full-window cursor rectangle would override WebKit's hand or text cursor.
+    if (_cursor != nil && !viva_view_has_native_cursor(self, point)) {
         [self addCursorRect:self.bounds cursor:_cursor];
     }
 }
@@ -3788,9 +4391,11 @@ static int viva_navigation_command(SEL selector) {
         NSPoint at = event.locationInWindow;
         if (hypot(at.x - _titlebarDragOrigin.x, at.y - _titlebarDragOrigin.y) >= VIVA_TITLEBAR_DRAG_SLOP) {
             // The system's drag loop swallows the button release, so the
-            // application is told the pointer left, which cancels its press.
+            // application is told the press is over. It is a cancel, not an
+            // exit: an exit only says the pointer left the window, and a press
+            // keeps the pointer until its button comes up.
             _titlebarDragPending = NO;
-            [self emitPointerExit];
+            [self emitPointerEvent:VIVA_POINTER_CANCEL fromEvent:event];
             [self.window performWindowDragWithEvent:event];
             return;
         }
@@ -3802,7 +4407,28 @@ static int viva_navigation_command(SEL selector) {
 }
 
 - (void)mouseMoved:(NSEvent *)event {
+    NSPoint point = [self convertPoint:event.locationInWindow fromView:nil];
+    BOOL native = viva_view_has_native_cursor(self, point);
+    BOOL enteringNative = !_nativeCursorActive && native;
+    BOOL returningToCanvas = _nativeCursorActive && !native;
+    if (native != _nativeCursorActive) {
+        _nativeCursorActive = native;
+        [self.window invalidateCursorRectsForView:self];
+    }
+    // Host tracking areas also cover subviews; native content must not emit canvas moves or set its cursor.
+    if (native) {
+        // The pointer left Viva's content for the page, where moves are not emitted; the control it was over
+        // must not stay hovered.
+        if (enteringNative) {
+            [self emitPointerExit];
+        }
+        return;
+    }
     [self emitPointerEvent:VIVA_POINTER_MOVE fromEvent:event];
+    // Force restoration only when returning ownership; ordinary moves retain the Go cursor cache.
+    if (returningToCanvas && _cursor != nil) {
+        [_cursor set];
+    }
 }
 
 - (void)rightMouseDown:(NSEvent *)event {
@@ -3831,6 +4457,10 @@ static int viva_navigation_command(SEL selector) {
 }
 
 // ---- Files dragged from Finder ----
+
+- (void)setModifierTapsEnabled:(BOOL)enabled {
+    _modifierTapsEnabled = enabled;
+}
 
 - (void)enableFileDrops {
     _fileDropEnabled = YES;
@@ -3941,10 +4571,63 @@ static int viva_navigation_command(SEL selector) {
 
 - (void)keyDown:(NSEvent *)event {
     viva_probe_key(event.timestamp);
-    NSString *characters = event.charactersIgnoringModifiers;
+    NSString *characters = viva_key_characters(event);
 	BOOL control = (event.modifierFlags & NSEventModifierFlagControl) != 0;
 	BOOL command = (event.modifierFlags & NSEventModifierFlagCommand) != 0;
-	if (_keyEventsEnabled && _callbackHandle != 0 && (control || command) && characters.length > 0) {
+	int shortcutKey = characters.length == 0 ? 0 : viva_terminal_key_code([characters characterAtIndex:0]);
+    if (_textInputEnabled && !_hasMarkedText && !control && !command &&
+        shortcutKey == 0 && characters.length > 0 && _keyEventsEnabled && _callbackHandle != 0) {
+        // Let the input method start a composition before considering a plain
+        // or Option shortcut. An unchanged direct insertion is held until the
+        // application declines the chord; a composition or converted commit
+        // goes straight to the text service and never becomes a shortcut.
+        NSString *typed = event.characters;
+        _interpretingKey = YES;
+        _interpretedConsumed = NO;
+        _interpretedInsert = NO;
+        _interpretedPlain = typed;
+        // handleEvent also reports asynchronous ownership: an input method
+        // can take the first key before it publishes any marked text.
+        NSTextInputContext *context = self.inputContext;
+        BOOL interpreted = context != nil && [context handleEvent:event];
+        if (!interpreted) {
+            [self interpretKeyEvent:event];
+        }
+        _interpretingKey = NO;
+        _interpretedPlain = nil;
+        if (_interpretedConsumed || _hasMarkedText || (interpreted && !_interpretedInsert)) {
+            return;
+        }
+        NSData *base = [characters dataUsingEncoding:NSUTF8StringEncoding];
+        NSRange replacement = _interpretedReplacement;
+        if (base.length > 0 && vivaShortcutEvent(_callbackHandle, self, 0,
+                viva_modifier_flags(event.modifierFlags), event.isARepeat ? 1 : 0, base.bytes, base.length)) {
+            return;
+        }
+        BOOL alt = (event.modifierFlags & NSEventModifierFlagOption) != 0;
+        viva_key_event_count++;
+        if (_textTerminal && (_textKeyReleases || (alt && _textAltSendsEscape))) {
+            if (_textKeyReleases) {
+                /* The key's text stays the unshifted character, as the rest of
+                 * the keyboard protocol expects; what the key types goes to
+                 * typed. */
+                NSData *keyText = [[characters lowercaseString] dataUsingEncoding:NSUTF8StringEncoding];
+                NSData *typedText = alt ? nil : [typed dataUsingEncoding:NSUTF8StringEncoding];
+                vivaRawKeyEvent(_callbackHandle, self, 0, viva_modifier_flags(event.modifierFlags),
+                    event.isARepeat ? 1 : 0, (unsigned int)event.keyCode + 1, keyText.bytes, keyText.length,
+                    typedText.length > 0 ? typedText.bytes : NULL, typedText.length);
+            } else {
+                vivaKeyEvent(_callbackHandle, self, 0, viva_modifier_flags(event.modifierFlags),
+                    event.isARepeat ? 1 : 0, base.bytes, base.length);
+            }
+        } else if (_interpretedInsert) {
+            [self emitTextKind:VIVA_TEXT_INSERT text:typed selectedRange:NSMakeRange(0, 0)
+                replacementRange:replacement command:0];
+        }
+        return;
+    }
+	if (_keyEventsEnabled && _callbackHandle != 0 && !_hasMarkedText &&
+        characters.length > 0) {
 		int named = viva_terminal_key_code([characters characterAtIndex:0]);
 		if (named == 0) {
 			NSData *text = [characters dataUsingEncoding:NSUTF8StringEncoding];
@@ -3958,7 +4641,7 @@ static int viva_navigation_command(SEL selector) {
 					text.length)) {
 				return;
 			}
-		} else if (named == VIVA_KEY_ENTER) {
+		} else if (named == VIVA_KEY_ENTER && (control || command)) {
 			/* Control or Command with Return: a multiline field would make it a
 			 * line break, so the application is offered it first. */
 			if (vivaShortcutEvent(
@@ -4014,7 +4697,7 @@ static int viva_navigation_command(SEL selector) {
             _interpretingKey = YES;
             _interpretedConsumed = NO;
             _interpretedPlain = typed;
-            [self interpretKeyEvents:@[event]];
+            [self interpretKeyEvent:event];
             _interpretingKey = NO;
             _interpretedPlain = nil;
             if (!_interpretedConsumed && !_hasMarkedText) {
@@ -4027,14 +4710,17 @@ static int viva_navigation_command(SEL selector) {
             }
             return;
         }
-        [self interpretKeyEvents:@[event]];
+        [self interpretKeyEvent:event];
         return;
     }
     int key = characters.length == 0 ? 0 : viva_key_code([characters characterAtIndex:0]);
+    if (key == 0 && characters.length > 0) {
+        key = viva_terminal_key_code([characters characterAtIndex:0]);
+    }
     if (!viva_text_input_row_key_is_raw(_textInputEnabled && _textPlaced, _hasMarkedText, key, command) &&
         !viva_text_input_navigation_key_is_raw(_textInputEnabled && _textNavigationKeys, _hasMarkedText, key) &&
-        viva_text_input_should_interpret_key(_textInputEnabled, _textInputMultiline, key)) {
-        [self interpretKeyEvents:@[event]];
+        viva_text_input_should_interpret_key(_textInputEnabled, _textInputMultiline, _hasMarkedText, key)) {
+        [self interpretKeyEvent:event];
         return;
     }
     if (_keyEventsEnabled && _callbackHandle != 0) {
@@ -4076,6 +4762,17 @@ static int viva_navigation_command(SEL selector) {
             return;
         }
     }
+    if (_modifierTapsEnabled && _keyEventsEnabled && _callbackHandle != 0) {
+        /* The application listens for a modifier pressed on its own: report the
+         * press and the release, and still let AppKit and the input method have
+         * the event (a bare Shift switches an input method's language). */
+        int pressed = 0;
+        int key = viva_modifier_key_change(event.keyCode, (unsigned long)event.modifierFlags, &pressed);
+        if (key != 0) {
+            vivaRawKeyEvent(_callbackHandle, self, key, viva_modifier_flags(event.modifierFlags),
+                pressed ? 0 : 2, (unsigned int)event.keyCode + 1, NULL, 0, NULL, 0);
+        }
+    }
     [super flagsChanged:event];
 }
 
@@ -4083,7 +4780,7 @@ static int viva_navigation_command(SEL selector) {
     NSEventModifierFlags modifiers = event.modifierFlags &
         (NSEventModifierFlagCommand | NSEventModifierFlagControl |
          NSEventModifierFlagOption | NSEventModifierFlagShift);
-    NSString *characters = event.charactersIgnoringModifiers;
+    NSString *characters = viva_key_characters(event);
     if (_keyEventsEnabled && _callbackHandle != 0 && !_hasMarkedText && viva_control_tab(modifiers, characters)) {
         // AppKit's window keeps Control+Tab and Control+Shift+Tab to move the
         // key view and never passes them to keyDown:, so an application would
@@ -4169,6 +4866,13 @@ static int viva_navigation_command(SEL selector) {
 
 - (void)beginLiveResizeRelaxation {
     _liveResizeRelaxed = YES;
+    /* AppKit resizes the layer before the drawable drawn for the new bounds is
+     * presented; the default resize gravity would stretch the previous drawable
+     * across the new bounds. With presentsWithTransaction the drawable is shown
+     * in the same Core Animation transaction as the layer's new bounds, so the
+     * window never shows a scaled previous frame. The resize path waits for the
+     * frame to be scheduled before returning. */
+    _metalLayer.presentsWithTransaction = YES;
 }
 
 - (void)endLiveResizeRelaxation {
@@ -4178,12 +4882,13 @@ static int viva_navigation_command(SEL selector) {
     _liveResizeRelaxed = NO;
     CGFloat scale = MAX(_metalLayer.contentsScale, 1.0);
     for (VivaTextLayer *layer in _textLabels) {
-        [layer forceTextureRebuildWithDevice:_metalLayer.device scale:scale];
+        [layer forceTextureRebuildWithDevice:_metalLayer.device scale:scale viewport:self.bounds.size];
     }
     viva_label_texture_rebuild_count += _textLabels.count;
     // setNeedsDisplay is not honored without drawRect; render explicitly so
     // the refreshed textures actually reach the screen.
     [self render];
+    _metalLayer.presentsWithTransaction = NO;
 }
 
 - (void)viewDidChangeBackingProperties {
@@ -4203,7 +4908,7 @@ static int viva_navigation_command(SEL selector) {
 - (BOOL)rebuildTextLabels {
     CGFloat scale = MAX(_metalLayer.contentsScale, 1.0);
     for (VivaTextLayer *layer in _textLabels) {
-        if (![layer rebuildWithDevice:_metalLayer.device scale:scale]) {
+        if (![layer rebuildWithDevice:_metalLayer.device scale:scale viewport:self.bounds.size]) {
             return NO;
         }
     }
@@ -4252,6 +4957,10 @@ static void viva_set_secure_event_input(BOOL on) {
 
 - (void)keyWindowChanged:(NSNotification *)notification {
     [self syncSecureEventInput];
+    if ([notification.name isEqualToString:NSWindowDidBecomeKeyNotification] &&
+        notification.object == self.window && _callbackHandle != 0) {
+        vivaWindowActivated(_callbackHandle);
+    }
     // The keys that were down will be released to whichever window has the
     // keyboard now, so the application must let go of them here.
     if ([notification.name isEqualToString:NSWindowDidResignKeyNotification] &&
@@ -4261,7 +4970,7 @@ static void viva_set_secure_event_input(BOOL on) {
 }
 
 - (viva_editor_line)newTextLine {
-    return viva_new_editor_line([self displayedText], _textFontSize, _textTerminal, _textCellWidth);
+    return viva_new_editor_line([self displayedText], _textFontSize, _textFontWeight, _textTerminal, _textCellWidth);
 }
 
 - (BOOL)rebuildTextTexture {
@@ -4270,8 +4979,8 @@ static void viva_set_secure_event_input(BOOL on) {
     }
     id<MTLTexture> texture = viva_text_input_texture(
         _metalLayer.device, MAX(_metalLayer.contentsScale, 1.0), [self displayedText],
-        _textFontSize, _textColor, _textFrame.size, _selectedRange, _hasMarkedText,
-        _markedRange, _caretVisible, _textTerminal, _textHideNativeOverlays, _textMonoFace, _textCellWidth);
+        _textFontSize, _textFontWeight, _textColor, _textFrame.size, _selectedRange, _hasMarkedText,
+        _markedRange, _caretVisible, _textTerminal, _textHideNativeOverlays, _textMonoFace, _textCellWidth, _textBaseline, _textAlignment);
     if (texture == nil) {
         return NO;
     }
@@ -4392,9 +5101,11 @@ static void viva_set_secure_event_input(BOOL on) {
         }
 
         if (wait) {
-            // Live resize must not return to AppKit before the new frame is
-            // scheduled; otherwise the compositor stretches the previous
-            // drawable across the resized layer for one or more frames.
+            // A live resize must not return to AppKit before the frame is
+            // scheduled: with presentsWithTransaction set, the drawable is
+            // presented in the same transaction as the layer's new bounds, so
+            // the window never shows the previous frame stretched. A scroll
+            // gesture that can outrun the display uses the same path.
             [commandBuffer waitUntilScheduled];
         } else if (_profileEnabled && !_reportedFirstFrame) {
             [commandBuffer waitUntilScheduled];
@@ -4407,6 +5118,91 @@ static void viva_set_secure_event_input(BOOL on) {
             fflush(stderr);
             _reportedFirstFrame = YES;
         }
+    }
+}
+
+/* recoverResources makes the window's Metal resources again after the device
+ * stopped serving them: the driver was reset, the GPU hung, an external GPU was
+ * unplugged or switched, or an allocation failed under pressure. What the
+ * window shows lives in the application, so the scene is sent again as a
+ * rebuild; the label layers rebuild their textures on the new device here.
+ * Returns NO when the device, its queue or the pipelines cannot be made, which
+ * is when the window cannot go on. */
+- (BOOL)recoverResources {
+    if (viva_shader_library_bytes == NULL) {
+        return NO;
+    }
+    @autoreleasepool {
+        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        if (device == nil) {
+            return NO;
+        }
+        id<MTLCommandQueue> queue = [device newCommandQueue];
+        if (queue == nil) {
+            [device release];
+            return NO;
+        }
+        dispatch_data_t libraryData = dispatch_data_create(
+            viva_shader_library_bytes,
+            viva_shader_library_length,
+            dispatch_get_main_queue(),
+            DISPATCH_DATA_DESTRUCTOR_DEFAULT
+        );
+        NSError *libraryError = nil;
+        id<MTLLibrary> library = [device newLibraryWithData:libraryData error:&libraryError];
+        dispatch_release(libraryData);
+        if (library == nil) {
+            [queue release];
+            [device release];
+            return NO;
+        }
+        // Both pipelines, whatever the window had: the frame that failed asked
+        // for rectangles, and a label texture of the old device cannot be drawn
+        // by the new one.
+        id<MTLRenderPipelineState> rectanglePipeline = viva_create_pipeline(
+            device, library, @"viva_rectangle_vertex", @"viva_rectangle_fragment", NULL);
+        id<MTLRenderPipelineState> textPipeline = viva_create_pipeline(
+            device, library, @"viva_text_vertex", @"viva_text_fragment", NULL);
+        [library release];
+        if (rectanglePipeline == nil || textPipeline == nil) {
+            [rectanglePipeline release];
+            [textPipeline release];
+            [queue release];
+            [device release];
+            return NO;
+        }
+        _metalLayer.device = device;
+        [self updateDrawableSize];
+        [_commandQueue release];
+        _commandQueue = queue;
+        [_rectanglePipeline release];
+        _rectanglePipeline = rectanglePipeline;
+        [_textPipeline release];
+        _textPipeline = textPipeline;
+        // The instance buffers belonged to the old device; the application
+        // sends every instance again, as a rebuild.
+        [_rectangleBuffer release];
+        _rectangleBuffer = nil;
+        free(_rectangleClips);
+        _rectangleClips = NULL;
+        _rectangleCount = 0;
+        _rectangleCapacity = 0;
+        free(_compositeCommands);
+        _compositeCommands = NULL;
+        _compositeCommandCount = 0;
+        CGFloat scale = MAX(_metalLayer.contentsScale, 1.0);
+        for (VivaTextLayer *layer in _textLabels) {
+            if (![layer forceTextureRebuildWithDevice:device scale:scale viewport:self.bounds.size]) {
+                [device release];
+                return NO;
+            }
+        }
+        viva_label_texture_rebuild_count += _textLabels.count;
+        [device release];
+        if (_textInputEnabled && ![self rebuildTextTexture]) {
+            return NO;
+        }
+        return YES;
     }
 }
 
@@ -4437,21 +5233,15 @@ static void viva_set_secure_event_input(BOOL on) {
                 free(replacementClips);
                 return 3;
             }
-            if (_callbackHandle != 0) {
-                viva_rectangle *destination = replacement.contents;
-                for (NSUInteger index = 0; index < totalCount; index++) {
-                    destination[index].reserved0 =
-                        (float)vivaRectangleLayer(_callbackHandle, index);
-                }
-                [replacement didModifyRange:NSMakeRange(
-                    0, totalCount * sizeof(viva_rectangle))];
-            }
+            // The staged instances carry their layer in reserved0, so the
+            // bytes newBufferWithBytes copies are already complete.
         }
         if (![self replaceCompositePlanForRectangles:
                 replacement == nil ? NULL : replacement.contents
                                                clips:replacementClips
                                       rectangleCount:totalCount
                                            textLayers:_textLabelLayers
+                                     textShapesBefore:_textLabelShapesBefore
                                             textCount:_textLabelCount]) {
             [replacement release];
             free(replacementClips);
@@ -4462,6 +5252,7 @@ static void viva_set_secure_event_input(BOOL on) {
         _rectangleClips = replacementClips;
         _rectangleBuffer = replacement;
         _rectangleCount = totalCount;
+        _rectangleCapacity = totalCount;
         viva_gpu_uploaded_bytes += totalCount * sizeof(viva_rectangle);
         viva_gpu_full_rebuild_count++;
     } else {
@@ -4474,30 +5265,41 @@ static void viva_set_secure_event_input(BOOL on) {
             return 2;
         }
         BOOL grew = totalCount > _rectangleCount;
+        BOOL reallocated = NO;
         if (grew) {
-            // The scene appended instances. Both buffers are retained at their
-            // exact count, so grow them by copying the old contents and then
-            // writing the new tail. Existing instance slots keep their values.
+            // The scene appended instances. A stream that appends every frame
+            // must not allocate, copy and re-flush the whole buffer each time,
+            // so the buffers carry headroom; a rebuild re-tightens them to the
+            // exact count. The headroom is only made when the new count no
+            // longer fits: growing on every append multiplied the capacity by
+            // a quarter per frame while the scene appended one instance, and
+            // the request passed what the device hands out within a few dozen
+            // appends.
             if (first > _rectangleCount || first + count != totalCount) {
                 return 2;
             }
-            id<MTLBuffer> replacement = [_metalLayer.device
-                newBufferWithLength:totalCount * sizeof(viva_rectangle)
-                            options:MTLResourceStorageModeShared];
-            if (replacement == nil) {
-                return 3;
+            NSUInteger capacity = viva_rectangle_capacity(_rectangleCapacity, totalCount);
+            if (capacity != _rectangleCapacity) {
+                id<MTLBuffer> replacement = [_metalLayer.device
+                    newBufferWithLength:capacity * sizeof(viva_rectangle)
+                                options:MTLResourceStorageModeShared];
+                if (replacement == nil) {
+                    return 3;
+                }
+                viva_clip *replacementClips = malloc(capacity * sizeof(viva_clip));
+                if (replacementClips == NULL) {
+                    [replacement release];
+                    return 3;
+                }
+                memcpy(replacementClips, _rectangleClips, _rectangleCount * sizeof(viva_clip));
+                memcpy(replacement.contents, _rectangleBuffer.contents, _rectangleCount * sizeof(viva_rectangle));
+                [_rectangleBuffer release];
+                free(_rectangleClips);
+                _rectangleBuffer = replacement;
+                _rectangleClips = replacementClips;
+                _rectangleCapacity = capacity;
+                reallocated = YES;
             }
-            viva_clip *replacementClips = malloc(totalCount * sizeof(viva_clip));
-            if (replacementClips == NULL) {
-                [replacement release];
-                return 3;
-            }
-            memcpy(replacementClips, _rectangleClips, _rectangleCount * sizeof(viva_clip));
-            memcpy(replacement.contents, _rectangleBuffer.contents, _rectangleCount * sizeof(viva_rectangle));
-            [_rectangleBuffer release];
-            free(_rectangleClips);
-            _rectangleBuffer = replacement;
-            _rectangleClips = replacementClips;
             _rectangleCount = totalCount;
         }
         memcpy(_rectangleClips + first, clips, count * sizeof(viva_clip));
@@ -4506,21 +5308,17 @@ static void viva_set_secure_event_input(BOOL on) {
             rectangles,
             count * sizeof(viva_rectangle)
         );
-        if (_callbackHandle != 0) {
-            viva_rectangle *destination = _rectangleBuffer.contents;
-            for (NSUInteger index = first; index < first + count; index++) {
-                destination[index].reserved0 =
-                    (float)vivaRectangleLayer(_callbackHandle, index);
-            }
-        }
+        // The staged instances carry their layer in reserved0, so the memcpy
+        // above has already written every field this buffer holds.
         [_rectangleBuffer didModifyRange:NSMakeRange(
-            grew ? 0 : first * sizeof(viva_rectangle),
-            grew ? totalCount * sizeof(viva_rectangle) : count * sizeof(viva_rectangle)
+            reallocated ? 0 : first * sizeof(viva_rectangle),
+            reallocated ? totalCount * sizeof(viva_rectangle) : count * sizeof(viva_rectangle)
         )];
         if (![self replaceCompositePlanForRectangles:_rectangleBuffer.contents
                                                clips:_rectangleClips
                                       rectangleCount:_rectangleCount
                                            textLayers:_textLabelLayers
+                                     textShapesBefore:_textLabelShapesBefore
                                             textCount:_textLabelCount]) {
             return 3;
         }
@@ -4538,19 +5336,25 @@ static void viva_set_secure_event_input(BOOL on) {
               count:(NSUInteger)count {
     CGFloat scale = MAX(_metalLayer.contentsScale, 1.0);
     uint16_t *replacementLayers = NULL;
+    uint32_t *replacementShapesBefore = NULL;
     if (count > 0) {
         replacementLayers = malloc(count * sizeof(uint16_t));
-        if (replacementLayers == NULL) {
+        replacementShapesBefore = malloc(count * sizeof(uint32_t));
+        if (replacementLayers == NULL || replacementShapesBefore == NULL) {
+            free(replacementLayers);
+            free(replacementShapesBefore);
             return 3;
         }
         for (NSUInteger index = 0; index < count; index++) {
             replacementLayers[index] = labels[index].layer;
+            replacementShapesBefore[index] = labels[index].shapes_before;
         }
     }
     NSMutableArray<VivaTextLayer *> *replacement = nil;
-    int status = viva_update_label_layers(_textLabels, labels, count, _metalLayer.device, scale, &replacement);
+    int status = viva_update_label_layers(_textLabels, labels, count, _metalLayer.device, scale, self.bounds.size, &replacement);
     if (status != 0) {
         free(replacementLayers);
+        free(replacementShapesBefore);
         return status;
     }
     if (![self replaceCompositePlanForRectangles:
@@ -4558,15 +5362,19 @@ static void viva_set_secure_event_input(BOOL on) {
                                            clips:_rectangleClips
                                   rectangleCount:_rectangleCount
                                        textLayers:replacementLayers
+                                 textShapesBefore:replacementShapesBefore
                                         textCount:count]) {
         [replacement release];
         free(replacementLayers);
+        free(replacementShapesBefore);
         return 3;
     }
     [_textLabels release];
     _textLabels = replacement;
     free(_textLabelLayers);
+    free(_textLabelShapesBefore);
     _textLabelLayers = replacementLayers;
+    _textLabelShapesBefore = replacementShapesBefore;
     _textLabelCount = count;
     viva_label_update_count++;
     return 0;
@@ -4651,6 +5459,16 @@ static void viva_set_secure_event_input(BOOL on) {
 }
 
 - (int)updateTextInput:(viva_text_input_config)textInput {
+    return [self updateTextInput:textInput keepComposition:NO];
+}
+
+// updateTextInput:keepComposition: mirrors a new editor configuration into the
+// native surface. With keep set, the editor is the one that was already
+// focused and the application acknowledges the same text and selection: a
+// field that grows a row or moves keeps the input method's composition, where
+// an unkept update discards it. The frame, caret, texture and character
+// coordinates still follow, so the candidate window moves with the caret.
+- (int)updateTextInput:(viva_text_input_config)textInput keepComposition:(BOOL)keep {
     if (!_dynamicTextInput) {
         return 4;
     }
@@ -4676,22 +5494,27 @@ static void viva_set_secure_event_input(BOOL on) {
     }
 
     BOOL wasEnabled = _textInputEnabled;
-    _textInputEnabled = NO;
-    [self syncSecureEventInput];
-    _textSelectionDragging = NO;
-    [self stopCaretBlink];
-    if (wasEnabled) {
-        [self.inputContext discardMarkedText];
-        [self.inputContext deactivate];
+    keep = keep && wasEnabled && textInput.enabled != 0;
+    if (!keep) {
+        _textInputEnabled = NO;
+        [self syncSecureEventInput];
+        _textSelectionDragging = NO;
+        [self stopCaretBlink];
+        if (wasEnabled) {
+            [self.inputContext discardMarkedText];
+            [self.inputContext deactivate];
+        }
+        _hasMarkedText = NO;
     }
-    _hasMarkedText = NO;
 
     if (!textInput.enabled) {
         _textSecure = NO;
+        _textCopyOverride = NO;
         _textTerminal = NO;
         _textHideNativeOverlays = NO;
         _textMonoFace = 0;
         _textCellWidth = 0;
+        _textBaseline = 0;
         _textAltSendsEscape = NO;
         _textKeyReleases = NO;
         [_text release];
@@ -4702,6 +5525,8 @@ static void viva_set_secure_event_input(BOOL on) {
         _textTexture = nil;
         _textFrame = NSZeroRect;
         _textFontSize = 0;
+        _textFontWeight = 0;
+        _textAlignment = 0;
         _selectedRange = NSMakeRange(0, 0);
         _markedRange = NSMakeRange(0, 0);
         _textInputMultiline = NO;
@@ -4715,10 +5540,13 @@ static void viva_set_secure_event_input(BOOL on) {
 
     [_text release];
     _text = replacement;
+    _textCopyOverride = textInput.copy_override != 0;
     [_textColor release];
     _textColor = replacementColor;
     _textFrame = NSMakeRect(textInput.x, textInput.y, textInput.width, textInput.height);
     _textFontSize = textInput.font_size;
+    _textFontWeight = textInput.font_weight;
+    _textAlignment = textInput.placed || textInput.terminal ? 0 : textInput.alignment;
     _selectedRange = viva_clamp_range(
         NSMakeRange(textInput.selected_start, textInput.selected_length),
         _text.length
@@ -4738,6 +5566,7 @@ static void viva_set_secure_event_input(BOOL on) {
     _textHideNativeOverlays = textInput.hide_native_overlays != 0;
     _textMonoFace = textInput.mono_face;
     _textCellWidth = textInput.cell_width;
+    _textBaseline = textInput.baseline;
     _textAltSendsEscape = textInput.alt_sends_escape != 0;
     _textKeyReleases = textInput.key_releases != 0;
     _textInputEnabled = YES;
@@ -4745,6 +5574,13 @@ static void viva_set_secure_event_input(BOOL on) {
     _caretVisible = YES;
     if (![self rebuildTextTexture]) {
         return 3;
+    }
+    if (keep) {
+        // The input context stays active and composing; only where it points
+        // changed.
+        [self.inputContext invalidateCharacterCoordinates];
+        [self restartCaretBlink];
+        return 0;
     }
     [self.window makeFirstResponder:self];
     [self.inputContext activate];
@@ -4809,6 +5645,8 @@ static void viva_set_secure_event_input(BOOL on) {
         // exactly the typed character is the key itself, anything else (a dead
         // key, composition, a commit) belongs to the input method.
         if (kind == VIVA_TEXT_INSERT && !_hasMarkedText && _interpretedPlain != nil && [text isEqualToString:_interpretedPlain]) {
+            _interpretedInsert = YES;
+            _interpretedReplacement = replacementRange;
             return;
         }
         _interpretedConsumed = YES;
@@ -4835,10 +5673,48 @@ static void viva_set_secure_event_input(BOOL on) {
     );
 }
 
+- (void)cancelMarkedComposition {
+    if (_compositionCancelEmitted) {
+        return;
+    }
+    _compositionCancelEmitted = YES;
+    [self emitTextKind:VIVA_TEXT_CANCEL_COMPOSITION
+                  text:@""
+         selectedRange:NSMakeRange(0, 0)
+       replacementRange:NSMakeRange(NSNotFound, 0)
+               command:0];
+}
+
+/* interpretKeyEvent is the one place that knows the key being interpreted is
+ * Escape during an input-method composition. Inside that window an empty mark,
+ * an empty insert or cancelOperation: is the input method's explicit
+ * cancellation; outside it they keep their ordinary meaning. */
+- (void)interpretKeyEvent:(NSEvent *)event {
+    BOOL previousCanceling = _cancelingComposition;
+    BOOL previousEmitted = _compositionCancelEmitted;
+    NSString *characters = event.characters;
+    _cancelingComposition = _hasMarkedText && characters.length > 0 &&
+        viva_key_code([characters characterAtIndex:0]) == VIVA_KEY_ESCAPE;
+    _compositionCancelEmitted = NO;
+    [self interpretKeyEvents:@[event]];
+    _cancelingComposition = previousCanceling;
+    _compositionCancelEmitted = previousEmitted;
+}
+
 - (void)insertText:(id)string replacementRange:(NSRange)replacementRange {
     NSString *plain = [string isKindOfClass:[NSAttributedString class]]
         ? [(NSAttributedString *)string string]
         : (NSString *)string;
+    if (_cancelingComposition) {
+        if (_compositionCancelEmitted) {
+            return;
+        }
+        if (plain.length == 0) {
+            [self cancelMarkedComposition];
+            return;
+        }
+        _cancelingComposition = NO;
+    }
     [self emitTextKind:VIVA_TEXT_INSERT
                   text:plain ?: @""
          selectedRange:NSMakeRange(0, 0)
@@ -4852,6 +5728,16 @@ static void viva_set_secure_event_input(BOOL on) {
     NSString *plain = [string isKindOfClass:[NSAttributedString class]]
         ? [(NSAttributedString *)string string]
         : (NSString *)string;
+    if (_cancelingComposition) {
+        if (_compositionCancelEmitted) {
+            return;
+        }
+        if (plain.length == 0) {
+            [self cancelMarkedComposition];
+            return;
+        }
+        _cancelingComposition = NO;
+    }
     [self emitTextKind:VIVA_TEXT_SET_MARKED
                   text:plain ?: @""
          selectedRange:selectedRange
@@ -4909,6 +5795,7 @@ static void viva_set_secure_event_input(BOOL on) {
     if (!viva_editor_line_made(line)) {
         return _selectedRange.location;
     }
+    x -= viva_editor_alignment_inset(line, _textFrame.size.width, _textAlignment, _textTerminal);
     NSUInteger position = viva_text_index_at(line, [self displayedText], x, _textTerminal);
     viva_editor_line_free(line);
     return MIN(position, _text.length);
@@ -4960,7 +5847,10 @@ static void viva_set_secure_event_input(BOOL on) {
     CGFloat offset = 0;
     viva_editor_line line = [self newTextLine];
     if (viva_editor_line_made(line)) {
-        offset = [self textOffsetForIndex:safe.location line:line];
+        offset = viva_editor_visible_caret(
+            viva_editor_alignment_inset(line, _textFrame.size.width, _textAlignment, _textTerminal) +
+                [self textOffsetForIndex:safe.location line:line],
+            _textFrame.size.width, _textAlignment, _textTerminal);
         viva_editor_line_free(line);
     }
     NSRect local = NSMakeRect(
@@ -4982,35 +5872,55 @@ static void viva_set_secure_event_input(BOOL on) {
     return [self.window convertRectToScreen:windowRect];
 }
 
-// copy: puts the selected text on the pasteboard. A password field never
-// exports what it holds, and an empty selection leaves the pasteboard alone.
-- (void)copy:(id)sender {
+// A failed copy never emits a cut edit. A custom selection is supplied by the
+// application while the native primary selection remains an ordinary caret.
+- (BOOL)copyToPasteboard {
     if (!_textInputEnabled || _textSecure) {
-        return;
+        return NO;
     }
-    NSRange selected = viva_clamp_range(_selectedRange, _text.length);
-    if (selected.length == 0) {
-        return;
+    NSString *value = nil;
+    if (_textCopyOverride) {
+        size_t length = 0;
+        unsigned char *utf8 = vivaCopyText(_callbackHandle, self, &length);
+        if (utf8 == NULL || length == 0) {
+            free(utf8);
+            return NO;
+        }
+        value = [[NSString alloc] initWithBytes:utf8 length:length encoding:NSUTF8StringEncoding];
+        free(utf8);
+        if (value == nil) {
+            return NO;
+        }
+    } else {
+        NSRange selected = viva_clamp_range(_selectedRange, _text.length);
+        if (selected.length == 0) {
+            return NO;
+        }
+        value = [_text substringWithRange:selected];
     }
     NSPasteboard *pasteboard = viva_pasteboard();
     [pasteboard clearContents];
-    [pasteboard setString:[_text substringWithRange:selected] forType:NSPasteboardTypeString];
+    BOOL copied = [pasteboard setString:value forType:NSPasteboardTypeString];
+    if (_textCopyOverride) {
+        [value release];
+    }
+    return copied;
 }
 
-// cut: copies, then removes the selection exactly as Backspace would.
+- (void)copy:(id)sender {
+    [self copyToPasteboard];
+}
+
+// cut: copies, then asks the application to remove its selection.
 - (void)cut:(id)sender {
-    if (!_textInputEnabled || _textSecure) {
+    if (![self copyToPasteboard]) {
         return;
     }
-    if (viva_clamp_range(_selectedRange, _text.length).length == 0) {
-        return;
-    }
-    [self copy:sender];
-    [self emitTextKind:VIVA_TEXT_COMMAND_EVENT
+    [self emitTextKind:VIVA_TEXT_PASTE
                   text:@""
          selectedRange:NSMakeRange(0, 0)
        replacementRange:NSMakeRange(NSNotFound, 0)
-               command:VIVA_TEXT_DELETE_BACKWARD];
+               command:0];
 }
 
 // paste: inserts the pasteboard's text in place of the selection. Passwords may
@@ -5026,6 +5936,12 @@ static void viva_set_secure_event_input(BOOL on) {
         if (value.length > 0) {
             [self emitTextKind:VIVA_TEXT_PASTE
                           text:value
+                 selectedRange:NSMakeRange(0, 0)
+               replacementRange:NSMakeRange(NSNotFound, 0)
+                       command:0];
+        } else {
+            [self emitTextKind:VIVA_TEXT_PASTE_NO_TEXT
+                          text:@""
                  selectedRange:NSMakeRange(0, 0)
                replacementRange:NSMakeRange(NSNotFound, 0)
                        command:0];
@@ -5100,6 +6016,15 @@ static void viva_set_secure_event_input(BOOL on) {
         command = VIVA_TEXT_UNDO;
     } else if (selector == @selector(redo:)) {
         command = VIVA_TEXT_REDO;
+    } else if (selector == @selector(cancelOperation:)) {
+        if (_hasMarkedText) {
+            if (!_cancelingComposition) {
+                _compositionCancelEmitted = NO;
+            }
+            [self cancelMarkedComposition];
+            return;
+        }
+        command = viva_navigation_command(selector);
     } else {
         command = viva_navigation_command(selector);
     }
@@ -5143,6 +6068,20 @@ static void viva_set_secure_event_input(BOOL on) {
 }
 @end
 
+/* VivaPreview is the window of a WindowPreview: it is never key or main, and
+ * its style mask keeps it from bringing the application forward. */
+@interface VivaPreview : NSPanel
+@end
+
+@implementation VivaPreview
+- (BOOL)canBecomeKeyWindow {
+    return NO;
+}
+- (BOOL)canBecomeMainWindow {
+    return NO;
+}
+@end
+
 @interface VivaAppDelegate : NSObject <NSApplicationDelegate, NSWindowDelegate> {
     NSRect _anchor;
     BOOL _hasAnchor;
@@ -5172,15 +6111,20 @@ static void viva_set_secure_event_input(BOOL on) {
     BOOL _resizeEventsEnabled;
     BOOL _frameEventsEnabled;
     BOOL _minimizeEventsEnabled;
+    BOOL _visibilityEventsEnabled;
     BOOL _keyEventsEnabled;
     BOOL _scrollEventsEnabled;
     int _windowMode;
     CGFloat _titlebarHeight;
+    CGFloat _trafficLightScale;
+    BOOL _placingTrafficLights;
     NSMutableArray<NSView *> *_titlebarWatched; /* views whose frame changes re-center the traffic lights */
     BOOL _fullscreenTarget;
     BOOL _fullscreenTransition;
+    BOOL _alwaysOnTop;
     BOOL _closeInterceptEnabled;
     BOOL _fileDropEnabled;
+    BOOL _modifierTapsEnabled;
     BOOL _closeConfirmed;
     uintptr_t _callbackHandle;
     BOOL _running;
@@ -5188,6 +6132,7 @@ static void viva_set_secure_event_input(BOOL on) {
 }
 
 - (void)updateMinimumSize;
+- (void)setVivaContentSize:(NSSize)size;
 
 - (instancetype)initWithConfig:(viva_window_config)config
                          device:(id<MTLDevice>)device
@@ -5211,10 +6156,12 @@ static void viva_set_secure_event_input(BOOL on) {
                    closeInterceptEnabled:(BOOL)closeInterceptEnabled
                         callbackHandle:(uintptr_t)callbackHandle;
 - (void)setFileDropEnabled:(BOOL)enabled;
+- (void)setModifierTapsEnabled:(BOOL)enabled;
 - (void)confirmClose;
 - (void)hideWindow;
 - (void)showWindow;
 - (void)setFullscreen:(BOOL)fullscreen;
+- (void)setAlwaysOnTop:(BOOL)enabled;
 - (BOOL)isFullscreen;
 - (void)reopenWindow;
 - (BOOL)isPanel;
@@ -5278,10 +6225,12 @@ static void viva_set_secure_event_input(BOOL on) {
         _resizeEventsEnabled = resizeEventsEnabled;
         _frameEventsEnabled = config.frame_events_enabled != 0;
         _minimizeEventsEnabled = config.minimize_events_enabled != 0;
+        _visibilityEventsEnabled = config.visibility_events_enabled != 0;
         _keyEventsEnabled = keyEventsEnabled;
         _scrollEventsEnabled = scrollEventsEnabled;
         _windowMode = windowMode;
         _titlebarHeight = config.titlebar_height > 0 ? config.titlebar_height : VIVA_DEFAULT_TITLEBAR_HEIGHT;
+        _trafficLightScale = config.traffic_light_scale;
         _closeInterceptEnabled = closeInterceptEnabled;
         _callbackHandle = callbackHandle;
         _hasAnchor = config.has_anchor != 0;
@@ -5296,6 +6245,10 @@ static void viva_set_secure_event_input(BOOL on) {
 
 - (void)setFileDropEnabled:(BOOL)enabled {
     _fileDropEnabled = enabled;
+}
+
+- (void)setModifierTapsEnabled:(BOOL)enabled {
+    _modifierTapsEnabled = enabled;
 }
 
 - (void)dealloc {
@@ -5327,13 +6280,16 @@ static void viva_set_secure_event_input(BOOL on) {
                               NSWindowStyleMaskResizable;
     if (_windowMode == VIVA_WINDOW_FRAMELESS) {
         style = NSWindowStyleMaskBorderless;
-    } else if (_windowMode == VIVA_WINDOW_PANEL) {
+    } else if (_windowMode == VIVA_WINDOW_PANEL || _windowMode == VIVA_WINDOW_PREVIEW) {
         style = NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel;
     } else if (_windowMode == VIVA_WINDOW_CUSTOM_TITLEBAR) {
         style |= NSWindowStyleMaskFullSizeContentView;
     }
 
     Class windowClass = _windowMode == VIVA_WINDOW_PANEL ? [VivaPanel class] : [NSWindow class];
+    if (_windowMode == VIVA_WINDOW_PREVIEW) {
+        windowClass = [VivaPreview class];
+    }
     if (_windowMode == VIVA_WINDOW_FRAMELESS) {
         windowClass = [VivaFramelessWindow class];
     }
@@ -5346,10 +6302,25 @@ static void viva_set_secure_event_input(BOOL on) {
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(screenParametersChanged:)
                                                  name:NSApplicationDidChangeScreenParametersNotification object:nil];
     _window.releasedWhenClosed = NO;
-    if (_windowMode != VIVA_WINDOW_PANEL) {
+    if (_windowMode != VIVA_WINDOW_PANEL && _windowMode != VIVA_WINDOW_PREVIEW) {
         _window.collectionBehavior |= NSWindowCollectionBehaviorFullScreenPrimary;
     }
-    if (_windowMode == VIVA_WINDOW_PANEL) {
+    if (_windowMode == VIVA_WINDOW_PREVIEW) {
+        /* Over every window and every Space, and invisible to the pointer: a
+         * picture that follows a drag, which must not take any of its events. */
+        _window.minSize = NSMakeSize(1, 1);
+        _window.backgroundColor = [NSColor clearColor];
+        _window.opaque = NO;
+        _window.hasShadow = NO;
+        _window.ignoresMouseEvents = YES;
+        _window.animationBehavior = NSWindowAnimationBehaviorNone;
+        _window.level = NSStatusWindowLevel;
+        _window.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces |
+                                     NSWindowCollectionBehaviorFullScreenAuxiliary |
+                                     NSWindowCollectionBehaviorTransient |
+                                     NSWindowCollectionBehaviorIgnoresCycle;
+        ((NSPanel *)_window).hidesOnDeactivate = NO;
+    } else if (_windowMode == VIVA_WINDOW_PANEL) {
         _window.minSize = NSMakeSize(1, 1);
         _window.backgroundColor = [NSColor clearColor];
         _window.opaque = NO;
@@ -5412,6 +6383,7 @@ static void viva_set_secure_event_input(BOOL on) {
     if (_fileDropEnabled) {
         [view enableFileDrops];
     }
+    [view setModifierTapsEnabled:_modifierTapsEnabled];
     [view setTitlebarHeight:_titlebarHeight];
     if (_windowMode == VIVA_WINDOW_CUSTOM_TITLEBAR) {
         [self keepTrafficLightsCentered];
@@ -5434,14 +6406,19 @@ static void viva_set_secure_event_input(BOOL on) {
             [_window setFrame:[_window constrainFrameRect:fitted toScreen:screen] display:NO];
         }
     }
-    [_window makeKeyAndOrderFront:nil];
-    [_window makeFirstResponder:view];
-    if (_windowMode != VIVA_WINDOW_PANEL) {
-        // A panel appears without bringing the application forward.
-        [NSApp activateIgnoringOtherApps:YES];
+    if (_windowMode == VIVA_WINDOW_PREVIEW) {
+        /* It appears without taking the key or bringing the application forward. */
+        [_window orderFrontRegardless];
+    } else {
+        [_window makeKeyAndOrderFront:nil];
+        [_window makeFirstResponder:view];
+        if (_windowMode != VIVA_WINDOW_PANEL) {
+            // A panel appears without bringing the application forward.
+            [NSApp activateIgnoringOtherApps:YES];
+        }
+        viva_running_window = _window;
+        viva_running_view = view;
     }
-    viva_running_window = _window;
-    viva_running_view = view;
     [view render];
     if (viva_test_resize_enabled() && _resizeEventsEnabled && _window != nil) {
         NSRect frame = _window.frame;
@@ -5602,8 +6579,22 @@ static void viva_set_secure_event_input(BOOL on) {
  * or the container, so the placement is redone in that very pass and the
  * buttons are never drawn at the system's height. Entering and leaving full
  * screen replaces the container, so the watched views are collected again. */
+// Frame notifications may fire synchronously between setting frame and bounds.
+// Suppress reentry until the scaled drawing coordinates are fully restored.
+- (void)placeTrafficLights {
+    if (_placingTrafficLights) {
+        return;
+    }
+    _placingTrafficLights = YES;
+    @try {
+        viva_place_traffic_lights(_window, _titlebarHeight, _trafficLightScale);
+    } @finally {
+        _placingTrafficLights = NO;
+    }
+}
+
 - (void)keepTrafficLightsCentered {
-    viva_place_traffic_lights(_window, _titlebarHeight);
+    [self placeTrafficLights];
     if (_titlebarWatched == nil) {
         _titlebarWatched = [[NSMutableArray alloc] init];
     }
@@ -5630,7 +6621,7 @@ static void viva_set_secure_event_input(BOOL on) {
 
 - (void)titlebarChanged:(NSNotification *)notification {
     (void)notification;
-    viva_place_traffic_lights(_window, _titlebarHeight);
+    [self placeTrafficLights];
 }
 
 /* AppKit reports some of the buttons' moves a turn of the run loop late, so the
@@ -5638,7 +6629,7 @@ static void viva_set_secure_event_input(BOOL on) {
 - (void)windowDidResize:(NSNotification *)notification {
     (void)notification;
     if (_windowMode == VIVA_WINDOW_CUSTOM_TITLEBAR) {
-        viva_place_traffic_lights(_window, _titlebarHeight);
+        [self placeTrafficLights];
     }
     [self reportFrameChange];
 }
@@ -5714,6 +6705,15 @@ static void viva_set_secure_event_input(BOOL on) {
     }
 }
 
+// windowDidChangeOcclusionState covers what the user can see: a window that is covered, minimized,
+// hidden or on a space that is not showing is not visible.
+- (void)windowDidChangeOcclusionState:(NSNotification *)notification {
+    (void)notification;
+    if (_visibilityEventsEnabled && _running && _callbackHandle != 0) {
+        vivaWindowOccluded(_callbackHandle, _window.contentView, (_window.occlusionState & NSWindowOcclusionStateVisible) != 0);
+    }
+}
+
 - (BOOL)isFullscreen {
     return (_window.styleMask & NSWindowStyleMaskFullScreen) != 0;
 }
@@ -5724,6 +6724,11 @@ static void viva_set_secure_event_input(BOOL on) {
         _fullscreenTransition = YES;
         [_window toggleFullScreen:nil];
     }
+}
+
+- (void)setAlwaysOnTop:(BOOL)enabled {
+    _alwaysOnTop = enabled;
+    _window.level = enabled ? NSFloatingWindowLevel : NSNormalWindowLevel;
 }
 
 - (void)windowWillEnterFullScreen:(NSNotification *)notification {
@@ -5763,6 +6768,7 @@ static void viva_set_secure_event_input(BOOL on) {
     if (_windowMode == VIVA_WINDOW_CUSTOM_TITLEBAR) {
         [self keepTrafficLightsCentered];
     }
+    [self setAlwaysOnTop:_alwaysOnTop];
     [self setFullscreen:_fullscreenTarget];
     [self reportFrameChange];
 }
@@ -5808,8 +6814,10 @@ static void viva_set_secure_event_input(BOOL on) {
     _closeConfirmed = NO;
 }
 
+/* Whether this window is one the application's ordinary window handling
+ * leaves alone: no Dock reopen, no full screen. */
 - (BOOL)isPanel {
-    return _windowMode == VIVA_WINDOW_PANEL;
+    return _windowMode == VIVA_WINDOW_PANEL || _windowMode == VIVA_WINDOW_PREVIEW;
 }
 
 - (BOOL)isHidden {
@@ -5855,6 +6863,11 @@ static void viva_set_secure_event_input(BOOL on) {
     CGFloat primaryHeight = NSScreen.screens.firstObject.frame.size.height;
     NSRect content = NSMakeRect(_origin.x, primaryHeight - _origin.y - _height, _width, _height);
     NSRect frame = [_window frameRectForContentRect:content];
+    if (_windowMode == VIVA_WINDOW_PREVIEW) {
+        /* A drag's picture goes wherever the pointer is, even half off a screen. */
+        [_window setFrame:frame display:NO];
+        return;
+    }
     NSScreen *screen = nil;
     NSPoint middle = NSMakePoint(NSMidX(frame), NSMidY(frame));
     for (NSScreen *candidate in NSScreen.screens) {
@@ -5867,6 +6880,44 @@ static void viva_set_secure_event_input(BOOL on) {
         screen = NSScreen.mainScreen ?: NSScreen.screens.firstObject;
     }
     [_window setFrame:[_window constrainFrameRect:frame toScreen:screen] display:NO];
+}
+
+/* Puts the top-left of the content area at origin, in top-left screen
+ * coordinates. */
+- (void)moveContentTo:(NSPoint)origin {
+    if (_window == nil || !_running) {
+        return;
+    }
+    CGFloat primaryHeight = NSScreen.screens.firstObject.frame.size.height;
+    NSRect content = [_window contentRectForFrameRect:_window.frame];
+    content.origin = NSMakePoint(origin.x, primaryHeight - origin.y - content.size.height);
+    [_window setFrame:[_window frameRectForContentRect:content] display:NO];
+}
+
+/* Changes the content area while keeping its current top-left origin. */
+- (void)setVivaContentSize:(NSSize)size {
+    if (_window == nil || !_running || _window.miniaturized || _window.zoomed ||
+        (_window.styleMask & NSWindowStyleMaskFullScreen) != 0) {
+        return;
+    }
+    NSRect current = [_window contentRectForFrameRect:_window.frame];
+    NSSize minimum = _window.contentMinSize;
+    size.width = MAX(size.width, minimum.width);
+    size.height = MAX(size.height, minimum.height);
+    NSScreen *screen = _window.screen ?: NSScreen.mainScreen ?: NSScreen.screens.firstObject;
+    if (screen != nil) {
+        NSRect available = [_window contentRectForFrameRect:screen.visibleFrame];
+        size.width = MIN(size.width, available.size.width);
+        size.height = MIN(size.height, available.size.height);
+    }
+    NSRect wanted = NSMakeRect(current.origin.x, NSMaxY(current) - size.height, size.width, size.height);
+    NSRect frame = [_window frameRectForContentRect:wanted];
+    if (screen != nil) {
+        NSRect work = screen.visibleFrame;
+        frame.origin.x = MAX(NSMinX(work), MIN(frame.origin.x, NSMaxX(work) - frame.size.width));
+        frame.origin.y = MAX(NSMinY(work), MIN(frame.origin.y, NSMaxY(work) - frame.size.height));
+    }
+    [_window setFrame:frame display:YES];
 }
 
 /* The content area in top-left screen coordinates; NO before the window exists. */
@@ -6006,6 +7057,29 @@ static void viva_reset_profile_counters(void) {
         }
     }
 }
+
+/* Documents the system opened this application with, for the file types the
+ * bundle registers. AppKit sends one file to openFile and a batch to openFiles. */
+- (BOOL)application:(NSApplication *)application openFile:(NSString *)filename {
+    (void)application;
+    const char *text = filename.UTF8String;
+    if (text == NULL) {
+        return NO;
+    }
+    vivaOpenFile(text);
+    return YES;
+}
+
+- (void)application:(NSApplication *)application openFiles:(NSArray<NSString *> *)filenames {
+    (void)application;
+    for (NSString *path in filenames) {
+        const char *text = path.UTF8String;
+        if (text != NULL) {
+            vivaOpenFile(text);
+        }
+    }
+    [NSApp replyToOpenOrPrint:NSApplicationDelegateReplySuccess];
+}
 @end
 
 static VivaApplicationDelegate *viva_application_delegate;
@@ -6058,10 +7132,11 @@ void *viva_application_open_window(viva_window_config config) {
         id<MTLRenderPipelineState> textPipeline = nil;
         id<MTLBuffer> rectangleBuffer = nil;
         if (config.shader_library != NULL && config.shader_library_length > 0) {
+            viva_remember_shader_library(config.shader_library, config.shader_library_length);
             _Static_assert(sizeof(viva_rectangle) == 80, "rectangle ABI must be 80 bytes");
-            _Static_assert(sizeof(viva_text_label) == 160, "text label ABI must be 160 bytes");
+            _Static_assert(sizeof(viva_text_label) == 264, "text label ABI must be 264 bytes");
             _Static_assert(sizeof(viva_text_run) == 36, "text run ABI must be 36 bytes");
-            _Static_assert(sizeof(viva_composite_command) == 32, "composite command ABI must be 32 bytes");
+            _Static_assert(sizeof(viva_composite_command) == 36, "composite command ABI must be 36 bytes");
             dispatch_data_t libraryData = dispatch_data_create(
                 config.shader_library,
                 config.shader_library_length,
@@ -6165,6 +7240,7 @@ void *viva_application_open_window(viva_window_config config) {
                                                         closeInterceptEnabled:config.close_intercept_enabled != 0
                                                                    callbackHandle:config.callback_handle];
         [delegate setFileDropEnabled:config.file_drop_enabled != 0];
+        [delegate setModifierTapsEnabled:config.modifier_taps_enabled != 0];
         if (delegate == nil) {
             [rectangleBuffer release];
             [textPipeline release];
@@ -6373,6 +7449,25 @@ int viva_application_window_frame(void *window, double *out) {
     return found;
 }
 
+void viva_application_move_window(void *window, double x, double y) {
+    void (^work)(void) = ^{
+        VivaAppDelegate *delegate = viva_find_window(window);
+        [delegate moveContentTo:NSMakePoint(x, y)];
+    };
+    if ([NSThread isMainThread]) {
+        work();
+    } else {
+        dispatch_sync(dispatch_get_main_queue(), work);
+    }
+}
+
+void viva_application_set_window_size(void *window, double width, double height) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        VivaAppDelegate *delegate = viva_find_window(window);
+        [delegate setVivaContentSize:NSMakeSize(width, height)];
+    });
+}
+
 void viva_application_hide_window(void *window) {
     viva_post_window_event(VIVA_HIDE_EVENT, window);
 }
@@ -6408,6 +7503,25 @@ int viva_application_fullscreen(void *window) {
         dispatch_sync(dispatch_get_main_queue(), work);
     }
     return fullscreen;
+}
+
+int viva_application_set_always_on_top(void *window, int enabled) {
+    __block int found = 0;
+    void (^work)(void) = ^{
+        VivaAppDelegate *delegate = viva_find_window(window);
+        if (delegate != nil && [delegate isPanel]) {
+            found = -1;
+        } else if (delegate != nil) {
+            [delegate setAlwaysOnTop:enabled != 0];
+            found = 1;
+        }
+    };
+    if ([NSThread isMainThread]) {
+        work();
+    } else {
+        dispatch_sync(dispatch_get_main_queue(), work);
+    }
+    return found;
 }
 
 void viva_application_show_window(void *window) {
@@ -6487,6 +7601,15 @@ int viva_view_update_rectangles(
                        count:count
                      rebuild:rebuild != 0
                       render:render != 0];
+    }
+}
+
+int viva_view_recover(void *view) {
+    if (view == NULL) {
+        return 1;
+    }
+    @autoreleasepool {
+        return [(VivaMetalView *)view recoverResources] ? 0 : 1;
     }
 }
 
@@ -6595,6 +7718,15 @@ int viva_view_update_text_input(void *view, viva_text_input_config text_input) {
     }
 }
 
+int viva_view_update_text_input_keeping_composition(void *view, viva_text_input_config text_input) {
+    if (view == NULL) {
+        return 1;
+    }
+    @autoreleasepool {
+        return [(VivaMetalView *)view updateTextInput:text_input keepComposition:YES];
+    }
+}
+
 int viva_view_move_text_input(void *view, float x, float y, float width, float height) {
     if (view == NULL) {
         return 1;
@@ -6670,8 +7802,8 @@ int viva_measure_text(
     }
 }
 
-int viva_measure_mono(double font_size, int mono_face, double *advance, double *height) {
-    if (advance == NULL || height == NULL || font_size <= 0) {
+int viva_measure_mono(double font_size, int mono_face, double *advance, double *ascent, double *descent, double *leading, double *rule, double *heavy) {
+    if (advance == NULL || ascent == NULL || descent == NULL || leading == NULL || rule == NULL || heavy == NULL || font_size <= 0) {
         return 1;
     }
     @autoreleasepool {
@@ -6690,7 +7822,26 @@ int viva_measure_mono(double font_size, int mono_face, double *advance, double *
         CGSize advances;
         CTFontGetAdvancesForGlyphs(font, kCTFontOrientationHorizontal, &glyph, &advances, 1);
         *advance = advances.width;
-        *height = CTFontGetAscent(font) + CTFontGetDescent(font) + CTFontGetLeading(font);
+        *ascent = CTFontGetAscent(font);
+        *descent = CTFontGetDescent(font);
+        *leading = CTFontGetLeading(font);
+        // The weight of the face's own box drawing lines: the ink width of a light and a
+        // heavy stem, which the face may draw at a different weight than its underline.
+        // The lookup answers false when either is missing, and still fills the other, so
+        // each glyph is checked on its own.
+        *rule = 0;
+        *heavy = 0;
+        UniChar boxCharacters[2] = {0x2502, 0x2503};  /* │ ┃ */
+        CGGlyph boxGlyphs[2] = {0, 0};
+        CTFontGetGlyphsForCharacters(font, boxCharacters, boxGlyphs, 2);
+        CGRect bounds[2] = {CGRectZero, CGRectZero};
+        CTFontGetBoundingRectsForGlyphs(font, kCTFontOrientationHorizontal, boxGlyphs, bounds, 2);
+        if (boxGlyphs[0] != 0) {
+            *rule = bounds[0].size.width;
+        }
+        if (boxGlyphs[1] != 0) {
+            *heavy = bounds[1].size.width;
+        }
         CFRelease(font);
         return *advance > 0 ? 0 : 4;
     }
@@ -6753,6 +7904,7 @@ int viva_unregister_font_file(const char *path) {
     viva_clip *_rectangleClips;
     NSMutableArray<VivaTextLayer *> *_labels;
     uint16_t *_labelLayers;
+    uint32_t *_labelShapesBefore;
     NSUInteger _labelCount;
     viva_composite_command *_commands;
     NSUInteger _commandCount;
@@ -6768,11 +7920,23 @@ int viva_unregister_font_file(const char *path) {
 - (BOOL)setRectangles:(const viva_rectangle *)rectangles clips:(const viva_clip *)clips count:(NSUInteger)count;
 - (BOOL)setLabels:(const viva_text_label *)labels count:(NSUInteger)count;
 - (BOOL)setTextInput:(viva_text_input_config)config;
+- (size_t)labelTextureBytes;
 - (BOOL)renderInto:(unsigned char *)pixels capacity:(size_t)capacity
              width:(size_t *)width height:(size_t *)height;
 @end
 
 @implementation VivaOffscreen
+
+- (size_t)labelTextureBytes {
+    size_t bytes = 0;
+    for (VivaTextLayer *layer in _labels) {
+        for (NSUInteger index = 0; index < [layer textureCount]; index++) {
+            id<MTLTexture> texture = [layer textureAtIndex:index];
+            bytes += texture.width * texture.height * 4;
+        }
+    }
+    return bytes;
+}
 
 - (instancetype)initWithLibrary:(const unsigned char *)library
                          length:(size_t)length
@@ -6820,6 +7984,7 @@ int viva_unregister_font_file(const char *path) {
     free(_commands);
     free(_rectangleClips);
     free(_labelLayers);
+    free(_labelShapesBefore);
     [_inputTexture release];
     [_labels release];
     [_rectangleBuffer release];
@@ -6845,7 +8010,7 @@ int viva_unregister_font_file(const char *path) {
     size_t count = 0;
     int status = viva_plan_composite(
         _rectangleBuffer == nil ? NULL : _rectangleBuffer.contents, _rectangleClips, _rectangleCount,
-        _labelLayers, _labelCount, replacement, capacity, &count);
+        _labelLayers, _labelShapesBefore, _labelCount, replacement, capacity, &count);
     if (status != 0) {
         free(replacement);
         return NO;
@@ -6881,24 +8046,32 @@ int viva_unregister_font_file(const char *path) {
 
 - (BOOL)setLabels:(const viva_text_label *)labels count:(NSUInteger)count {
     uint16_t *replacementLayers = NULL;
+    uint32_t *replacementShapesBefore = NULL;
     if (count > 0) {
         replacementLayers = malloc(count * sizeof(uint16_t));
-        if (replacementLayers == NULL) {
+        replacementShapesBefore = malloc(count * sizeof(uint32_t));
+        if (replacementLayers == NULL || replacementShapesBefore == NULL) {
+            free(replacementLayers);
+            free(replacementShapesBefore);
             return NO;
         }
     }
     NSMutableArray<VivaTextLayer *> *replacement = nil;
-    if (viva_update_label_layers(_labels, labels, count, _device, _scale, &replacement) != 0) {
+    if (viva_update_label_layers(_labels, labels, count, _device, _scale, _size, &replacement) != 0) {
         free(replacementLayers);
+        free(replacementShapesBefore);
         return NO;
     }
     for (NSUInteger index = 0; index < count; index++) {
         replacementLayers[index] = labels[index].layer;
+        replacementShapesBefore[index] = labels[index].shapes_before;
     }
     [_labels release];
     _labels = replacement;
     free(_labelLayers);
+    free(_labelShapesBefore);
     _labelLayers = replacementLayers;
+    _labelShapesBefore = replacementShapesBefore;
     _labelCount = count;
     return [self replan];
 }
@@ -6924,11 +8097,12 @@ int viva_unregister_font_file(const char *path) {
     _inputFrame = NSMakeRect(config.x, config.y, config.width, config.height);
     _inputLayer = config.layer;
     _inputTexture = viva_text_input_texture(
-        _device, _scale, shown, config.font_size, color, _inputFrame.size,
+        _device, _scale, shown, config.font_size, config.font_weight, color, _inputFrame.size,
         NSMakeRange(config.selected_start, config.selected_length),
         config.has_marked_text != 0,
         NSMakeRange(config.marked_start, config.marked_length), YES, config.terminal != 0,
-        config.hide_native_overlays != 0, config.mono_face, config.cell_width);
+        config.hide_native_overlays != 0, config.mono_face, config.cell_width, config.baseline,
+        config.placed || config.terminal ? 0 : config.alignment);
     return _inputTexture != nil;
 }
 
@@ -7013,6 +8187,10 @@ int viva_offscreen_set_labels(void *offscreen, const viva_text_label *labels, si
     @autoreleasepool {
         return [(VivaOffscreen *)offscreen setLabels:labels count:count] ? 0 : 1;
     }
+}
+
+size_t viva_offscreen_label_texture_bytes(void *offscreen) {
+    return [(VivaOffscreen *)offscreen labelTextureBytes];
 }
 
 int viva_offscreen_set_text_input(void *offscreen, viva_text_input_config config) {

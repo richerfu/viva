@@ -6,14 +6,14 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/vivaui/viva/gfx"
 	webplatform "github.com/vivaui/viva/internal/platform/web"
-	"github.com/vivaui/viva/ui"
 )
 
 func defaultNativeReduceMotion() bool { return false }
 
 // nativeTextEngine is the platform's text engine; nil keeps the reference metrics.
-func defaultNativeTextEngine() ui.TextEngine { return nil }
+func defaultNativeTextEngine() gfx.TextEngine { return nil }
 
 func defaultNativePreferredLanguages() []string { return webplatform.PreferredLanguages() }
 
@@ -35,6 +35,10 @@ func defaultNativeSetClipboardText(value string) error {
 
 func defaultNativeHasClipboardImage() bool { return false }
 
+func defaultNativeClipboardFiles() ([]string, error) { return nil, ErrUnsupported }
+
+func defaultNativeSetClipboardFiles([]string) error { return ErrUnsupported }
+
 func defaultNativeClipboardImagePNG() ([]byte, error) {
 	return nil, webSystemError("read clipboard image", webplatform.ClipboardImagePNG())
 }
@@ -43,7 +47,7 @@ func defaultNativeSetCursor(cursor Cursor) error {
 	return webSystemError("set cursor", webplatform.SetCursorShape(uint8(cursor)))
 }
 
-func defaultNativeSetCursorImage(image *ui.CursorImage) error {
+func defaultNativeSetCursorImage(image *gfx.CursorImage) error {
 	return webSystemError("set cursor image", webplatform.SetCursorImage(image))
 }
 
@@ -61,9 +65,15 @@ func defaultNativeSaveFile(SaveFileOptions) (string, error) {
 	return path, webSystemError("save file", err)
 }
 
+func defaultNativeSaveFileWithCheckbox(SaveFileOptions, SaveFileCheckbox) (SaveFileSelection, error) {
+	return SaveFileSelection{}, fmt.Errorf("save file with checkbox: %w", ErrUnsupported)
+}
+
 func defaultNativeOpenURL(target string) error {
 	return webSystemError("open external URL", webplatform.OpenURL(target))
 }
+
+func defaultNativeRevealPath(string) error { return ErrUnsupported }
 
 func defaultNativePlaySystemSound(sound SystemSound) error {
 	return webSystemError("play system sound", webplatform.PlaySystemSound(uint8(sound)))

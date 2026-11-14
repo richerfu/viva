@@ -23,7 +23,7 @@ import (
 	"time"
 
 	"github.com/vivaui/viva/app"
-	"github.com/vivaui/viva/ui"
+	"github.com/vivaui/viva/gfx"
 )
 
 // step is how long a scenario waits for something that should happen at once, and
@@ -49,8 +49,8 @@ func main() {
 		control, err := application.OpenWindow(app.Config{
 			Title: "viva-conformance", Width: 320, Height: 120,
 			Invalidator: &runner.inv, OnWake: runner.drain,
-			Paint: func(canvas *ui.Canvas, size ui.Size) {
-				canvas.Label("running checks", ui.Rect{X: 12, Y: 12, Width: 280, Height: 24}, ui.TextStyle{Size: 14})
+			Paint: func(canvas *gfx.Canvas, size gfx.Size) {
+				canvas.Label("running checks", gfx.Rect{X: 12, Y: 12, Width: 280, Height: 24}, gfx.TextStyle{Size: 14})
 			},
 		}, nil)
 		if err != nil {
@@ -167,7 +167,7 @@ func (r *runner) open(title string, mode app.WindowMode, refuseClose bool) (*pro
 		config := app.Config{
 			Title: title, Width: 300, Height: 160, WindowMode: mode,
 			Invalidator: &p.inv, OnWake: func() { p.wakes.Add(1) },
-			Paint:    func(*ui.Canvas, ui.Size) { p.paints.Add(1) },
+			Paint:    func(*gfx.Canvas, gfx.Size) { p.paints.Add(1) },
 			OnClosed: func() { close(p.closed) },
 		}
 		if refuseClose {
@@ -301,6 +301,30 @@ func (r *runner) scenarios(results *report) {
 		return nil
 	})
 
+	check("a flood of Invalidate calls costs about one wake per frame", func() error {
+		p, err := r.open("flood", app.WindowTitled, false)
+		if err != nil {
+			return err
+		}
+		defer p.window.Close()
+		if err := p.waitFor("the first paint", func() bool { return p.paints.Load() >= 1 }); err != nil {
+			return err
+		}
+		time.Sleep(300 * time.Millisecond)
+		before, floodFor := p.wakes.Load(), 600*time.Millisecond
+		for end := time.Now().Add(floodFor); time.Now().Before(end); {
+			p.inv.Invalidate()
+		}
+		time.Sleep(quiet)
+		got := p.wakes.Load() - before
+		// The frame grid is 120 Hz; a few more allow for the first wake, which goes out at
+		// once, and a window thread that runs late.
+		if limit := int64(floodFor/(time.Second/120)) + 8; got < 1 || got > limit {
+			return fmt.Errorf("%d wakes in %v of constant Invalidate, want between 1 and %d", got, floodFor, limit)
+		}
+		return nil
+	})
+
 	check("a hidden window stays open and still receives wakes", func() error {
 		p, err := r.open("hidden", app.WindowTitled, false)
 		if err != nil {
@@ -334,6 +358,33 @@ func (r *runner) scenarios(results *report) {
 			return err
 		}
 		return nil
+	})
+
+	check("a hidden window runs OnWake but paints nothing until it is shown again", func() error {
+		p, err := r.open("occluded", app.WindowTitled, false)
+		if err != nil {
+			return err
+		}
+		defer p.window.Close()
+		if err := p.waitFor("the first paint", func() bool { return p.paints.Load() >= 1 }); err != nil {
+			return err
+		}
+		p.window.Hide()
+		time.Sleep(500 * time.Millisecond) // the platform's visibility change arrives
+		paints, wakes := p.paints.Load(), p.wakes.Load()
+		for range 3 {
+			p.inv.Invalidate()
+			time.Sleep(50 * time.Millisecond)
+		}
+		if err := p.waitFor("OnWake while hidden", func() bool { return p.wakes.Load() > wakes }); err != nil {
+			return err
+		}
+		time.Sleep(quiet)
+		if got := p.paints.Load() - paints; got != 0 {
+			return fmt.Errorf("a hidden window painted %d times", got)
+		}
+		p.window.Show()
+		return p.waitFor("the frame the hidden window missed", func() bool { return p.paints.Load() > paints })
 	})
 
 	check("a panel opens, paints, and closes from another goroutine", func() error {

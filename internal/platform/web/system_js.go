@@ -8,8 +8,8 @@ import (
 	"sync"
 	"syscall/js"
 
+	"github.com/vivaui/viva/gfx"
 	"github.com/vivaui/viva/internal/platform"
-	"github.com/vivaui/viva/ui"
 )
 
 var (
@@ -26,6 +26,12 @@ func ClipboardText() (string, error) {
 
 func SetClipboardText(string) error {
 	return fmt.Errorf("%w: Clipboard.writeText returns a Promise", ErrAsyncRequired)
+}
+
+// SetClipboardHTML is the synchronous form of the rich copy: the browser answers
+// it through a Promise, so use SetClipboardHTMLAsync.
+func SetClipboardHTML(html, alt string) error {
+	return fmt.Errorf("%w: Clipboard.write returns a Promise", ErrAsyncRequired)
 }
 
 // ClipboardImagePNG cannot answer synchronously: Clipboard.read returns a Promise.
@@ -200,7 +206,7 @@ func SetCursorShape(shape uint8) error {
 }
 
 // SetCursorImage makes the picture the pointer over the page, through the CSS cursor property.
-func SetCursorImage(image *ui.CursorImage) error {
+func SetCursorImage(image *gfx.CursorImage) error {
 	cursor, err := cursorImageCSS(image)
 	if err != nil {
 		return err
@@ -270,6 +276,7 @@ func cursorCSS(shape uint8) (string, error) {
 		"nwse-resize",
 		"nesw-resize",
 		"not-allowed",
+		"grabbing",
 		"none",
 	}
 	if int(shape) >= len(values) {

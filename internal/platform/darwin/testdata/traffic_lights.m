@@ -8,12 +8,15 @@ void vivaViewResized(uintptr_t handle, void *view, double width, double height) 
 void vivaRedrawRequested(uintptr_t handle, void *view) {}
 void vivaKeyEvent(uintptr_t handle, void *view, int key, int modifiers, int repeat, const unsigned char *utf8, size_t utf8Length) {}
 void vivaRawKeyEvent(uintptr_t handle, void *view, int key, int modifiers, int flags, unsigned int code, const unsigned char *utf8, size_t utf8Length, const unsigned char *typed, size_t typedLength) {}
+void vivaWindowActivated(uintptr_t handle) {}
 void vivaFocusLost(uintptr_t handle, void *view) {}
 int vivaTerminalCells(uint32_t character) { return 1; }
 int vivaAccessibilityAction(uintptr_t handle, void *view, uint64_t node, int action, double number, const unsigned char *utf8, size_t utf8Length, int start, int end) { return 0; }
 viva_text_line *vivaShapedLine(const unsigned char *utf8, size_t length, double size, double weight) { return viva_text_line_create(utf8, length, size, weight); }
+viva_text_line *vivaShapedLineStyle(const unsigned char *utf8, size_t length, double size, double weight, int italic) { return viva_text_line_create_style(utf8, length, size, weight, italic); }
 int vivaShortcutEvent(uintptr_t handle, void *view, int key, int modifiers, int repeat, const unsigned char *utf8, size_t utf8Length) { return 0; }
 void vivaOpenURL(const char *url) {}
+void vivaOpenFile(const char *path) {}
 int vivaApplicationQuitRequested(void) { return 0; }
 int vivaApplicationReopenRequested(void) { return 0; }
 int vivaFileDropEvent(uintptr_t handle, void *view, int phase, double x, double y, const char *paths, size_t length) { return 0; }
@@ -22,13 +25,14 @@ void vivaCloseRequested(uintptr_t handle, void *view) {}
 void vivaWindowClosed(uintptr_t handle) {}
 void vivaFrameChanged(uintptr_t handle, void *view, double x, double y, double width, double height) {}
 void vivaWindowMinimized(uintptr_t handle, void *view, int minimized) {}
+void vivaWindowOccluded(uintptr_t handle, void *view, int visible) {}
 void vivaWindowFullscreen(uintptr_t handle, void *view, int fullscreen) {}
 int vivaWindowReopenRequested(uintptr_t handle, void *view) { return 0; }
-uint16_t vivaRectangleLayer(uintptr_t handle, size_t index) { return 0; }
 int vivaPressAt(uintptr_t handle, double x, double y) { return 0; }
 void vivaTextInput(uintptr_t handle, void *view, int kind, const unsigned char *utf8,
                   size_t length, int64_t start, int64_t selectedLength,
                   int64_t replacementStart, int64_t replacementLength, int command) {}
+unsigned char *vivaCopyText(uintptr_t handle, void *view, size_t *length) { *length = 0; return NULL; }
 
 // A custom-titlebar window that is never ordered front: nothing appears on screen.
 static NSWindow *customTitlebarWindow(CGFloat width, CGFloat height) {
@@ -84,21 +88,49 @@ int main(void) {
         NSWindow *window = customTitlebarWindow(800, 600);
         CGFloat system = viva_traffic_light_center(window);
         assert(system > 0);
-        viva_place_traffic_lights(window, VIVA_DEFAULT_TITLEBAR_HEIGHT);
+        viva_place_traffic_lights(window, VIVA_DEFAULT_TITLEBAR_HEIGHT, 0);
         assertCenter(window, system, "in a strip of the system's height");
-        viva_place_traffic_lights(window, 20);
+        viva_place_traffic_lights(window, 20, 0);
         assertCenter(window, system, "in a strip shorter than the system's");
 
         // A taller strip centers them in it, and placing again changes nothing.
-        viva_place_traffic_lights(window, 36);
+        viva_place_traffic_lights(window, 36, 0);
         assertCenter(window, 18, "in a 36 point strip");
         assertAligned(window, "in a 36 point strip");
         assert(fabs(NSHeight(viva_titlebar_container(window).frame) - 36) < 0.01);
         NSRect container = viva_titlebar_container(window).frame;
-        viva_place_traffic_lights(window, 36);
+        viva_place_traffic_lights(window, 36, 0);
         assert(NSEqualRects(container, viva_titlebar_container(window).frame));
-        viva_place_traffic_lights(window, 44);
+        viva_place_traffic_lights(window, 44, 0);
         assertCenter(window, 22, "in a 44 point strip");
+
+        // Shrinking preserves centers and drawing bounds, and never compounds.
+        NSButton *close = [window standardWindowButton:NSWindowCloseButton];
+        NSSize originalSize = close.bounds.size;
+        CGFloat originalCenterX = NSMidX(close.frame);
+        const CGFloat compactScale = 0.9;
+        viva_place_traffic_lights(window, 44, compactScale);
+        assert(fabs(NSWidth(close.frame) - originalSize.width * compactScale) < 0.01);
+        assert(fabs(NSMidX(close.frame) - originalCenterX) < 0.01);
+        assert(NSEqualSizes(close.bounds.size, originalSize));
+        viva_place_traffic_lights(window, 44, compactScale);
+        assert(fabs(NSWidth(close.frame) - originalSize.width * compactScale) < 0.01);
+        assertCenter(window, 22, "after shrinking the native buttons");
+
+        // A strip of the system's height needs no placement, but the scale
+        // still shrinks the buttons around their original centers.
+        window = customTitlebarWindow(800, 600);
+        NSButton *systemClose = [window standardWindowButton:NSWindowCloseButton];
+        NSSize systemSize = systemClose.bounds.size;
+        CGFloat systemCenterX = NSMidX(systemClose.frame);
+        CGFloat systemCenterY = NSMidY(systemClose.frame);
+        viva_place_traffic_lights(window, VIVA_DEFAULT_TITLEBAR_HEIGHT, compactScale);
+        assert(fabs(NSWidth(systemClose.frame) - systemSize.width * compactScale) < 0.01);
+        assert(fabs(NSMidX(systemClose.frame) - systemCenterX) < 0.01);
+        assert(fabs(NSMidY(systemClose.frame) - systemCenterY) < 0.01);
+        assert(NSEqualSizes(systemClose.bounds.size, systemSize));
+        viva_place_traffic_lights(window, VIVA_DEFAULT_TITLEBAR_HEIGHT, compactScale);
+        assert(fabs(NSWidth(systemClose.frame) - systemSize.width * compactScale) < 0.01);
 
         // AppKit puts the buttons back whenever it lays the titlebar out, a
         // resize being one; the delegate puts them back in the same pass.
@@ -110,6 +142,14 @@ int main(void) {
         window.delegate = delegate;
         [delegate performSelector:@selector(keepTrafficLightsCentered)];
         assertCenter(window, 18, "once the delegate keeps them centered");
+        // Changing scale after observers are installed must not reenter while
+        // frame and drawing bounds are temporarily out of sync.
+        [delegate setValue:[NSNumber numberWithDouble:compactScale] forKey:@"_trafficLightScale"];
+        [delegate performSelector:@selector(keepTrafficLightsCentered)];
+        assertCenter(window, 18, "after scaling with active frame observers");
+        NSButton *scaledClose = [window standardWindowButton:NSWindowCloseButton];
+        assert(fabs(NSWidth(scaledClose.frame) / NSWidth(scaledClose.bounds) - compactScale) < 0.01);
+
         [window setFrame:NSMakeRect(0, 85, 1000, 700) display:NO];
         assertCenter(window, 18, "after the window grew");
         assertAligned(window, "after the window grew");
@@ -118,10 +158,15 @@ int main(void) {
         window.titlebarAppearsTransparent = NO;
         window.titlebarAppearsTransparent = YES;
         assertCenter(window, 18, "after the titlebar was restyled");
+        assert(fabs(NSWidth(scaledClose.frame) / NSWidth(scaledClose.bounds) - compactScale) < 0.01);
+        [delegate setAlwaysOnTop:YES];
+        assert(window.level == NSFloatingWindowLevel);
+        [delegate setAlwaysOnTop:NO];
+        assert(window.level == NSNormalWindowLevel);
         [delegate release];
 
         // A window with no traffic lights to move is left alone.
-        viva_place_traffic_lights(nil, 36);
+        viva_place_traffic_lights(nil, 36, 0);
         printf("traffic lights: ok (system center %.1f, strip 36 -> 18, strip 44 -> 22)\n", system);
     }
     return 0;

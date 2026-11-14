@@ -7,9 +7,9 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/vivaui/viva/gfx"
 	"github.com/vivaui/viva/internal/input"
 	"github.com/vivaui/viva/internal/platform"
-	"github.com/vivaui/viva/ui"
 )
 
 // wheelStep is how many logical pixels one notch of a mouse wheel scrolls, as the XCB backend has
@@ -149,7 +149,7 @@ func (w *gtkWindow) buttonAt(x, y, screenX, screenY float32, gdkButton uint32, d
 		w.pointer.pending = false
 	}
 	button := gdkPointerButton(gdkButton)
-	if button == ui.PointerButtonNone {
+	if button == gfx.PointerButtonNone {
 		return
 	}
 	if down {
@@ -335,6 +335,9 @@ func (w *gtkWindow) focusChanged(focused bool) {
 		w.ime.setFocused(focused)
 	}
 	if focused {
+		if w.config.OnActivate != nil {
+			w.config.OnActivate()
+		}
 		platform.NotifyAppearanceChanged()
 		return
 	}
@@ -456,10 +459,20 @@ func (w *gtkWindow) keyEvent(event uintptr) uintptr {
 		if w.ime != nil && w.ime.filtering() {
 			w.ime.filter(event)
 		}
+		w.tapModifier(key, keyEvent.Modifiers|key.Modifier(), repeat, false, e.HardwareKeycode)
 		return 1
 	}
-	if w.config.OnShortcut != nil && platform.ShortcutCandidate(keyEvent) && !w.text.ownsChord(keyEvent) {
-		frame, handled, err := w.config.OnShortcut(keyEvent)
+	shortcutEvent := keyEvent
+	if w.config.OnShortcut != nil && key == input.KeyUnknown {
+		shortcutEvent.Text = w.shortcutText(e, e.State&gdkShiftMask != 0)
+	}
+	if shortcutEvent.Key == input.KeySpace {
+		shortcutEvent.Key, shortcutEvent.Text = input.KeyUnknown, " "
+	}
+	if w.config.OnShortcut != nil && platform.ShortcutCandidate(shortcutEvent) &&
+		shortcutEvent.Modifiers&(input.ModifierControl|input.ModifierMeta) != 0 &&
+		e.State&(1<<7) == 0 && !(w.text != nil && w.text.state.Composing) && !w.text.ownsChord(keyEvent) {
+		frame, handled, err := w.config.OnShortcut(shortcutEvent)
 		w.present(frame, err)
 		if handled {
 			return 1
@@ -467,15 +480,46 @@ func (w *gtkWindow) keyEvent(event uintptr) uintptr {
 	}
 	// The input method gets the key first; one it takes comes back as a commit or a preedit change,
 	// and one it hands back arrives again as an ordinary key event.
-	if w.ime != nil && w.ime.filtering() && w.ime.filter(event) {
-		return 1
+	plainShortcut := w.config.OnShortcut != nil && platform.ShortcutCandidate(shortcutEvent) &&
+		shortcutEvent.Modifiers&(input.ModifierControl|input.ModifierMeta) == 0 &&
+		e.State&(1<<7) == 0 && !(w.text != nil && w.text.state.Composing) && !w.text.ownsChord(keyEvent)
+	if w.ime != nil && w.ime.filtering() {
+		if plainShortcut {
+			direct, _ := keysymRune(e.Keyval)
+			if w.ime.filterShortcut(event, shortcutEvent, string(direct)) {
+				return 1
+			}
+		} else if w.ime.filter(event) {
+			return 1
+		}
+	}
+	if plainShortcut {
+		frame, handled, err := w.config.OnShortcut(shortcutEvent)
+		w.present(frame, err)
+		if handled {
+			return 1
+		}
 	}
 	w.deliverKey(keyEvent)
 	return 1
 }
 
+// tapModifier tells the runtime about a modifier key going up or down when the
+// application listens for a modifier pressed on its own
+// (platform.Config.ModifierTaps). The input method has already had the key.
+func (w *gtkWindow) tapModifier(key input.Key, modifiers input.Modifiers, repeat, release bool, code uint16) {
+	if !w.config.ModifierTaps || w.config.OnKey == nil || !key.IsModifier() {
+		return
+	}
+	frame, err := w.config.OnKey(platform.KeyEvent{Key: key, Modifiers: modifiers, Repeat: repeat, Release: release, Code: uint32(code)})
+	w.present(frame, err)
+}
+
 func (w *gtkWindow) keyRelease(e *gdkEventKey, event uintptr) {
 	delete(w.keys.down, e.HardwareKeycode)
+	if key := normalizedKeysym(e.Keyval); key.IsModifier() && !w.wantsKeyReleases() {
+		w.tapModifier(key, gdkModifiers(e.State)&^key.Modifier(), false, true, e.HardwareKeycode)
+	}
 	if w.ime != nil && w.ime.filtering() && w.ime.filter(event) {
 		return
 	}

@@ -22,6 +22,37 @@
 //	text := session.Driver().Clipboard()
 //	session.Screenshot("after.png")
 //
+// Tree lists the controls of the frame with their role, identity, accessible name and state, and
+// Expect checks a condition about the frame (a text, a control's state, the focus, a clean
+// layout, every control named), failing with what the frame has instead. A control is named in
+// commands by its accessible name, by "id:home/save", or by role and name ("button:Save"), so a
+// control with no name of its own can still be operated:
+//
+//	session.Expect("state", "checkbox:", "unchecked")
+//	session.ClickLabel("id:home/auto")
+//	session.Expect("text", "Connected", "within", "5000")
+//
+// The clock belongs to the test: Now returns it, Advance moves it, and Frame
+// paints one frame without moving it. Transitioning reports whether the last
+// frame asked for the next one, so a test can prove that an animation ended:
+//
+//	session.Advance(200 * time.Millisecond)
+//	session.Expect("text", "Saved")
+//	if session.Transitioning() {
+//		t.Error("the transition is still running")
+//	}
+//
+// Access returns the last frame's accessibility tree in reading order: what
+// assistive technology is told about every control, with its role, bounds,
+// name, value, states and range. AccessByRole and AccessByName find one node,
+// as a screen reader or a test would:
+//
+//	node, ok := session.AccessByRole(gfx.RoleCheckbox, "Auto update")
+//	if !ok || !node.Checked { ... }
+//
+// A session has no notification center: Notifications returns the ones the
+// application sent, in order, instead of showing them.
+//
 // Record plays the animation clock and writes the frames whose pixels changed,
 // so a transition can be reviewed as a sequence rather than a still:
 //

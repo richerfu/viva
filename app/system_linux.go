@@ -7,8 +7,8 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/vivaui/viva/gfx"
 	linuxplatform "github.com/vivaui/viva/internal/platform/linux"
-	"github.com/vivaui/viva/ui"
 )
 
 // nativeReduceMotion is the desktop's preference for less animation: the settings portal,
@@ -16,7 +16,7 @@ import (
 func defaultNativeReduceMotion() bool { return linuxplatform.ReduceMotion() }
 
 // nativeTextEngine is the platform's text engine; nil keeps the reference metrics.
-func defaultNativeTextEngine() ui.TextEngine { return linuxplatform.TextEngine() }
+func defaultNativeTextEngine() gfx.TextEngine { return linuxplatform.TextEngine() }
 
 func defaultNativePreferredLanguages() []string { return languagesFromEnvironment(os.Getenv) }
 
@@ -35,6 +35,15 @@ func defaultNativeSetClipboardText(value string) error {
 
 func defaultNativeHasClipboardImage() bool { return linuxplatform.HasClipboardImage() }
 
+func defaultNativeClipboardFiles() ([]string, error) {
+	paths, err := linuxplatform.ClipboardFiles()
+	return paths, linuxSystemError(err)
+}
+
+func defaultNativeSetClipboardFiles(paths []string) error {
+	return linuxSystemError(linuxplatform.SetClipboardFiles(paths))
+}
+
 func defaultNativeClipboardImagePNG() ([]byte, error) {
 	png, err := linuxplatform.ClipboardImagePNG()
 	return png, linuxSystemError(err)
@@ -44,7 +53,7 @@ func defaultNativeSetCursor(cursor Cursor) error {
 	return linuxSystemError(linuxplatform.SetCursorShape(uint8(cursor)))
 }
 
-func defaultNativeSetCursorImage(image *ui.CursorImage) error {
+func defaultNativeSetCursorImage(image *gfx.CursorImage) error {
 	return linuxSystemError(linuxplatform.SetCursorImage(image))
 }
 
@@ -85,8 +94,30 @@ func defaultNativeSaveFile(options SaveFileOptions) (string, error) {
 	return path, linuxSystemError(err)
 }
 
+func defaultNativeSaveFileWithCheckbox(options SaveFileOptions, checkbox SaveFileCheckbox) (SaveFileSelection, error) {
+	filters := make([]linuxplatform.FileFilter, len(options.Filters))
+	for index, filter := range options.Filters {
+		filters[index] = linuxplatform.FileFilter{Name: filter.Name, Pattern: filter.Pattern}
+	}
+	path, checked, canceled, err := linuxplatform.SaveFileWithCheckbox(linuxplatform.SaveFileOptions{
+		Title: options.Title, SuggestedName: options.SuggestedName,
+		DefaultExtension: options.DefaultExtension, Filters: filters,
+	}, checkbox.Label, checkbox.Checked)
+	if canceled {
+		return SaveFileSelection{}, ErrCanceled
+	}
+	if err != nil {
+		return SaveFileSelection{}, linuxSystemError(err)
+	}
+	return SaveFileSelection{Path: path, Checked: checked}, nil
+}
+
 func defaultNativeOpenURL(target string) error {
 	return linuxSystemError(linuxplatform.OpenURL(target))
+}
+
+func defaultNativeRevealPath(path string) error {
+	return linuxSystemError(linuxplatform.RevealPath(path))
 }
 
 func defaultNativeOpenWith(executable, path string) error {

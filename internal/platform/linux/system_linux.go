@@ -189,8 +189,86 @@ func ClipboardImagePNG() ([]byte, error) {
 	return data, nil
 }
 
+// maxClipboardFileListBytes bounds the list of URIs an owner hands over:
+// MaxClipboardFiles long paths, escaped, fit with room to spare.
+const maxClipboardFileListBytes = 4 << 20
+
+// ClipboardFiles returns the paths of the files the X11 CLIPBOARD owner offers:
+// the x-special/gnome-copied-files target of Nautilus, Nemo, Caja and Thunar,
+// or the text/uri-list target KDE's Dolphin and most other toolkits use. The
+// owner is asked for its TARGETS first, because some hand over their text for
+// any target they are asked for.
+func ClipboardFiles() ([]string, error) {
+	if hooks := shellHooks.Load(); hooks != nil {
+		if hooks.clipboardFiles == nil {
+			return nil, platform.ErrNoClipboardFiles
+		}
+		return hooks.clipboardFiles()
+	}
+	if files, owned := ownedClipboardFiles(); owned {
+		if len(files) == 0 {
+			return nil, platform.ErrNoClipboardFiles
+		}
+		return files, nil
+	}
+	api, connection, requestor, clipboard, owner, err := openClipboardRequest()
+	if err != nil {
+		return nil, err
+	}
+	defer closeClipboardRequest(api, connection, requestor)
+	if owner == xcbAtomNone {
+		return nil, platform.ErrNoClipboardFiles
+	}
+	targets, err := api.atom(connection, "TARGETS")
+	if err != nil {
+		return nil, err
+	}
+	property, err := api.atom(connection, "VIVA_CLIPBOARD_TARGETS")
+	if err != nil {
+		return nil, err
+	}
+	data, kind, accepted, err := readSelectionBytes(api, connection, requestor, clipboard, targets, property, 1<<16)
+	if err != nil {
+		return nil, err
+	}
+	if !accepted || kind != xcbAtomAtom || len(data)%4 != 0 {
+		return nil, platform.ErrNoClipboardFiles
+	}
+	offered := make(map[uint32]bool, len(data)/4)
+	for offset := 0; offset+4 <= len(data); offset += 4 {
+		offered[binary.NativeEndian.Uint32(data[offset:])] = true
+	}
+	property, err = api.atom(connection, "VIVA_CLIPBOARD_FILES")
+	if err != nil {
+		return nil, err
+	}
+	for _, name := range [...]string{"x-special/gnome-copied-files", "text/uri-list"} {
+		target, err := api.atom(connection, name)
+		if err != nil {
+			return nil, err
+		}
+		if !offered[target] {
+			continue
+		}
+		list, _, accepted, err := readSelectionBytes(api, connection, requestor, clipboard, target, property, maxClipboardFileListBytes)
+		if errors.Is(err, platform.ErrClipboardImageTooLarge) {
+			return nil, fmt.Errorf("linux: the clipboard's file list is larger than %d MiB", maxClipboardFileListBytes>>20)
+		}
+		if err != nil {
+			return nil, err
+		}
+		if !accepted {
+			continue
+		}
+		if paths := platform.FilesFromURIList(list); len(paths) > 0 {
+			return paths, nil
+		}
+	}
+	return nil, platform.ErrNoClipboardFiles
+}
+
 // ownsClipboardText reports whether this process's window is the CLIPBOARD
-// owner, in which case it holds text and nothing else.
+// owner. The clipboard holds the window's text, files, or both.
 func ownsClipboardText() bool {
 	win := activeWindow.Load()
 	if win == nil {
@@ -199,6 +277,21 @@ func ownsClipboardText() bool {
 	win.mu.Lock()
 	defer win.mu.Unlock()
 	return activeWindow.Load() == win && win.connection != 0 && win.ownsClipboard
+}
+
+// ownedClipboardFiles is the file list this window owns, and whether it owns
+// the clipboard at all (with text or files).
+func ownedClipboardFiles() ([]string, bool) {
+	win := activeWindow.Load()
+	if win == nil {
+		return nil, false
+	}
+	win.mu.Lock()
+	defer win.mu.Unlock()
+	if activeWindow.Load() != win || win.connection == 0 || !win.ownsClipboard {
+		return nil, false
+	}
+	return append([]string(nil), win.clipboardFiles...), true
 }
 
 // openClipboardRequest connects to the X server with a 1x1 input window to
@@ -378,21 +471,12 @@ func SetClipboardText(value string) error {
 	if activeWindow.Load() != win || win.connection == 0 {
 		return fmt.Errorf("linux: clipboard ownership requires a running window")
 	}
-	if err := win.ensureClipboardAtoms(); err != nil {
+	if err := win.claimClipboardLocked(); err != nil {
 		return err
-	}
-	win.api.setSelectionOwner(win.connection, win.id, win.clipboardAtom, 0)
-	if win.api.flush(win.connection) <= 0 || win.api.connectionHasError(win.connection) != 0 {
-		return fmt.Errorf("linux: claim clipboard: XCB connection failed")
-	}
-	owner, err := selectionOwner(win.api, win.connection, win.clipboardAtom)
-	if err != nil {
-		return err
-	}
-	if owner != win.id {
-		return fmt.Errorf("linux: X server refused clipboard ownership")
 	}
 	win.clipboard = value
+	win.clipboardHTML = ""
+	win.clipboardFiles = nil
 	win.ownsClipboard = true
 	return nil
 }
@@ -556,6 +640,26 @@ func SaveFile(options SaveFileOptions) (string, bool, error) {
 		return "", false, fmt.Errorf("linux: save file dialog returned %d paths", len(paths))
 	}
 	return paths[0], false, nil
+}
+
+func SaveFileWithCheckbox(options SaveFileOptions, label string, initial bool) (string, bool, bool, error) {
+	filters, err := portalFilters(options.Filters)
+	if err != nil {
+		return "", false, false, err
+	}
+	name, err := suggestedSaveName(options.SuggestedName, options.DefaultExtension)
+	if err != nil {
+		return "", false, false, err
+	}
+	paths, choices, canceled, err := portalChooseWithChoices(portalFileRequest{
+		method: "SaveFile", parent: portalParent(), title: options.Title, filters: filters,
+		currentName: name, checkboxLabel: label, checkboxChecked: initial,
+	})
+	path, checked, canceled, err := portalSaveCheckboxResult(paths, choices, canceled, err)
+	if errors.Is(err, errServiceMissing) {
+		return "", false, false, unsupported("save checkbox requires a file chooser portal supporting choices")
+	}
+	return path, checked, canceled, err
 }
 
 func OpenURL(target string) error {
@@ -988,8 +1092,8 @@ func (win *window) checkRequest(action string, cookie xcbVoidCookie) error {
 }
 
 // cursorHidden is the shape a surface that draws its own pointer asks for: app.CursorHidden,
-// after the ten shapes of the cursor font and the theme.
-const cursorHidden uint8 = 10
+// after the eleven shapes of the cursor font and the theme.
+const cursorHidden uint8 = 11
 
 // applyHiddenCursor makes a fully transparent cursor: a 1x1 bitmap, cleared to zero, as both the
 // source and the mask of the cursor, so no pixel of the pointer shows. The contents of a new

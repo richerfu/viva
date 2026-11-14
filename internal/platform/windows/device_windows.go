@@ -5,6 +5,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/vivaui/viva/internal/diag"
 	"github.com/vivaui/viva/internal/platform"
 )
 
@@ -46,10 +47,22 @@ func (renderer *renderer) recover(software bool) error {
 func (state *windowState) recoverDevice(cause error) error {
 	plan := state.devices.Next(time.Now())
 	if plan == platform.RecoverGiveUp {
+		if diag.Enabled(diag.Error) {
+			diag.Report(diag.Error, "render", "device-lost", "the graphics device was lost again and again",
+				diag.String("error", cause.Error()))
+		}
 		return fmt.Errorf("windows: the graphics device was lost again and again: %w", cause)
 	}
 	if err := state.renderer.recover(plan == platform.RecoverSoftware); err != nil {
+		if diag.Enabled(diag.Error) {
+			diag.Report(diag.Error, "render", "device-recovery-failed", "the graphics device could not be made again",
+				diag.String("error", err.Error()), diag.String("cause", cause.Error()))
+		}
 		return fmt.Errorf("windows: the graphics device was lost and could not be made again: %w (%w)", err, cause)
+	}
+	if diag.Enabled(diag.Warn) {
+		diag.Report(diag.Warn, "render", "device-recovered", "the graphics device was lost and made again",
+			diag.Bool("software", plan == platform.RecoverSoftware))
 	}
 	state.refreshBackdrop()
 	return nil
@@ -58,14 +71,42 @@ func (state *windowState) recoverDevice(cause error) error {
 // present draws the window, and draws it again on a new device if the one it had
 // was lost.
 func (state *windowState) present(width, height int) error {
-	err := state.renderer.present(width, height, state.scale)
-	if err == nil || !state.renderer.deviceLost() {
-		return err
+	return state.presentWithSync(width, height, 1)
+}
+
+// presentImmediate draws the window without waiting for the display refresh. A
+// resize uses it so the frame drawn for the new client size reaches the swap
+// chain before the window manager returns; the swap chain itself does not scale
+// stale frames (see createWindowSwapChain).
+func (state *windowState) presentImmediate(width, height int) error {
+	return state.presentWithSync(width, height, 0)
+}
+
+func (state *windowState) presentWithSync(width, height int, sync uintptr) error {
+	err := state.renderer.presentWithSync(width, height, state.scale, sync)
+	if err != nil && state.renderer.deviceLost() {
+		if recoverErr := state.recoverDevice(err); recoverErr != nil {
+			return recoverErr
+		}
+		err = state.renderer.presentWithSync(width, height, state.scale, sync)
 	}
-	if err := state.recoverDevice(err); err != nil {
-		return err
+	if err == nil {
+		// The frame the runtime handed over is on the screen: it may ask for the
+		// next one. Asking before the present would keep a frame message in the
+		// queue the whole time a transition runs, and Windows defers the mouse
+		// input of a window that never lets its queue drain.
+		state.framePresented()
 	}
-	return state.renderer.present(width, height, state.scale)
+	return err
+}
+
+// framePresented tells the runtime the frame it was handed is done: it was
+// presented, or there was nothing to present. Its present-paced frame clock
+// asks for the next frame only after this.
+func (state *windowState) framePresented() {
+	if state.config.FramePresented != nil {
+		state.config.FramePresented()
+	}
 }
 
 // applyFrame hands a frame to the renderer, making the device again first if it

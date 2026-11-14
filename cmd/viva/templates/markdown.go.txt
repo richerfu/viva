@@ -6,8 +6,8 @@ import (
 	"unicode/utf8"
 	"unsafe"
 
+	"github.com/vivaui/viva/gfx"
 	"github.com/vivaui/viva/markdown"
-	"github.com/vivaui/viva/ui"
 )
 
 // MarkdownStyle sizes the text of a MarkdownView. The zero value is a 13-point
@@ -19,7 +19,7 @@ type MarkdownStyle struct {
 	// LineHeight is the distance between the lines of body text.
 	LineHeight float32
 	// MonoFace is the fixed-pitch family of code.
-	MonoFace ui.MonoFace
+	MonoFace gfx.MonoFace
 	// CodeInset keeps this much of the right side of every code block free of
 	// text: room for a button the application paints over the block.
 	CodeInset float32
@@ -31,6 +31,22 @@ type MarkdownStyle struct {
 	// string that runs over several lines is only colored where the lexer can
 	// tell from the line itself. The colors come from MarkdownLook.Code.
 	Highlight func(language, line string, dst []MarkdownCodeRun) []MarkdownCodeRun
+	// Image, when set, is asked for the bitmap of every image (![alt](destination)),
+	// with the destination as written, while the view lays out: the bitmap decides
+	// the room the image takes. It is asked on every Layout, and more than once for
+	// one image (a table measures its cells before laying them out), so answer from
+	// a cache. The view never reads files or the network; an application resolves
+	// relative paths and fetches what it allows. A bitmap's pixels are its size in
+	// the layout, scaled down to the column and never up. The renderer's texture
+	// cache knows a bitmap by gfx.Bitmap.ID and Version, as AvatarData's doc says,
+	// so give each bitmap a stable ID and bump Version when its pixels change.
+	// Without an ID every paint sends the pixels to the painter again, so a document
+	// with images re-uploads them on every frame. An ok of false lays the image out
+	// as its alt text, so an application can answer once the image has loaded, lay
+	// the document out again and invalidate. The alt text stays part of the
+	// document's text, for search and copy, while an image itself has no caret or
+	// selection highlight.
+	Image func(destination string) (gfx.Bitmap, bool)
 }
 
 // MarkdownCodeClass says what a stretch of code is, which MarkdownLook.Code turns
@@ -60,21 +76,21 @@ type MarkdownCodeRun struct {
 
 // MarkdownLook colors a MarkdownView.
 type MarkdownLook struct {
-	Text           ui.Color // body text, headings and code
-	Muted          ui.Color // quotes, list markers
-	Link           ui.Color
-	CodeFill       ui.Color // behind a fenced block
-	InlineCodeFill ui.Color // behind code inside a line
-	Line           ui.Color // borders, rules and quote bars
+	Text           gfx.Color // body text, headings and code
+	Muted          gfx.Color // quotes, list markers
+	Link           gfx.Color
+	CodeFill       gfx.Color // behind a fenced block
+	InlineCodeFill gfx.Color // behind code inside a line
+	Line           gfx.Color // borders, rules and quote bars
 	// Code colors the classes of highlighted code, by class; a class left
 	// transparent is drawn in Text.
-	Code      [MarkdownCodeClasses]ui.Color
-	Selection ui.Color // behind selected text; transparent paints none
-	Radius    float32  // corners of code blocks and tables
+	Code      [MarkdownCodeClasses]gfx.Color
+	Selection gfx.Color // behind selected text; transparent paints none
+	Radius    float32   // corners of code blocks and tables
 }
 
 // MarkdownLookFor derives a look from a theme.
-func MarkdownLookFor(theme ui.Theme) MarkdownLook {
+func MarkdownLookFor(theme gfx.Theme) MarkdownLook {
 	selection := theme.Primary
 	selection.Alpha *= 0.50
 	return MarkdownLook{
@@ -120,7 +136,7 @@ func snapRune(text []byte, offset int) int {
 // MarkdownCode is a fenced code block of a laid-out document: where it is, so
 // the application can put a copy button on it, and what it holds.
 type MarkdownCode struct {
-	Bounds ui.Rect // relative to the origin the document is painted at
+	Bounds gfx.Rect // relative to the origin the document is painted at
 	Text   string
 }
 
@@ -131,11 +147,11 @@ type MarkdownPaint struct {
 	X, Y float32
 	// Clip is the visible part of the canvas. Nothing outside it is painted
 	// and no link outside it gets a hit region. The zero Rect means everything.
-	Clip ui.Rect
+	Clip gfx.Rect
 	// Links names the hit regions of links: fragment i of the view is
 	// Links.At(Base+i), and MarkdownView.Link(i) says where it points. Zero
 	// paints links without hits.
-	Links ui.Scope
+	Links gfx.Scope
 	// Base is added to the number of every fragment, so that several views
 	// painted in one frame can share a scope: give each the total of the
 	// LinkCount of the views before it.
@@ -144,7 +160,7 @@ type MarkdownPaint struct {
 	Selection MarkdownSelection
 }
 
-var _ ui.TextPlacement = (*MarkdownView)(nil)
+var _ gfx.TextPlacement = (*MarkdownView)(nil)
 
 // MarkdownView lays out and paints a markdown.Document. It keeps the arrays it
 // builds, so laying out the next version of a message that is still being typed
@@ -157,29 +173,30 @@ var _ ui.TextPlacement = (*MarkdownView)(nil)
 //	view.Paint(canvas, components.MarkdownPaint{Look: components.MarkdownLookFor(theme), X: x, Y: y, Links: links})
 //
 // Layout measures text and is the expensive half: do it when the text or the
-// width changed, and call Paint every frame. Proportional text has no italic
-// face yet, so emphasis is drawn a weight heavier than the text around it.
+// width changed, and call Paint every frame.
 type MarkdownView struct {
 	pieces     []mdPiece
 	runs       []mdCodeRun
 	hl         []MarkdownCodeRun
-	scratch    []ui.TextRun
-	selScratch []ui.TextSpan
+	scratch    []gfx.TextRun
+	selScratch []gfx.TextSpan
 	boxes      []mdBox
 	links      []mdLink
 	codes      []MarkdownCode
+	images     []mdImage
+	anchors    []MarkdownAnchor
 	atoms      []mdAtom
 	numbers    []byte
 	tabs       []byte  // code lines with their tabs spread into blanks
 	tabBound   []int32 // where each byte of a spread code line came from
 	plain      []byte  // the rendered text, for selection and copying
 	spanBase   []int32 // where each span of the current inline block starts in plain
-	measure    *ui.Canvas
+	measure    *gfx.Canvas
 	paintX     float32 // where the last Paint put the document
 	paintY     float32
 	painted    bool
 	bars       [markdownMaxQuote + 1]int32
-	face       ui.MonoFace
+	face       gfx.MonoFace
 	height     float32
 }
 
@@ -201,17 +218,28 @@ func (v *MarkdownView) SelectedText(sel MarkdownSelection) string {
 // answer text. It uses the origin and measurements of the last Paint, so it is
 // valid from that paint until the next Layout or Paint. Decoration such as list
 // markers is skipped; a point in the margin snaps to the nearest character.
-func (v *MarkdownView) OffsetAt(point ui.Point) (offset int, ok bool) {
+func (v *MarkdownView) OffsetAt(point gfx.Point) (offset int, ok bool) {
 	if !v.painted || v.measure == nil || len(v.pieces) == 0 {
 		return 0, false
 	}
 	x, y := point.X-v.paintX, point.Y-v.paintY
 	best, bestScore := -1, float32(0)
+	var previous *mdPiece
 	for index := range v.pieces {
 		piece := &v.pieces[index]
 		if piece.plainLo < 0 {
 			continue
 		}
+		if previous != nil && previous.y == piece.y && previous.plainHi < piece.plainLo && y >= piece.y && y <= piece.y+piece.h {
+			start := previous.x + v.caretAdvance(previous, int(previous.plainHi-previous.plainLo))
+			end := piece.x + v.caretAdvance(piece, 0)
+			if end > start && x >= start && x <= end {
+				gap := int(piece.plainLo - previous.plainHi)
+				position := int(float32(gap)*(x-start)/(end-start) + 0.5)
+				return gfx.GraphemeStart(unsafe.String(unsafe.SliceData(v.plain), len(v.plain)), int(previous.plainHi)+min(max(position, 0), gap)), true
+			}
+		}
+		previous = piece
 		dx, dy := float32(0), float32(0)
 		if x < piece.x {
 			dx = piece.x - x
@@ -237,14 +265,77 @@ func (v *MarkdownView) OffsetAt(point ui.Point) (offset int, ok bool) {
 	if piece.mono {
 		local = v.codeOffsetAt(piece, localX)
 	} else {
-		local = v.measure.TextOffsetAt(piece.text, piece.size, piece.weight, localX)
+		local = v.measure.TextOffsetAtStyle(piece.text, gfx.TextStyle{Size: piece.size, Weight: piece.weight, Italic: piece.italic}, localX)
 	}
 	local = min(max(local, 0), int(piece.plainHi-piece.plainLo))
 	return int(piece.plainLo) + local, true
 }
 
+// CaretAt returns the window rectangle for a rendered byte offset after Paint.
+// It reports geometry only; MarkdownView does not own the selection or editor.
+func (v *MarkdownView) CaretAt(offset int) (gfx.Rect, bool) {
+	if !v.painted || v.measure == nil || len(v.pieces) == 0 {
+		return gfx.Rect{}, false
+	}
+	value := unsafe.String(unsafe.SliceData(v.plain), len(v.plain))
+	offset = gfx.GraphemeStart(value, offset)
+	var chosen, before, after *mdPiece
+	for index := range v.pieces {
+		piece := &v.pieces[index]
+		if piece.plainLo < 0 {
+			continue
+		}
+		switch {
+		case offset >= int(piece.plainLo) && offset <= int(piece.plainHi):
+			if chosen == nil || piece.plainLo == int32(offset) && chosen.plainLo < int32(offset) {
+				chosen = piece
+			}
+		case int(piece.plainHi) < offset:
+			if before == nil || piece.plainHi > before.plainHi {
+				before = piece
+			}
+		case int(piece.plainLo) > offset:
+			if after == nil || piece.plainLo < after.plainLo {
+				after = piece
+			}
+		}
+	}
+	if chosen == nil {
+		if before != nil && after != nil && before.y == after.y {
+			start := before.x + v.caretAdvance(before, int(before.plainHi-before.plainLo))
+			end := after.x + v.caretAdvance(after, 0)
+			fraction := float32(offset-int(before.plainHi)) / float32(after.plainLo-before.plainHi)
+			return gfx.Rect{X: v.paintX + start + (end-start)*fraction, Y: v.paintY + before.y, Width: 1, Height: before.h}, true
+		}
+		if before == nil && after == nil {
+			return gfx.Rect{}, false
+		}
+		if before == nil || after != nil && int(after.plainLo)-offset <= offset-int(before.plainHi) {
+			chosen = after
+			offset = int(after.plainLo)
+		} else {
+			chosen = before
+			offset = int(before.plainHi)
+		}
+	}
+	local := min(max(offset-int(chosen.plainLo), 0), int(chosen.plainHi-chosen.plainLo))
+	advance := v.caretAdvance(chosen, local)
+	return gfx.Rect{X: v.paintX + chosen.x + advance, Y: v.paintY + chosen.y, Width: 1, Height: chosen.h}, true
+}
+
+func (v *MarkdownView) caretAdvance(piece *mdPiece, local int) float32 {
+	var advance float32
+	if piece.mono {
+		_, display := v.codeDisplayRange(piece, local, local)
+		advance = piece.padX + float32(monoCells(piece.text[:display]))*piece.cell
+	} else {
+		advance = v.measure.TextCaretStyle(piece.text, gfx.TextStyle{Size: piece.size, Weight: piece.weight, Italic: piece.italic}, local)
+	}
+	return advance
+}
+
 // CaretBounds reports no caret: a MarkdownView paints text, not an input field.
-func (v *MarkdownView) CaretBounds() (ui.Rect, bool) { return ui.Rect{}, false }
+func (v *MarkdownView) CaretBounds() (gfx.Rect, bool) { return gfx.Rect{}, false }
 
 // codeOffsetAt is the source byte offset nearest x inside a fixed-pitch piece.
 // The piece's own cell width is used, because inline code is drawn smaller than
@@ -389,6 +480,7 @@ type mdPiece struct {
 	weight     float32
 	color      mdColor
 	mono       bool
+	italic     bool
 	strike     bool
 	link       int32
 }
@@ -410,15 +502,27 @@ type mdBox struct {
 
 type mdLink struct {
 	x, y, w, h float32
-	size       float32
+	// underline is where the hover underline sits below the link's top: at
+	// the baseline of a text link, at the bottom edge of an image link.
+	underline  float32
 	text, dest string
+}
+
+// mdImage is an image laid out at x, y, w by h.
+type mdImage struct {
+	bitmap     gfx.Bitmap
+	x, y, w, h float32
 }
 
 type mdAtom struct {
 	span, lo, hi int32
-	w, space     float32 // width, and the width of the blank that follows it
-	brk          bool    // a line break
-	glue         bool    // punctuation that may not start a line
+	// image marks an image's atom: w by h of bitmap.
+	image    bool
+	h        float32
+	bitmap   gfx.Bitmap
+	w, space float32 // width, and the width of the blank that follows it
+	brk      bool    // a line break
+	glue     bool    // punctuation that may not start a line
 }
 
 type mdFont struct {
@@ -428,8 +532,10 @@ type mdFont struct {
 
 // mdLayout is the state of one Layout call.
 type mdLayout struct {
+	// column is the widest an image may be laid out, set by inline.
+	column float32
 	v      *MarkdownView
-	canvas *ui.Canvas
+	canvas *gfx.Canvas
 	style  MarkdownStyle
 	doc    *markdown.Document
 	lines  int
@@ -437,14 +543,15 @@ type mdLayout struct {
 
 // Layout positions the blocks of doc in a column width wide and returns its
 // height. Positions are relative to the point the document is painted at.
-func (v *MarkdownView) Layout(canvas *ui.Canvas, style MarkdownStyle, doc *markdown.Document, width float32) float32 {
+func (v *MarkdownView) Layout(canvas *gfx.Canvas, style MarkdownStyle, doc *markdown.Document, width float32) float32 {
 	if style.Size <= 0 {
 		style.Size = 13
 	}
 	if style.LineHeight <= 0 {
 		style.LineHeight = float32(int(style.Size*1.55 + 0.5))
 	}
-	v.pieces, v.boxes, v.links, v.codes, v.numbers, v.runs, v.tabs, v.tabBound, v.plain, v.spanBase = v.pieces[:0], v.boxes[:0], v.links[:0], v.codes[:0], v.numbers[:0], v.runs[:0], v.tabs[:0], v.tabBound[:0], v.plain[:0], v.spanBase[:0]
+	v.images = v.images[:0]
+	v.pieces, v.boxes, v.links, v.codes, v.anchors, v.numbers, v.runs, v.tabs, v.tabBound, v.plain, v.spanBase = v.pieces[:0], v.boxes[:0], v.links[:0], v.codes[:0], v.anchors[:0], v.numbers[:0], v.runs[:0], v.tabs[:0], v.tabBound[:0], v.plain[:0], v.spanBase[:0]
 	v.bars = [markdownMaxQuote + 1]int32{}
 	v.face = style.MonoFace
 	v.measure = canvas
@@ -452,7 +559,7 @@ func (v *MarkdownView) Layout(canvas *ui.Canvas, style MarkdownStyle, doc *markd
 	l := mdLayout{v: v, canvas: canvas, style: style, doc: doc}
 	width = max(width, 40)
 
-	body := mdFont{size: style.Size, line: style.LineHeight, weight: ui.WeightRegular, color: mdColText}
+	body := mdFont{size: style.Size, line: style.LineHeight, weight: gfx.WeightRegular, color: mdColText}
 	y := float32(0)
 	var prev *markdown.Block
 	for index := range doc.Blocks {
@@ -495,6 +602,7 @@ func (v *MarkdownView) Layout(canvas *ui.Canvas, style MarkdownStyle, doc *markd
 			y = l.table(b, x0, w, y, t)
 		}
 		l.quoteBars(b.Quote, top, y)
+		v.anchors = append(v.anchors, MarkdownAnchor{Start: b.Start, End: b.End, Top: top, Bottom: y})
 		prev = b
 	}
 	v.height = y
@@ -513,9 +621,9 @@ func (l *mdLayout) heading(level int, t mdFont) mdFont {
 	}
 	t.size *= scale
 	t.line = float32(int(t.line*scale + 0.5))
-	t.weight = ui.WeightSemibold
+	t.weight = gfx.WeightSemibold
 	if level == 1 {
-		t.weight = ui.WeightBold
+		t.weight = gfx.WeightBold
 	}
 	return t
 }
@@ -588,11 +696,11 @@ func (l *mdLayout) marker(b *markdown.Block, x, y float32, t mdFont) {
 		v.numbers = append(v.numbers, '.')
 		text = unsafe.String(&v.numbers[start], len(v.numbers)-start)
 	}
-	w := l.canvas.TextWidthWeight(text, t.size, ui.WeightRegular)
+	w := l.canvas.TextWidthWeight(text, t.size, gfx.WeightRegular)
 	v.pieces = append(v.pieces, mdPiece{
 		plainLo: -1, plainHi: -1,
 		text: text, x: x + markdownMarkerW - 6 - w, y: y, w: w + 2, h: t.line, size: t.size,
-		weight: ui.WeightRegular, color: mdColMuted, link: -1,
+		weight: gfx.WeightRegular, color: mdColMuted, link: -1,
 	})
 }
 
@@ -639,7 +747,7 @@ func (l *mdLayout) code(b *markdown.Block, x, width, y float32) float32 {
 				piece := mdPiece{
 					plainLo: plainLo, plainHi: int32(len(v.plain)), codeCol: int32(column), cell: cell, spread: true,
 					text: chunk, x: x + markdownCodePadX, y: y, w: float32(monoCells(chunk)) * cell, h: height,
-					size: size, weight: ui.WeightRegular, color: mdColText, mono: true, link: -1,
+					size: size, weight: gfx.WeightRegular, color: mdColText, mono: true, link: -1,
 				}
 				piece.runLo = int32(len(v.runs))
 				v.appendCodeRuns(line, start, end, marked)
@@ -660,7 +768,7 @@ func (l *mdLayout) code(b *markdown.Block, x, width, y float32) float32 {
 		text = rest
 	}
 	y += markdownCodePadY
-	rect := ui.Rect{X: x, Y: top, Width: width, Height: y - top}
+	rect := gfx.Rect{X: x, Y: top, Width: width, Height: y - top}
 	v.boxes = append(v.boxes, mdBox{kind: mdBoxCode, x: rect.X, y: rect.Y, w: rect.Width, h: rect.Height})
 	v.codes = append(v.codes, MarkdownCode{Bounds: rect, Text: b.Text})
 	return y
@@ -857,7 +965,7 @@ func (l *mdLayout) table(b *markdown.Block, x, width, y float32, t mdFont) float
 		natural[c] = 2 * markdownCellPadX
 	}
 	head := t
-	head.weight = ui.WeightSemibold
+	head.weight = gfx.WeightSemibold
 	for i, cell := range cells[:rows*columns] {
 		style := t
 		if i < columns {
@@ -952,12 +1060,10 @@ func (l *mdLayout) natural(spans []markdown.Span, t mdFont) float32 {
 func spanWeight(base float32, style markdown.Style) float32 {
 	switch {
 	case style&markdown.Bold != 0:
-		if base >= ui.WeightSemibold {
-			return ui.WeightBold
+		if base >= gfx.WeightSemibold {
+			return gfx.WeightBold
 		}
-		return ui.WeightSemibold
-	case style&markdown.Italic != 0 && base < ui.WeightMedium:
-		return ui.WeightMedium
+		return gfx.WeightSemibold
 	}
 	return base
 }
@@ -985,7 +1091,10 @@ func (l *mdLayout) atomize(spans []markdown.Span, t mdFont) {
 	atoms := l.v.atoms[:0]
 	monoSize := max(t.size-1, 9)
 	cell, _ := l.canvas.MonoCellSize(monoSize, l.style.MonoFace)
-	space := l.canvas.TextWidthWeight(" ", t.size, ui.WeightRegular)
+	// A blank is as wide as one of the regular face whatever its span's weight, so that
+	// emphasis does not move the words around it. An italic span's blank is the italic face's.
+	space := l.canvas.TextWidthWeight(" ", t.size, gfx.WeightRegular)
+	italicSpace := l.canvas.TextWidthStyle(" ", gfx.TextStyle{Size: t.size, Weight: gfx.WeightRegular, Italic: true})
 	var pending float32
 	for si, sp := range spans {
 		if sp.Text == markdown.Newline {
@@ -993,7 +1102,22 @@ func (l *mdLayout) atomize(spans []markdown.Span, t mdFont) {
 			pending = 0
 			continue
 		}
+		if sp.Image != "" && l.style.Image != nil {
+			if bitmap, ok := l.style.Image(sp.Image); ok && bitmap.Width > 0 && bitmap.Height > 0 {
+				w, h := float32(bitmap.Width), float32(bitmap.Height)
+				if column := l.column; column > 0 && w > column {
+					w, h = column, h*column/w
+				}
+				if pending > 0 && len(atoms) > 0 && !atoms[len(atoms)-1].brk {
+					atoms[len(atoms)-1].space = pending
+				}
+				pending = 0
+				atoms = append(atoms, mdAtom{span: int32(si), image: true, w: w, h: h, bitmap: bitmap})
+				continue
+			}
+		}
 		mono := sp.Style&markdown.Mono != 0
+		italic := sp.Style&markdown.Italic != 0
 		size, weight := t.size, spanWeight(t.weight, sp.Style)
 		if mono {
 			size = monoSize
@@ -1004,6 +1128,8 @@ func (l *mdLayout) atomize(spans []markdown.Span, t mdFont) {
 			if r == ' ' || r == '\t' {
 				if mono {
 					pending += cell
+				} else if italic {
+					pending = italicSpace
 				} else {
 					pending = space
 				}
@@ -1041,6 +1167,8 @@ func (l *mdLayout) atomize(spans []markdown.Span, t mdFont) {
 			var w float32
 			if mono {
 				w = float32(monoCells(text[i:j]))*cell + 2*markdownInlinePad
+			} else if italic {
+				w = l.canvas.TextWidthStyle(text[i:j], gfx.TextStyle{Size: size, Weight: weight, Italic: true})
 			} else {
 				w = l.canvas.TextWidthWeight(text[i:j], size, weight)
 			}
@@ -1066,9 +1194,12 @@ type mdLine struct {
 	piece  int // the open piece, or -1
 	lo     int32
 	span   int32
-	pieceP int // first piece, box and link of the line, for alignment
+	pieceP int // first piece, box, link and image of the line, for alignment
 	pieceB int
 	pieceL int
+	pieceI int
+	// tall is the height of the tallest image on the line.
+	tall float32
 	// grew reports that the open piece took a second atom, so its width is a
 	// running sum that closePiece must settle.
 	grew bool
@@ -1085,7 +1216,9 @@ func (l *mdLayout) inline(spans []markdown.Span, x, width, y float32, t mdFont, 
 	if len(spans) == 0 {
 		return y
 	}
+	l.column = width
 	l.atomize(spans, t)
+	l.column = 0
 	m := mdLine{l: l, spans: spans, t: t, align: align, x0: x, width: width, y: y, piece: -1}
 	m.reset()
 	for _, a := range l.v.atoms {
@@ -1150,7 +1283,8 @@ func (m *mdLine) fit(a mdAtom) (mdAtom, bool) {
 func (m *mdLine) reset() {
 	v := m.l.v
 	m.x, m.w, m.has, m.piece = 0, 0, false, -1
-	m.pieceP, m.pieceB, m.pieceL = len(v.pieces), len(v.boxes), len(v.links)
+	m.pieceP, m.pieceB, m.pieceL, m.pieceI = len(v.pieces), len(v.boxes), len(v.links), len(v.images)
+	m.tall = 0
 	m.measuredSpan, m.measuredLo, m.measuredHi, m.measuredEnd = -1, 0, 0, 0
 	m.grew = false
 }
@@ -1158,6 +1292,9 @@ func (m *mdLine) reset() {
 func (m *mdLine) spanWidth(sp markdown.Span, text string) float32 {
 	size, weight := m.t.size, spanWeight(m.t.weight, sp.Style)
 	if sp.Style&markdown.Mono == 0 {
+		if sp.Style&markdown.Italic != 0 {
+			return m.l.canvas.TextWidthStyle(text, gfx.TextStyle{Size: size, Weight: weight, Italic: true})
+		}
 		return m.l.canvas.TextWidthWeight(text, size, weight)
 	}
 	size = max(size-1, 9)
@@ -1176,6 +1313,9 @@ func (m *mdLine) spanPad(sp markdown.Span) float32 {
 }
 
 func (m *mdLine) exactWidth(a mdAtom) float32 {
+	if a.image {
+		return a.w
+	}
 	if a.hi <= a.lo {
 		return 0
 	}
@@ -1346,6 +1486,20 @@ func (m *mdLine) place(a mdAtom) {
 	v := l.v
 	sp := m.spans[a.span]
 	mono := sp.Style&markdown.Mono != 0
+	if a.image {
+		m.closePiece()
+		x := m.x0 + m.x
+		v.images = append(v.images, mdImage{bitmap: a.bitmap, x: x, y: m.y, w: a.w, h: a.h})
+		if sp.Link != "" {
+			v.links = append(v.links, mdLink{x: x, y: m.y, w: a.w, h: a.h, underline: a.h - 1, text: sp.Text, dest: sp.Link})
+		}
+		m.x += a.w
+		m.w = m.x
+		m.x += a.space
+		m.has = true
+		m.tall = max(m.tall, a.h)
+		return
+	}
 	if a.hi <= a.lo {
 		return
 	}
@@ -1388,7 +1542,7 @@ func (m *mdLine) place(a mdAtom) {
 	v.pieces = append(v.pieces, mdPiece{
 		plainLo: base + int32(a.lo), plainHi: base + int32(a.hi), cell: cell, padX: padX,
 		text: sp.Text[a.lo:a.hi], x: m.x0 + m.x, y: m.y, w: a.w, h: m.t.line,
-		size: size, weight: weight, color: color, mono: mono, strike: sp.Style&markdown.Strike != 0, link: -1,
+		size: size, weight: weight, color: color, mono: mono, italic: sp.Style&markdown.Italic != 0, strike: sp.Style&markdown.Strike != 0, link: -1,
 	})
 	m.piece, m.span, m.lo = len(v.pieces)-1, a.span, a.lo
 	m.measuredSpan, m.grew = -1, false
@@ -1439,7 +1593,7 @@ func (m *mdLine) closePiece() {
 	if sp.Link != "" {
 		v.links = append(v.links, mdLink{
 			x: p.x + p.padX, y: p.y, w: p.w - 2*p.padX, h: p.h,
-			size: p.size, text: p.text, dest: sp.Link,
+			underline: p.h/2 + p.size*0.6, text: p.text, dest: sp.Link,
 		})
 		p.link = int32(len(v.links) - 1)
 	}
@@ -1468,15 +1622,20 @@ func (m *mdLine) endLine() {
 			for i := m.pieceL; i < len(v.links); i++ {
 				v.links[i].x += shift
 			}
+			for i := m.pieceI; i < len(v.images); i++ {
+				v.images[i].x += shift
+			}
 		}
 	}
-	m.y += m.t.line
+	// A line with an image is as tall as the tallest image, with the text along its
+	// top and a little air below the pixels so that stacked images do not touch.
+	m.y += max(m.t.line, m.tall+4)
 	m.l.lines++
 	m.reset()
 }
 
 // Paint draws the laid-out document.
-func (v *MarkdownView) Paint(canvas *ui.Canvas, p MarkdownPaint) {
+func (v *MarkdownView) Paint(canvas *gfx.Canvas, p MarkdownPaint) {
 	v.paintX, v.paintY, v.painted = p.X, p.Y, true
 	look := p.Look
 	clipped := p.Clip.Height > 0
@@ -1484,13 +1643,13 @@ func (v *MarkdownView) Paint(canvas *ui.Canvas, p MarkdownPaint) {
 		return !clipped || (y+h >= p.Clip.Y && y <= p.Clip.Y+p.Clip.Height)
 	}
 	if clipped {
-		canvas.Clip(ui.Rect{
+		canvas.Clip(gfx.Rect{
 			X: p.Clip.X, Y: p.Clip.Y, Width: p.Clip.Width, Height: p.Clip.Height,
 		})
 		defer canvas.Unclip()
 	}
 	for _, box := range v.boxes {
-		rect := ui.Rect{X: p.X + box.x, Y: p.Y + box.y, Width: box.w, Height: box.h}
+		rect := gfx.Rect{X: p.X + box.x, Y: p.Y + box.y, Width: box.w, Height: box.h}
 		if !visible(rect.Y, rect.Height) {
 			continue
 		}
@@ -1505,6 +1664,12 @@ func (v *MarkdownView) Paint(canvas *ui.Canvas, p MarkdownPaint) {
 			canvas.Fill(rect, look.Line)
 		case mdBoxHead:
 			canvas.Rounded(rect, 4, look.InlineCodeFill)
+		}
+	}
+	for _, image := range v.images {
+		rect := gfx.Rect{X: p.X + image.x, Y: p.Y + image.y, Width: image.w, Height: image.h}
+		if visible(rect.Y, rect.Height) {
+			canvas.DrawBitmap(image.bitmap, rect)
 		}
 	}
 	start, end := p.Selection.Range(v.plain)
@@ -1530,20 +1695,20 @@ func (v *MarkdownView) Paint(canvas *ui.Canvas, p MarkdownPaint) {
 					}
 					x := p.X + piece.x + piece.padX + float32(monoCells(piece.text[:from]))*cell
 					width := float32(monoCells(piece.text[from:to])) * cell
-					canvas.Fill(ui.Rect{X: x, Y: p.Y + piece.y, Width: width, Height: piece.h}, look.Selection)
+					canvas.Fill(gfx.Rect{X: x, Y: p.Y + piece.y, Width: width, Height: piece.h}, look.Selection)
 				}
 				continue
 			}
-			v.selScratch = canvas.TextSelection(v.selScratch[:0], piece.text, piece.size, piece.weight,
+			v.selScratch = canvas.TextSelectionStyle(v.selScratch[:0], piece.text, gfx.TextStyle{Size: piece.size, Weight: piece.weight, Italic: piece.italic},
 				lo-int(piece.plainLo), hi-int(piece.plainLo))
 			for _, span := range v.selScratch {
-				canvas.Fill(ui.Rect{X: p.X + piece.x + span.X, Y: p.Y + piece.y, Width: span.Width, Height: piece.h}, look.Selection)
+				canvas.Fill(gfx.Rect{X: p.X + piece.x + span.X, Y: p.Y + piece.y, Width: span.Width, Height: piece.h}, look.Selection)
 			}
 		}
 	}
 	for index := range v.pieces {
 		piece := &v.pieces[index]
-		rect := ui.Rect{
+		rect := gfx.Rect{
 			X: p.X + piece.x + piece.padX, Y: p.Y + piece.y,
 			Width: piece.w - 2*piece.padX, Height: piece.h,
 		}
@@ -1565,31 +1730,31 @@ func (v *MarkdownView) Paint(canvas *ui.Canvas, p MarkdownPaint) {
 				if run.class > 0 && int(run.class) < len(look.Code) && look.Code[run.class].Alpha > 0 {
 					stretch = look.Code[run.class]
 				}
-				v.scratch = append(v.scratch, ui.TextRun{
+				v.scratch = append(v.scratch, gfx.TextRun{
 					Column: column, Bytes: run.bytes, Cells: run.cells, Color: stretch, Weight: piece.weight,
 				})
 				column += run.cells
 			}
-			canvas.LabelRuns(piece.text, rect, ui.TextStyle{
+			canvas.LabelRuns(piece.text, rect, gfx.TextStyle{
 				Size: piece.size, Weight: piece.weight, Color: color, Mono: true, MonoFace: v.face,
 			}, piece.cell, v.scratch)
 		} else {
-			canvas.Label(piece.text, rect, ui.TextStyle{Size: piece.size, Weight: piece.weight, Color: color, Mono: piece.mono, MonoFace: v.face})
+			canvas.Label(piece.text, rect, gfx.TextStyle{Size: piece.size, Weight: piece.weight, Italic: piece.italic, Color: color, Mono: piece.mono, MonoFace: v.face})
 		}
 		if piece.strike {
-			canvas.Fill(ui.Rect{X: rect.X, Y: rect.Y + rect.Height/2, Width: rect.Width, Height: 1}, color)
+			canvas.Fill(gfx.Rect{X: rect.X, Y: rect.Y + rect.Height/2, Width: rect.Width, Height: 1}, color)
 		}
 	}
 	for index := range v.links {
 		link := &v.links[index]
-		rect := ui.Rect{X: p.X + link.x, Y: p.Y + link.y, Width: link.w, Height: link.h}
+		rect := gfx.Rect{X: p.X + link.x, Y: p.Y + link.y, Width: link.w, Height: link.h}
 		if !visible(rect.Y, rect.Height) || p.Links.IsZero() {
 			continue
 		}
 		id := p.Links.At(p.Base + index)
-		canvas.HitWithOptions(id, rect, link.text, ui.HitOptions{Role: ui.RoleLink})
+		canvas.HitWithOptions(id, rect, link.text, gfx.HitOptions{Role: gfx.RoleLink})
 		if canvas.Hovered() == id {
-			canvas.Fill(ui.Rect{X: rect.X, Y: rect.Y + rect.Height/2 + link.size*0.6, Width: rect.Width, Height: 1}, look.Link)
+			canvas.Fill(gfx.Rect{X: rect.X, Y: rect.Y + link.underline, Width: rect.Width, Height: 1}, look.Link)
 		}
 	}
 }

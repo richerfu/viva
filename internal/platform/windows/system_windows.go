@@ -1,8 +1,11 @@
 package windows
 
 import (
+	"encoding/binary"
 	"fmt"
+	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -15,6 +18,7 @@ const (
 	clipboardUnicodeText = 13
 	clipboardDIB         = 8
 	clipboardDIBV5       = 17
+	clipboardHDrop       = 15
 	globalMoveable       = 0x2
 	globalZeroInit       = 0x40
 	classInProcess       = 1
@@ -33,8 +37,10 @@ const (
 	notifyMessage        = 1
 	notifyIcon           = 2
 	notifyTip            = 4
+	notifyState          = 8
 	notifyInfo           = 0x10
 	notifyInfoIcon       = 1
+	notifyHidden         = 1
 
 	maxClipboardBytes = 64 << 20
 )
@@ -113,6 +119,10 @@ var notificationMu sync.Mutex
 var notificationWindow uintptr
 var notificationAdded bool
 
+var callNotifyIcon = func(operation uintptr, data *notifyIconData) (uintptr, uintptr, error) {
+	return shellNotifyIcon.Call(operation, uintptr(unsafe.Pointer(data)))
+}
+
 var openDialogClass = guid{Data1: 0xdc1c5a9c, Data2: 0xe88a, Data3: 0x4dde, Data4: [8]byte{0xa5, 0xa1, 0x60, 0xf8, 0x2a, 0x20, 0xae, 0xf7}}
 var openDialogInterface = guid{Data1: 0xd57c7288, Data2: 0xd4ad, Data3: 0x4768, Data4: [8]byte{0xbe, 0x02, 0x9d, 0x96, 0x95, 0x32, 0xd9, 0x60}}
 var saveDialogClass = guid{Data1: 0xc0b4e2f3, Data2: 0xba21, Data3: 0x4773, Data4: [8]byte{0x8d, 0xba, 0x33, 0x5e, 0xc9, 0x46, 0xeb, 0x8b}}
@@ -152,6 +162,8 @@ func ClipboardText() (string, error) {
 
 var pngFormatOnce sync.Once
 var pngFormat uintptr
+var dropEffectFormat uintptr
+var dropEffectFormatOnce sync.Once
 
 // registeredPNGFormat is the clipboard format named "PNG", which browsers, Paint
 // and the Snipping Tool offer alongside the bitmap formats; 0 when it cannot be
@@ -162,6 +174,16 @@ func registeredPNGFormat() uintptr {
 		pngFormat, _, _ = registerClipboardFormat.Call(uintptr(unsafe.Pointer(name)))
 	})
 	return pngFormat
+}
+
+// registeredDropEffectFormat is the clipboard format Explorer reads to know a
+// drag or paste is a copy.
+func registeredDropEffectFormat() uintptr {
+	dropEffectFormatOnce.Do(func() {
+		name, _ := syscall.UTF16PtrFromString("Preferred DropEffect")
+		dropEffectFormat, _, _ = registerClipboardFormat.Call(uintptr(unsafe.Pointer(name)))
+	})
+	return dropEffectFormat
 }
 
 // HasClipboardImage reports whether the clipboard offers a PNG or a bitmap
@@ -225,6 +247,51 @@ func ClipboardImagePNG() ([]byte, error) {
 	return nil, platform.ErrNoClipboardImage
 }
 
+// maxClipboardFileListBytes bounds the CF_HDROP block: MaxClipboardFiles long
+// paths fit with room to spare.
+const maxClipboardFileListBytes = 16 << 20
+
+// ClipboardFiles returns the paths of the files the clipboard holds: the
+// CF_HDROP list Explorer leaves there after a copy.
+func ClipboardFiles() ([]string, error) {
+	clipboardMu.Lock()
+	defer clipboardMu.Unlock()
+	if available, _, _ := clipboardFormatAvailable.Call(clipboardHDrop); available == 0 {
+		return nil, platform.ErrNoClipboardFiles
+	}
+	// Another program may hold the clipboard for a moment while it writes.
+	var opened uintptr
+	var callErr error
+	for attempt := 0; attempt < 5; attempt++ {
+		if opened, _, callErr = openClipboard.Call(0); opened != 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if opened == 0 {
+		return nil, windowsCallError("open clipboard", callErr)
+	}
+	defer closeClipboard.Call()
+	handle, _, callErr := clipboardData.Call(clipboardHDrop)
+	if handle == 0 {
+		return nil, windowsCallError("read clipboard files", callErr)
+	}
+	size, _, _ := globalSize.Call(handle)
+	if size == 0 || size > maxClipboardFileListBytes {
+		return nil, fmt.Errorf("windows: invalid clipboard file list size %d", size)
+	}
+	memory, _, callErr := globalLock.Call(handle)
+	if memory == 0 {
+		return nil, windowsCallError("lock clipboard files", callErr)
+	}
+	defer globalUnlock.Call(handle)
+	paths := platform.FilesFromDropFiles(unsafe.Slice((*byte)(pointer(memory)), int(size)))
+	if len(paths) == 0 {
+		return nil, platform.ErrNoClipboardFiles
+	}
+	return paths, nil
+}
+
 // clipboardBytes copies the global memory block of one format of the open
 // clipboard; a block above limit is ErrClipboardImageTooLarge.
 func clipboardBytes(format uintptr, limit int) ([]byte, error) {
@@ -284,6 +351,74 @@ func SetClipboardText(value string) error {
 	}
 	if result, _, callErr := setClipboardData.Call(clipboardUnicodeText, handle); result == 0 {
 		return windowsCallError("write clipboard", callErr)
+	}
+	transferred = true
+	return nil
+}
+
+// SetClipboardFiles makes paths the files the clipboard holds, as Explorer does
+// after the user copies a selection: a CF_HDROP list, the file names as text,
+// and the copy effect.
+func SetClipboardFiles(paths []string) error {
+	drop := platform.DropFilesBytes(paths)
+	names := make([]string, len(paths))
+	for index, path := range paths {
+		names[index] = filepath.Base(path)
+	}
+	text, err := syscall.UTF16FromString(strings.Join(names, "\r\n"))
+	if err != nil {
+		return fmt.Errorf("windows: encode clipboard file names: %w", err)
+	}
+	clipboardMu.Lock()
+	defer clipboardMu.Unlock()
+	owner := uintptr(0)
+	if state := active.Load(); state != nil {
+		owner = state.window
+	}
+	if opened, _, callErr := openClipboard.Call(owner); opened == 0 {
+		return windowsCallError("open clipboard", callErr)
+	}
+	defer closeClipboard.Call()
+	if emptied, _, callErr := emptyClipboard.Call(); emptied == 0 {
+		return windowsCallError("empty clipboard", callErr)
+	}
+	if err := setClipboardBlock(clipboardHDrop, drop); err != nil {
+		return err
+	}
+	// The names and the effect are what a file manager adds beside the list;
+	// a clipboard that already holds the files is still usable without them.
+	textBytes := make([]byte, len(text)*2)
+	for index, unit := range text {
+		binary.LittleEndian.PutUint16(textBytes[index*2:], unit)
+	}
+	_ = setClipboardBlock(clipboardUnicodeText, textBytes)
+	if format := registeredDropEffectFormat(); format != 0 {
+		_ = setClipboardBlock(format, []byte{1, 0, 0, 0}) // DROPEFFECT_COPY
+	}
+	return nil
+}
+
+// setClipboardBlock puts one clipboard format on the open clipboard. The system
+// owns the memory after a successful SetClipboardData; a failure frees it.
+func setClipboardBlock(format uintptr, data []byte) error {
+	handle, _, callErr := globalAlloc.Call(globalMoveable|globalZeroInit, uintptr(len(data)))
+	if handle == 0 {
+		return windowsCallError("allocate clipboard data", callErr)
+	}
+	transferred := false
+	defer func() {
+		if !transferred {
+			globalFree.Call(handle)
+		}
+	}()
+	memory, _, callErr := globalLock.Call(handle)
+	if memory == 0 {
+		return windowsCallError("lock clipboard data", callErr)
+	}
+	copy(unsafe.Slice((*byte)(pointer(memory)), len(data)), data)
+	globalUnlock.Call(handle)
+	if result, _, callErr := setClipboardData.Call(format, handle); result == 0 {
+		return windowsCallError("write clipboard data", callErr)
 	}
 	transferred = true
 	return nil
@@ -381,7 +516,17 @@ func OpenDirectory(options OpenDirectoryOptions) (string, bool, error) {
 }
 
 func SaveFile(options SaveFileOptions) (string, bool, error) {
+	path, _, canceled, err := saveFile(options, "", false)
+	return path, canceled, err
+}
+
+func SaveFileWithCheckbox(options SaveFileOptions, label string, initial bool) (string, bool, bool, error) {
+	return saveFile(options, label, initial)
+}
+
+func saveFile(options SaveFileOptions, checkboxLabel string, initial bool) (string, bool, bool, error) {
 	var path string
+	var checked bool
 	canceled := false
 	err := withSTA(func() error {
 		dialog, err := createFileDialog(&saveDialogClass, &saveDialogInterface)
@@ -389,6 +534,14 @@ func SaveFile(options SaveFileOptions) (string, bool, error) {
 			return err
 		}
 		defer release(&dialog)
+		var custom uintptr
+		if checkboxLabel != "" {
+			custom, err = addSaveDialogCheckbox(dialog, checkboxLabel, initial)
+			if err != nil {
+				return err
+			}
+			defer release(&custom)
+		}
 		flags := uint32(forceFileSystem | pathMustExist | overwritePrompt | noChangeDirectory)
 		if err := configureFileDialog(dialog, options.Title, options.Filters, flags); err != nil {
 			return err
@@ -425,9 +578,15 @@ func SaveFile(options SaveFileOptions) (string, bool, error) {
 		}
 		defer release(&item)
 		path, err = shellItemPath(item)
+		if err != nil {
+			return err
+		}
+		if custom != 0 {
+			checked, err = saveDialogCheckboxState(custom)
+		}
 		return err
 	})
-	return path, canceled, err
+	return path, checked, canceled, err
 }
 
 func OpenURL(target string) error {
@@ -487,26 +646,58 @@ func SendNotification(title, body string) error {
 			return windowsCallError("load notification icon", callErr)
 		}
 	}
-	data := notifyIconData{Size: uint32(unsafe.Sizeof(notifyIconData{})), Window: host, ID: 1, Flags: notifyIcon | notifyTip | notifyInfo, Icon: icon, InfoFlags: notifyInfoIcon}
-	copyUTF16(data.Tip[:], "Viva")
-	copyUTF16(data.InfoTitle[:], title)
-	copyUTF16(data.Info[:], body)
+	data := notificationIconData(host, icon, title, body)
+	return sendNotificationIcon(&data)
+}
+
+func sendNotificationIcon(data *notifyIconData) error {
 	notificationMu.Lock()
 	defer notificationMu.Unlock()
 	operation := uintptr(notifyModify)
-	if !notificationAdded || notificationWindow != host {
-		if notificationAdded {
+	if !notificationAdded || notificationWindow != data.Window {
+		if notificationWindow != 0 {
 			removeNotificationIconLocked(notificationWindow)
 		}
 		operation = notifyAdd
 	}
-	ok, _, callErr := shellNotifyIcon.Call(operation, uintptr(unsafe.Pointer(&data)))
+	ok, _, callErr := callNotifyIcon(operation, data)
+	if ok == 0 && operation == notifyModify {
+		// Explorer can rebuild the notification area without the process seeing
+		// TaskbarCreated on a status window. Forget the stale uID and recreate
+		// the carrier once, including when the application has only normal
+		// windows. The shell may still hold the uID when the modify failed only
+		// for the moment: delete it first, or the add over it fails too.
+		removeNotificationIconLocked(notificationWindow)
+		operation = notifyAdd
+		ok, _, callErr = callNotifyIcon(operation, data)
+	}
 	if ok == 0 {
+		// The shell may still hold the uID under the window it was last sent to.
+		// Remember that window, so the next notification deletes the leftover
+		// instead of adding over it, which fails.
+		notificationAdded = false
+		notificationWindow = data.Window
 		return windowsCallError("send notification", callErr)
 	}
 	notificationAdded = true
-	notificationWindow = host
+	notificationWindow = data.Window
 	return nil
+}
+
+func notificationIconData(host, icon uintptr, title, body string) notifyIconData {
+	// NIF_INFO needs a notification-area icon, but the icon itself is only the
+	// carrier for the balloon. Keep it hidden so applications with their own
+	// tray item do not gain a second, framework-branded icon beside it.
+	data := notifyIconData{
+		Size: uint32(unsafe.Sizeof(notifyIconData{})), Window: host, ID: 1,
+		Flags: notifyIcon | notifyTip | notifyInfo | notifyState,
+		Icon:  icon, State: notifyHidden, StateMask: notifyHidden,
+		InfoFlags: notifyInfoIcon,
+	}
+	copyUTF16(data.Tip[:], title)
+	copyUTF16(data.InfoTitle[:], title)
+	copyUTF16(data.Info[:], body)
+	return data
 }
 
 func removeNotificationIcon(window uintptr) {
@@ -515,12 +706,26 @@ func removeNotificationIcon(window uintptr) {
 	removeNotificationIconLocked(window)
 }
 
+// invalidateNotificationIcon forgets the carrier after the shell replaces its
+// notification area. The carrier no longer exists there, so the next
+// SendNotification starts again with NIM_ADD instead of modifying a stale uID.
+func invalidateNotificationIcon() {
+	notificationMu.Lock()
+	defer notificationMu.Unlock()
+	removeNotificationIconLocked(notificationWindow)
+	notificationAdded = false
+	notificationWindow = 0
+}
+
+// removeNotificationIconLocked deletes the carrier the notification state last
+// named, also when a failed send left it there unconfirmed: the window is the
+// one the shell may still hold it under.
 func removeNotificationIconLocked(window uintptr) {
-	if !notificationAdded || notificationWindow != window {
+	if window == 0 || notificationWindow != window {
 		return
 	}
 	data := notifyIconData{Size: uint32(unsafe.Sizeof(notifyIconData{})), Window: window, ID: 1}
-	shellNotifyIcon.Call(notifyDelete, uintptr(unsafe.Pointer(&data)))
+	callNotifyIcon(notifyDelete, &data)
 	notificationAdded = false
 	notificationWindow = 0
 }
@@ -528,6 +733,9 @@ func removeNotificationIconLocked(window uintptr) {
 func cursorHandle(shape uint8) (uintptr, error) {
 	if shape == cursorHidden {
 		return hiddenCursor()
+	}
+	if shape == 10 { // app.CursorGrabbing, kept numeric so backend shape IDs stay thin.
+		return grabbingCursorHandle()
 	}
 	identifiers := [...]uintptr{32512, 32513, 32649, 32515, 32514, 32644, 32645, 32642, 32643, 32648}
 	if int(shape) >= len(identifiers) {
@@ -546,7 +754,7 @@ func withSTA(run func() error) error {
 	status, _, _ := initializeCOM.Call(0, 2)
 	code := uint32(status)
 	if code != 0 && code != 1 {
-		return fmt.Errorf("windows: initialize file dialog COM apartment: %w", hresult(status))
+		return fmt.Errorf("windows: initialize COM apartment: %w", hresult(status))
 	}
 	defer uninitializeCOM.Call()
 	return run()
@@ -784,7 +992,7 @@ func notificationIcon(host uintptr) uintptr {
 }
 
 // cursorHidden is the shape a surface that draws its own pointer asks for.
-const cursorHidden uint8 = 10
+const cursorHidden uint8 = 11
 
 var createCursor = user.NewProc("CreateCursor")
 

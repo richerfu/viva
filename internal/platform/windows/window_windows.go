@@ -12,17 +12,18 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/vivaui/viva/gfx"
 	"github.com/vivaui/viva/internal/input"
 	"github.com/vivaui/viva/internal/platform"
 	"github.com/vivaui/viva/internal/render"
 	"github.com/vivaui/viva/text"
-	"github.com/vivaui/viva/ui"
 )
 
 const (
 	wmDestroy          = 2
 	wmMove             = 3
 	wmSize             = 5
+	wmShowWindowEvent  = 0x0018 // WM_SHOWWINDOW: the window is being shown or hidden
 	wmKillFocus        = 8
 	wmSetFocus         = 7
 	wmPaint            = 15
@@ -62,7 +63,15 @@ const (
 	wmAllowClose       = 32769
 	wmApplyCursor      = 32770
 	wmRedraw           = 32771
+	wmSetSize          = 0x8052
 	wsOverlappedWindow = 0x00cf0000
+)
+
+const (
+	spiSetFontSmoothing            = 0x4b
+	spiSetFontSmoothingContrast    = 0x200b
+	spiSetFontSmoothingType        = 0x200d
+	spiSetFontSmoothingOrientation = 0x2013
 )
 
 type windowState struct {
@@ -71,14 +80,19 @@ type windowState struct {
 	fullscreenStyle     uint32
 	fullscreenPlacement windowPlacement
 	backdropState
-	application                            *windowsApplication
-	config                                 platform.Config
-	renderer                               renderer
-	window                                 uintptr
-	ready, tracking, sizing                bool
-	minimized                              bool
+	application             *windowsApplication
+	config                  platform.Config
+	renderer                renderer
+	window                  uintptr
+	ready, tracking, sizing bool
+	minimized               bool
+	trimArmed               bool      // the idle timer that trims driver memory is running
+	lastPresent             time.Time // when the window last presented a frame
+	// hiddenByShow is set while ShowWindow has the window hidden; shownVisible is the last
+	// visibility reported to OnVisibility, with ok set once one has been.
+	hiddenByShow, shownVisible, shownKnown bool
 	maximized                              bool
-	lastFrame                              ui.Rect
+	lastFrame                              gfx.Rect
 	scale                                  float32
 	scaleFixed                             bool // VIVA_SCALE set it: the display's own scale is ignored
 	err                                    error
@@ -102,24 +116,31 @@ type windowState struct {
 	baseRectangleCount, baseTextLabelCount int
 	textLabels                             []platform.TextLabel
 	textRectangles                         []render.Rectangle
-	textEngine                             ui.TextEngine
-	textSpans                              []ui.TextSpan
-	textRuns                               []ui.TextRun
+	textEngine                             gfx.TextEngine
+	textSpans                              []gfx.TextSpan
+	textRuns                               []gfx.TextRun
 	captionPress                           captionPress
 	imeComposing                           bool
-	pendingHighSurrogate                   uint16
-	accessibility                          uiaTree
-	pendingKey                             pendingKey
-	deadKey                                bool
-	icons                                  [2]uintptr
-	drop                                   *dropTarget
-	wheel                                  wheelSettings
-	devices                                platform.DeviceRecovery
-	ncTracking                             bool
-	imeTarget                              text.Range
-	imeHasTarget                           bool
-	titlebarThemed, titlebarDark           bool
-	web                                    *webHost
+	// imeDisabled says the window's input-method context is disassociated, and
+	// imeContext holds the context to give back when it returns. A surface that
+	// shows another machine's desktop asks for it (platform.TextInput.DisableIME):
+	// the host's input method would otherwise take the keys that belong to the
+	// machine on the other side.
+	imeDisabled                  bool
+	imeContext                   uintptr
+	pendingHighSurrogate         uint16
+	accessibility                uiaTree
+	pendingKey                   pendingKey
+	deadKey                      bool
+	icons                        [2]uintptr
+	drop                         *dropTarget
+	wheel                        wheelSettings
+	devices                      platform.DeviceRecovery
+	ncTracking                   bool
+	imeTarget                    text.Range
+	imeHasTarget                 bool
+	titlebarThemed, titlebarDark bool
+	web                          *webHost
 }
 
 var active atomic.Pointer[windowState]
@@ -145,8 +166,14 @@ type windowsApplication struct {
 	thread uint32
 	status *statusState
 	// oleReady is set once OLE is initialized on the event-loop thread, which
-	// a window needs to take files by drag and drop.
+	// a window needs to take files by drag and drop, and the taskbar needs to
+	// draw a progress bar.
 	oleReady bool
+	// taskbar is the application's ITaskbarList3, made the first time a bar is
+	// asked for; taskbarTried says the shell refused one, which it is not asked
+	// again.
+	taskbar      uintptr
+	taskbarTried bool
 }
 
 type nativeWindow struct {
@@ -172,7 +199,7 @@ func (state *windowState) reportFrame() {
 	if scale <= 0 {
 		scale = 1
 	}
-	frame := ui.Rect{
+	frame := gfx.Rect{
 		X: float32(origin.X) / scale, Y: float32(origin.Y) / scale,
 		Width:  float32(client.Right-client.Left) / scale,
 		Height: float32(client.Bottom-client.Top) / scale,
@@ -235,6 +262,11 @@ func RunApplication(start platform.ApplicationStart) error {
 			application.closeAll()
 			continue
 		}
+		// A handled printable shortcut must never reach TranslateMessage:
+		// it would enqueue WM_CHAR even if windowProc consumes WM_KEYDOWN.
+		if offerQueuedShortcut(&event) {
+			continue
+		}
 		translateMessage.Call(uintptr(unsafe.Pointer(&event)))
 		dispatchMessage.Call(uintptr(unsafe.Pointer(&event)))
 	}
@@ -281,6 +313,9 @@ func (application *windowsApplication) OpenWindow(config platform.Config) (platf
 		state.closeText()
 		return nil, fmt.Errorf("windows: create window: %w", err)
 	}
+	// A window created with its input (config.TextInput) keeps the host's input
+	// method off it already when the input asked for that (DisableIME).
+	state.updateIMEAssociation()
 	application.windows++
 	if config.Waker != nil && config.OnRedraw != nil {
 		config.Waker.Bind(func() {
@@ -339,6 +374,11 @@ func (application *windowsApplication) OpenWindow(config platform.Config) (platf
 		return nil, err
 	}
 	state.installFrame()
+	if config.SetFrameInterval != nil {
+		// Present(1) in WM_PAINT blocks until the display takes the frame, so
+		// the display paces the window; the runtime needs no interval of its own.
+		config.SetFrameInterval(0)
+	}
 	state.watchBackdropPower()
 	state.applyBackdrop()
 	state.ready = true
@@ -371,6 +411,9 @@ func (application *windowsApplication) closeAll() {
 		}
 		return true
 	})
+	// The one cursor this package made — the closed hand Win32 does not ship —
+	// is destroyed once no window can still be showing it.
+	closeGrabbingCursor()
 }
 
 func windowProc(window, kind, first, second uintptr) (result uintptr) {
@@ -398,6 +441,14 @@ func windowProc(window, kind, first, second uintptr) (result uintptr) {
 		}
 	}()
 	switch kind {
+	case wmAlwaysOnTop:
+		if state.setAlwaysOnTop(first != 0) {
+			return 1
+		}
+		return 0
+	case wmSetSize:
+		state.resizeClient(int(first&0xffff), int((first>>16)&0xffff))
+		return 0
 	case wmFullscreen:
 		state.setFullscreen(first != 0)
 		return 0
@@ -498,15 +549,23 @@ func windowProc(window, kind, first, second uintptr) (result uintptr) {
 		if engine, err := theTextEngine(); err == nil {
 			engine.forget()
 		}
+		state.renderer.invalidateText()
+		invalidateRect.Call(window, 0, 0)
 	case wmSettingChange:
 		// The user changed some system setting, perhaps the light or dark mode
 		// ("ImmersiveColorSet"). The observer reads the mode and ignores the rest.
 		state.wheel = readWheelSettings()
 		state.settingsChanged()
 		platform.NotifyAppearanceChanged()
+		if first == 0 || first == spiSetFontSmoothing || first == spiSetFontSmoothingContrast || first == spiSetFontSmoothingType || first == spiSetFontSmoothingOrientation {
+			state.renderer.invalidateText()
+			invalidateRect.Call(window, 0, 0)
+		}
 	case wmActivate:
 		if uint16(first) == waInactive {
 			state.panelDeactivated()
+		} else if state.config.OnActivate != nil {
+			state.config.OnActivate()
 		}
 	case wmSetFocus:
 		state.focused = true
@@ -565,9 +624,29 @@ func windowProc(window, kind, first, second uintptr) (result uintptr) {
 	case wmPaint:
 		var paint paintStruct
 		beginPaint.Call(window, uintptr(unsafe.Pointer(&paint)))
+		// An empty update region has nothing left to draw. Presenting again would
+		// block on the next vblank for no change.
+		if paint.Bounds.Right <= paint.Bounds.Left || paint.Bounds.Bottom <= paint.Bounds.Top {
+			endPaint.Call(window, uintptr(unsafe.Pointer(&paint)))
+			state.framePresented()
+			return 0
+		}
+		// Nobody can see a minimized window, and its client area no longer matches what it
+		// showed: a custom frame reports the small minimized window (160x28) instead of an
+		// empty rectangle. Presenting at that size would resize the swap chain to the corner
+		// of the old frame, and the taskbar's preview of the window would show it stretched.
+		// The last visible frame stays until the restore's WM_SIZE paints the window again.
+		if state.iconic() {
+			endPaint.Call(window, uintptr(unsafe.Pointer(&paint)))
+			state.framePresented()
+			return 0
+		}
 		var bounds rect
 		getClientRect.Call(window, uintptr(unsafe.Pointer(&bounds)))
 		err := state.present(int(bounds.Right), int(bounds.Bottom))
+		if err == nil {
+			state.scheduleTrim()
+		}
 		endPaint.Call(window, uintptr(unsafe.Pointer(&paint)))
 		if err != nil {
 			state.fail(err)
@@ -579,6 +658,14 @@ func windowProc(window, kind, first, second uintptr) (result uintptr) {
 			state.web.moved()
 		}
 		return 0
+	case wmShowWindowEvent:
+		// wParam is whether the window is being shown; lParam says why, and zero is a call to
+		// ShowWindow. The other reasons (an owner minimizing or restoring) leave the window's
+		// own state, which wmSize follows.
+		if second == 0 {
+			state.hiddenByShow = first == 0
+			state.reportVisibility()
+		}
 	case wmSize:
 		if first == 1 { // SIZE_MINIMIZED
 			if !state.minimized {
@@ -586,6 +673,7 @@ func windowProc(window, kind, first, second uintptr) (result uintptr) {
 				if state.ready && state.config.OnMinimize != nil {
 					state.config.OnMinimize(true)
 				}
+				state.reportVisibility()
 			}
 			return 0
 		}
@@ -594,6 +682,7 @@ func windowProc(window, kind, first, second uintptr) (result uintptr) {
 			if state.ready && state.config.OnMinimize != nil {
 				state.config.OnMinimize(false)
 			}
+			state.reportVisibility()
 		}
 		zoomed := first == 2 // SIZE_MAXIMIZED
 		if state.maximized != zoomed && first != 1 {
@@ -610,11 +699,31 @@ func windowProc(window, kind, first, second uintptr) (result uintptr) {
 		if state.config.OnResize != nil {
 			state.resizeEvents++
 			frame, err := state.config.OnResize(state.logicalSize(int(uint16(second)), int(uint16(second>>16))))
-			state.frame(frame, err)
+			if err := state.frameWithText(frame, err, false); err != nil {
+				return 0
+			}
 		}
 		state.reportFrame()
 		if state.web != nil {
 			state.web.layoutAll(true)
+		}
+		if state.ready {
+			// Draw the new size before returning to the window manager. The swap
+			// chain is scaled with DXGI_SCALING_NONE, so a frame that has not
+			// arrived yet is shown at its own size instead of stretched over the
+			// new client area. Maximize, restore and DPI changes take this path
+			// too; it is the same paint the queued WM_PAINT would have done, just
+			// earlier.
+			if err := state.presentImmediate(int(uint16(second)), int(uint16(second>>16))); err != nil {
+				state.fail(err)
+			} else {
+				state.scheduleTrim()
+				// presentImmediate drew the whole client area, so the invalidate
+				// PrepareFrame queued has nothing left to paint. ValidateRect
+				// removes it rather than drawing the same frame twice.
+				validateRect.Call(window, 0)
+			}
+			return 0
 		}
 		invalidateRect.Call(window, 0, 0)
 		return 0
@@ -668,14 +777,14 @@ func windowProc(window, kind, first, second uintptr) (result uintptr) {
 			state.tracking = true
 		}
 		eventKind := platform.PointerMove
-		button := ui.PointerButtonNone
+		button := gfx.PointerButtonNone
 		switch kind {
 		case wmLeftDown, wmLeftUp:
-			button = ui.PointerButtonPrimary
+			button = gfx.PointerButtonPrimary
 		case wmRightDown, wmRightUp:
-			button = ui.PointerButtonSecondary
+			button = gfx.PointerButtonSecondary
 		case wmMiddleDown, wmMiddleUp:
-			button = ui.PointerButtonMiddle
+			button = gfx.PointerButtonMiddle
 		case wmXButtonDown, wmXButtonUp:
 			var known bool
 			if button, known = sideButton(first); !known {
@@ -741,24 +850,20 @@ func windowProc(window, kind, first, second uintptr) (result uintptr) {
 		if state.wantsKeyReleases() && state.keyUp(first, second, modifiers()) {
 			return 0
 		}
+		state.modifierTap(first, second, true, modifiers())
 	case wmKeyDown, wmSysKeyDown:
 		if state.textEnabled && state.imeComposing {
 			break // IME candidate keys must not submit or dismiss the surrounding form.
 		}
 		modifiers := modifiers()
 		wanted := state.wantsKeyReleases()
+		if !wanted {
+			state.modifierTap(first, second, false, modifiers)
+		}
 		if wanted && !state.imeComposing {
-			// Control and Command chords are offered to the application first,
-			// as without releases.
-			if state.offerShortcut(first, second, modifiers) {
-				return 0
-			}
 			if state.keyDown(first, second, modifiers) {
 				return 0
 			}
-		}
-		if !(wanted && !state.imeComposing) && state.offerShortcut(first, second, modifiers) {
-			return 0
 		}
 		if state.textEnabled && !state.imeComposing && !wanted && state.textKey(first, second, modifiers) {
 			return 0
@@ -789,6 +894,10 @@ func windowProc(window, kind, first, second uintptr) (result uintptr) {
 			return 0
 		}
 	case wmTimer:
+		if first == trimTimerID {
+			state.handleTrimTimer()
+			return 0
+		}
 		state.handleCaretTimer(first)
 		return 0
 	case wmNCHitTest:
@@ -825,10 +934,13 @@ func scaleOverride(value string) (float32, bool) {
 }
 
 func (state *windowState) frame(frame platform.Frame, err error) {
-	state.frameWithText(frame, err, false)
+	_ = state.frameWithText(frame, err, false)
 }
 
-func (state *windowState) frameWithText(frame platform.Frame, err error, nativeVisualChanged bool) {
+// frameWithText applies a frame and reports an error that stopped it, as well as
+// handling it through fail. A caller that presents synchronously (WM_SIZE does)
+// must not present a frame that was never applied.
+func (state *windowState) frameWithText(frame platform.Frame, err error, nativeVisualChanged bool) error {
 	views := frame.NativeViews
 	if err == nil {
 		state.applyBackdrop()
@@ -842,20 +954,27 @@ func (state *windowState) frameWithText(frame platform.Frame, err error, nativeV
 		if err == nil {
 			err = state.applyFrame(frame)
 		}
-		if err == nil && dirty {
-			invalidateRect.Call(state.window, 0, 0)
+		if err == nil {
+			if dirty {
+				invalidateRect.Call(state.window, 0, 0)
+			} else {
+				// Nothing reached the screen, so no WM_PAINT will report this
+				// frame as presented; the runtime can still ask for the next one.
+				state.framePresented()
+			}
 		}
 	}
 	if err != nil {
 		state.fail(err)
-		return
+		return err
 	}
 	if frame.Accessibility != nil {
 		if err := state.accessibility.update(frame.Accessibility); err != nil {
 			state.fail(err)
-			return
+			return err
 		}
 	}
+	return nil
 }
 
 // destroyed releases what the window held when the system destroys it. The
@@ -1002,14 +1121,14 @@ func (state *windowState) testEvents() {
 
 // sideButton is the button a WM_XBUTTON message is for. The high word of wParam
 // says which: XBUTTON1 is the Back button of a mouse, XBUTTON2 Forward.
-func sideButton(wParam uintptr) (ui.PointerButton, bool) {
+func sideButton(wParam uintptr) (gfx.PointerButton, bool) {
 	switch uint16(wParam >> 16) {
 	case 1:
-		return ui.PointerButtonBack, true
+		return gfx.PointerButtonBack, true
 	case 2:
-		return ui.PointerButtonForward, true
+		return gfx.PointerButtonForward, true
 	}
-	return ui.PointerButtonNone, false
+	return gfx.PointerButtonNone, false
 }
 
 // configureClicks sets the double-click time and distance from the system
@@ -1028,5 +1147,34 @@ func (state *windowState) configureClicks() {
 		if width, _, _ := getSystemMetrics.Call(smCxDoubleClick); width > 0 && state.scale > 0 {
 			state.clicks.Distance = float32(width) / 2 / state.scale
 		}
+	}
+}
+
+// iconic reports whether the window manager has the window minimized. WM_SIZE
+// normally sets state.minimized first, but a paint caused by the resize can arrive
+// before that message; the window itself is already iconic by then.
+func (state *windowState) iconic() bool {
+	if state.minimized {
+		return true
+	}
+	minimized, _, _ := isIconic.Call(state.window)
+	return minimized != 0
+}
+
+// reportVisibility tells OnVisibility when the window stopped or started being something the
+// user can see: hidden with ShowWindow, or minimized. A covered window or one on another virtual
+// desktop is not reported; Windows has no message for either that this window receives.
+func (state *windowState) reportVisibility() {
+	if state.config.OnVisibility == nil || !state.ready {
+		return
+	}
+	visible := !state.hiddenByShow && !state.minimized
+	if state.shownKnown && state.shownVisible == visible {
+		return
+	}
+	state.shownKnown, state.shownVisible = true, visible
+	state.config.OnVisibility(visible)
+	if !visible {
+		state.renderer.trim()
 	}
 }

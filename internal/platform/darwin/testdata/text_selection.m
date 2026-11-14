@@ -15,6 +15,16 @@ void vivaPointerEvent(uintptr_t handle, void *view, int kind, int button, int mo
 }
 void vivaViewResized(uintptr_t handle, void *view, double width, double height) {}
 void vivaRedrawRequested(uintptr_t handle, void *view) {}
+// viva_test_keyboard_event builds a real key event, so characters re-applied
+// with modifiers are resolved by the active layout and key code.
+static NSEvent *viva_test_keyboard_event(unsigned short key_code, CGEventFlags flags) {
+    CGEventRef event = CGEventCreateKeyboardEvent(NULL, key_code, true);
+    CGEventSetFlags(event, flags);
+    NSEvent *result = [NSEvent eventWithCGEvent:event];
+    CFRelease(event);
+    return result;
+}
+
 // Raw key events a terminal view delivers.
 static int rawKeys[16];
 static int rawModifiers[16];
@@ -30,6 +40,7 @@ void vivaKeyEvent(uintptr_t handle, void *view, int key, int modifiers, int repe
     }
 }
 void vivaRawKeyEvent(uintptr_t handle, void *view, int key, int modifiers, int flags, unsigned int code, const unsigned char *utf8, size_t utf8Length, const unsigned char *typed, size_t typedLength) {}
+void vivaWindowActivated(uintptr_t handle) {}
 void vivaFocusLost(uintptr_t handle, void *view) {}
 // The terminal's table, reduced to what these tests use: CJK ideographs take two cells,
 // combining marks none.
@@ -42,8 +53,10 @@ int vivaTerminalCells(uint32_t character) {
 int vivaAccessibilityAction(uintptr_t handle, void *view, uint64_t node, int action, double number, const unsigned char *utf8, size_t utf8Length, int start, int end) { return 0; }
 // The engine's shaped line, uncached: the caller releases it.
 viva_text_line *vivaShapedLine(const unsigned char *utf8, size_t length, double size, double weight) { return viva_text_line_create(utf8, length, size, weight); }
+viva_text_line *vivaShapedLineStyle(const unsigned char *utf8, size_t length, double size, double weight, int italic) { return viva_text_line_create_style(utf8, length, size, weight, italic); }
 int vivaShortcutEvent(uintptr_t handle, void *view, int key, int modifiers, int repeat, const unsigned char *utf8, size_t utf8Length) { return 0; }
 void vivaOpenURL(const char *url) {}
+void vivaOpenFile(const char *path) {}
 int vivaApplicationQuitRequested(void) { return 0; }
 int vivaApplicationReopenRequested(void) { return 0; }
 int vivaFileDropEvent(uintptr_t handle, void *view, int phase, double x, double y, const char *paths, size_t length) { return 0; }
@@ -52,13 +65,35 @@ void vivaCloseRequested(uintptr_t handle, void *view) {}
 void vivaWindowClosed(uintptr_t handle) {}
 void vivaFrameChanged(uintptr_t handle, void *view, double x, double y, double width, double height) {}
 void vivaWindowMinimized(uintptr_t handle, void *view, int minimized) {}
+void vivaWindowOccluded(uintptr_t handle, void *view, int visible) {}
 void vivaWindowFullscreen(uintptr_t handle, void *view, int fullscreen) {}
 int vivaWindowReopenRequested(uintptr_t handle, void *view) { return 0; }
-uint16_t vivaRectangleLayer(uintptr_t handle, size_t index) { return 0; }
 int vivaPressAt(uintptr_t handle, double x, double y) { return 0; }
 void vivaTextInput(uintptr_t handle, void *view, int kind, const unsigned char *utf8,
                   size_t length, int64_t start, int64_t selectedLength,
                   int64_t replacementStart, int64_t replacementLength, int command) {}
+
+static NSUInteger copyRequests;
+
+// RecordingInputContext counts what the platform editor asks of the input
+// method's session. The harness runs no real input method, so these calls are
+// the contract: a composition being typed must not be discarded by a layout
+// update of the field it is typed into.
+@interface RecordingInputContext : NSObject {
+@public
+    NSUInteger discards;
+    NSUInteger activations;
+    NSUInteger deactivations;
+    NSUInteger invalidations;
+}
+@end
+
+@implementation RecordingInputContext
+- (void)discardMarkedText { discards++; }
+- (void)activate { activations++; }
+- (void)deactivate { deactivations++; }
+- (void)invalidateCharacterCoordinates { invalidations++; }
+@end
 
 @interface SelectionView : VivaMetalView {
 @public
@@ -69,11 +104,21 @@ void vivaTextInput(uintptr_t handle, void *view, int kind, const unsigned char *
     // so the selection tests keep proving they never emit one.
     BOOL recordEdits;
     NSUInteger editEvents;
+    NSUInteger cancelEvents;
     int lastKind;
     int lastCommand;
     NSString *lastText;
+    NSString *copyOverrideValue;
     // The modifiers the next Return key is taken to have.
     NSEventModifierFlags returnFlags;
+    // What a fake input-method interpreter does for a composing key: 0 is the
+    // system binding, 1 no update, 2 one empty mark, 3 two empty marks, 4 a
+    // non-empty update, 5 empty mark + nested no-update key + empty mark, 6
+    // empty mark + nested ordinary empty mark + empty mark, 7 non-empty then
+    // empty mark, 8 empty insert, 9 non-empty insert, 10 empty mark followed by
+    // cancelOperation:, 11 unmark.
+    int fakeMarkedMode;
+    RecordingInputContext *recordingContext;
 }
 - (void)resetText:(NSString *)value;
 - (NSEvent *)mouseEvent:(NSEventType)type offset:(CGFloat)offset;
@@ -89,14 +134,27 @@ void vivaTextInput(uintptr_t handle, void *view, int kind, const unsigned char *
 - (BOOL)hasCaretTimer;
 - (void)beginComposition;
 - (void)setTerminal:(BOOL)value;
+- (void)setCopyOverride:(NSString *)value enabled:(BOOL)enabled;
 - (void)setCellWidth:(CGFloat)value;
 - (void)enableKeyCallbacks;
 - (void)endComposition;
 - (BOOL)composing;
 - (CGFloat)frameX;
+- (NSRect)inputFrame;
+- (void)setAlignment:(int)value;
+- (void)interpretKeyEvents:(NSArray<NSEvent *> *)eventArray;
 @end
 
 @implementation SelectionView
+- (void)setCopyOverride:(NSString *)value enabled:(BOOL)enabled {
+    _textCopyOverride = enabled;
+    [copyOverrideValue release];
+    copyOverrideValue = [value copy];
+}
+- (void)dealloc {
+    [copyOverrideValue release];
+    [super dealloc];
+}
 - (void)resetText:(NSString *)value {
     [self stopCaretBlink];
     [_text release];
@@ -115,14 +173,16 @@ void vivaTextInput(uintptr_t handle, void *view, int kind, const unsigned char *
     renders = 0;
     recordEdits = NO;
     editEvents = 0;
+    cancelEvents = 0;
     lastKind = 0;
     lastCommand = 0;
     [lastText release];
     lastText = nil;
     _textSecure = NO;
     _textInputMultiline = NO;
+    fakeMarkedMode = 0;
 }
-- (NSTextInputContext *)inputContext { return nil; }
+- (NSTextInputContext *)inputContext { return (NSTextInputContext *)recordingContext; }
 - (NSEventModifierFlags)returnKeyModifierFlags { return returnFlags; }
 - (BOOL)rebuildTextTexture { textureRebuilds++; return YES; }
 - (void)render { renders++; }
@@ -130,6 +190,9 @@ void vivaTextInput(uintptr_t handle, void *view, int kind, const unsigned char *
     replacementRange:(NSRange)replacement command:(int)command {
     if (recordEdits && kind != VIVA_TEXT_SET_SELECTION) {
         editEvents++;
+        if (kind == VIVA_TEXT_CANCEL_COMPOSITION) {
+            cancelEvents++;
+        }
         lastKind = kind;
         lastCommand = command;
         [lastText release];
@@ -175,7 +238,72 @@ void vivaTextInput(uintptr_t handle, void *view, int kind, const unsigned char *
 - (void)endComposition { _hasMarkedText = NO; }
 - (BOOL)composing { return _hasMarkedText; }
 - (CGFloat)frameX { return _textFrame.origin.x; }
+- (NSRect)inputFrame { return _textFrame; }
+- (void)setAlignment:(int)value { _textAlignment = value; }
+- (void)interpretKeyEvents:(NSArray<NSEvent *> *)eventArray {
+    if (!_hasMarkedText || fakeMarkedMode == 0) {
+        [super interpretKeyEvents:eventArray];
+        return;
+    }
+    int mode = fakeMarkedMode;
+    if (mode == 1) {
+        return;
+    }
+    if (mode == 8) {
+        [self insertText:@"" replacementRange:NSMakeRange(NSNotFound, 0)];
+        return;
+    }
+    if (mode == 9) {
+        [self insertText:@"x" replacementRange:NSMakeRange(NSNotFound, 0)];
+        return;
+    }
+    if (mode == 11) {
+        [self unmarkText];
+        return;
+    }
+    if (mode == 5 || mode == 6) {
+        [self setMarkedText:@"" selectedRange:NSMakeRange(0, 0) replacementRange:NSMakeRange(NSNotFound, 0)];
+        fakeMarkedMode = mode == 6 ? 2 : 1;
+        NSEvent *nested = [NSEvent keyEventWithType:NSEventTypeKeyDown location:NSZeroPoint
+            modifierFlags:0 timestamp:0 windowNumber:0 context:nil characters:@"x"
+            charactersIgnoringModifiers:@"x" isARepeat:NO keyCode:7];
+        [self keyDown:nested];
+        [self setMarkedText:@"" selectedRange:NSMakeRange(0, 0) replacementRange:NSMakeRange(NSNotFound, 0)];
+        return;
+    }
+    if (mode == 10) {
+        [self setMarkedText:@"" selectedRange:NSMakeRange(0, 0) replacementRange:NSMakeRange(NSNotFound, 0)];
+        [self doCommandBySelector:@selector(cancelOperation:)];
+        return;
+    }
+    if (mode == 7) {
+        [self setMarkedText:@"ni" selectedRange:NSMakeRange(2, 0) replacementRange:NSMakeRange(NSNotFound, 0)];
+        [self setMarkedText:@"" selectedRange:NSMakeRange(0, 0) replacementRange:NSMakeRange(NSNotFound, 0)];
+        return;
+    }
+    if (mode == 3) {
+        [self setMarkedText:@"" selectedRange:NSMakeRange(0, 0) replacementRange:NSMakeRange(NSNotFound, 0)];
+    }
+    if (mode == 2 || mode == 3) {
+        [self setMarkedText:@"" selectedRange:NSMakeRange(0, 0) replacementRange:NSMakeRange(NSNotFound, 0)];
+        return;
+    }
+    [self setMarkedText:@"ni" selectedRange:NSMakeRange(2, 0) replacementRange:NSMakeRange(NSNotFound, 0)];
+}
 @end
+
+unsigned char *vivaCopyText(uintptr_t handle, void *view, size_t *length) {
+    copyRequests++;
+    NSString *value = ((SelectionView *)view)->copyOverrideValue;
+    const char *utf8 = [value UTF8String];
+    *length = utf8 == NULL ? 0 : strlen(utf8);
+    if (*length == 0) {
+        return NULL;
+    }
+    unsigned char *result = malloc(*length);
+    memcpy(result, utf8, *length);
+    return result;
+}
 
 static NSEvent *keyEvent(NSString *characters, NSEventModifierFlags modifiers) {
     return [NSEvent keyEventWithType:NSEventTypeKeyDown location:NSZeroPoint
@@ -274,6 +402,109 @@ int main(void) {
             assert([view textIndexForEvent:[view mouseEvent:NSEventTypeLeftMouseDown offset:boundary + 0.01]] == index);
         }
 
+        for (int alignment = 1; alignment <= 2; alignment++) {
+            NSString *value = @"A中B";
+            NSData *utf8 = [value dataUsingEncoding:NSUTF8StringEncoding];
+            viva_text_input_config config = {0};
+            config.enabled = 1;
+            config.utf8 = utf8.bytes;
+            config.utf8_length = utf8.length;
+            config.x = 40;
+            config.y = 80;
+            config.width = 260;
+            config.height = 32;
+            config.font_size = 16;
+            config.alpha = 1;
+            config.alignment = alignment;
+            assert([view updateTextInput:config] == 0);
+            viva_editor_line line = [view newTextLine];
+            CGFloat inset = MAX(0, 260 - line.shaped->width) / (alignment == 1 ? 2 : 1);
+            viva_editor_line_free(line);
+            for (NSUInteger index = 0; index <= value.length; index++) {
+                CGFloat boundary = inset + [view offsetForIndex:index];
+                assert([view textIndexForEvent:[view mouseEvent:NSEventTypeLeftMouseDown offset:boundary + 0.01]] == index);
+            }
+        }
+
+        // A field that grows a row while someone composes keeps the input
+        // method's marked text: the frame and caret follow the new layout, but
+        // the session is neither discarded nor deactivated. A replacing update
+        // of the same config still ends it.
+        {
+            NSString *value = @"ni";
+            NSData *utf8 = [value dataUsingEncoding:NSUTF8StringEncoding];
+            RecordingInputContext *context = [[RecordingInputContext alloc] init];
+            view->recordingContext = context;
+            [view resetText:value];
+            [view setEditing:NO];
+            viva_text_input_config composing = {0};
+            composing.enabled = 1;
+            composing.utf8 = utf8.bytes;
+            composing.utf8_length = utf8.length;
+            composing.x = 40;
+            composing.y = 80;
+            composing.width = 260;
+            composing.height = 32;
+            composing.font_size = 16;
+            composing.alpha = 1;
+            composing.marked_start = 0;
+            composing.marked_length = 2;
+            composing.has_marked_text = 1;
+            composing.placed = 1;
+            composing.caret_x = 70;
+            composing.caret_y = 85;
+            composing.caret_width = 1;
+            composing.caret_height = 16;
+            assert([view updateTextInput:composing] == 0);
+            assert(context->discards == 0 && context->deactivations == 0 && context->activations == 1);
+            assert([view hasMarkedText]);
+            NSUInteger rebuilds = view->textureRebuilds;
+            NSUInteger invalidations = context->invalidations;
+            viva_text_input_config taller = composing;
+            taller.y = 64;
+            taller.height = 48;
+            assert(viva_view_update_text_input_keeping_composition(view, taller) == 0);
+            assert(context->discards == 0 && context->deactivations == 0 && context->activations == 1);
+            assert(context->invalidations == invalidations + 1);
+            assert([view hasMarkedText]);
+            assert(NSEqualRanges([view markedRange], NSMakeRange(0, 2)));
+            assert(NSEqualRects([view inputFrame], NSMakeRect(40, 64, 260, 48)));
+            assert(view->textureRebuilds == rebuilds + 1);
+            assert([view updateTextInput:composing] == 0);
+            assert(context->discards == 1 && context->deactivations == 1);
+            assert([view updateTextInput:(viva_text_input_config){0}] == 0);
+            view->recordingContext = nil;
+            [context release];
+        }
+
+        NSWindow *candidateWindow = [[NSWindow alloc] initWithContentRect:NSMakeRect(120, 120, 480, 320)
+            styleMask:NSWindowStyleMaskBorderless backing:NSBackingStoreBuffered defer:NO];
+        [candidateWindow setContentView:view];
+        for (int alignment = 0; alignment <= 2; alignment++) {
+            [view resetText:@"A中B"];
+            [view setAlignment:alignment];
+            viva_editor_line line = [view newTextLine];
+            NSRect inputFrame = [view inputFrame];
+            CGFloat inset = viva_editor_alignment_inset(line, inputFrame.size.width, alignment, NO);
+            CGFloat caret = [view textOffsetForIndex:2 line:line];
+            viva_editor_line_free(line);
+            NSRect expectedLocal = NSMakeRect(inputFrame.origin.x + inset + caret,
+                view.bounds.size.height - NSMaxY(inputFrame), 1, inputFrame.size.height);
+            NSRect expectedScreen = [candidateWindow convertRectToScreen:[view convertRect:expectedLocal toView:nil]];
+            NSRange actual = NSMakeRange(NSNotFound, 0);
+            NSRect candidate = [view firstRectForCharacterRange:NSMakeRange(2, 0) actualRange:&actual];
+            assert(NSEqualRanges(actual, NSMakeRange(2, 0)));
+            assert(fabs(NSMinX(candidate) - NSMinX(expectedScreen)) < 0.01);
+            if (alignment == 2) {
+                NSRect endCandidate = [view firstRectForCharacterRange:NSMakeRange(3, 0) actualRange:NULL];
+                NSRect field = [candidateWindow convertRectToScreen:[view convertRect:
+                    NSMakeRect(inputFrame.origin.x, view.bounds.size.height - NSMaxY(inputFrame), inputFrame.size.width, inputFrame.size.height) toView:nil]];
+                assert(NSMinX(endCandidate) < NSMaxX(field));
+            }
+        }
+        [candidateWindow setContentView:nil];
+        [candidateWindow release];
+
         [view resetText:@"marked"];
         [view beginComposition];
         [view selectTextRange:view.selectedRange];
@@ -367,6 +598,7 @@ int main(void) {
         _Static_assert(VIVA_TEXT_DELETE_WORD_FORWARD == GO_TEXT_DELETE_WORD_FORWARD, "delete word forward");
         _Static_assert(VIVA_TEXT_DELETE_TO_LINE_START == GO_TEXT_DELETE_TO_LINE_START, "delete to line start");
         _Static_assert(VIVA_TEXT_DELETE_TO_LINE_END == GO_TEXT_DELETE_TO_LINE_END, "delete to line end");
+        _Static_assert(VIVA_TEXT_CANCEL_COMPOSITION == GO_TEXT_CANCEL_COMPOSITION, "cancel composition");
         const struct { const char *selector; int command; } navigation[] = {
             {"moveWordLeft:", VIVA_TEXT_MOVE_WORD_LEFT},
             {"moveWordRight:", VIVA_TEXT_MOVE_WORD_RIGHT},
@@ -455,16 +687,42 @@ int main(void) {
         assert([view performKeyEquivalent:keyEvent(@"c", command)]);
         assert([[board stringForType:NSPasteboardTypeString] isEqualToString:@"keep"]);
 
-        // Cut copies, then deletes the selection the way Backspace does.
+        // Cut copies, then emits an empty paste to delete the application selection.
         [view selectTextRange:NSMakeRange(0, 1)];
         assert([view performKeyEquivalent:keyEvent(@"x", command)]);
         assert([[board stringForType:NSPasteboardTypeString] isEqualToString:@"A"]);
-        assert(view->editEvents == 1 && view->lastKind == VIVA_TEXT_COMMAND_EVENT &&
-               view->lastCommand == VIVA_TEXT_DELETE_BACKWARD);
+        assert(view->editEvents == 1 && view->lastKind == VIVA_TEXT_PASTE &&
+               view->lastCommand == 0);
         [view selectTextRange:NSMakeRange(2, 0)];
-        NSUInteger edits = view->editEvents;
+        NSUInteger clipboardEdits = view->editEvents;
         assert([view performKeyEquivalent:keyEvent(@"x", command)]);
-        assert(view->editEvents == edits);
+        assert(view->editEvents == clipboardEdits);
+
+        // A component-owned disjoint selection copies its prepared text even
+        // though the native primary selection is collapsed.
+        [view setCopyOverride:@"bc\n  " enabled:YES];
+        NSUInteger previousCopies = copyRequests;
+        [view copy:nil];
+        assert(copyRequests == previousCopies + 1);
+        assert([[board stringForType:NSPasteboardTypeString] isEqualToString:@"bc\n  "]);
+        [view cut:nil];
+        assert(copyRequests == previousCopies + 2);
+        assert(view->editEvents == clipboardEdits + 1 && view->lastKind == VIVA_TEXT_PASTE &&
+               view->lastCommand == 0);
+        [view setCopyOverride:@"" enabled:YES];
+        [board clearContents];
+        [board setString:@"keep" forType:NSPasteboardTypeString];
+        [view copy:nil];
+        [view cut:nil];
+        assert([[board stringForType:NSPasteboardTypeString] isEqualToString:@"keep"]);
+        assert(view->editEvents == clipboardEdits + 1);
+        [view setCopyOverride:nil enabled:YES];
+        [view selectTextRange:NSMakeRange(0, 1)];
+        [view copy:nil];
+        [view cut:nil];
+        assert([[board stringForType:NSPasteboardTypeString] isEqualToString:@"keep"]);
+        assert(view->editEvents == clipboardEdits + 1);
+        [view setCopyOverride:nil enabled:NO];
 
         // Paste inserts the pasteboard text; the case of the key does not matter.
         [board clearContents];
@@ -486,15 +744,15 @@ int main(void) {
         // An empty or non-text pasteboard inserts nothing, and says so: a field
         // that takes pictures then looks at the pasteboard's other formats.
         [board clearContents];
-        edits = view->editEvents;
+        clipboardEdits = view->editEvents;
         [view paste:nil];
-        assert(view->editEvents == edits + 1 && view->lastKind == VIVA_TEXT_PASTE_NO_TEXT);
+        assert(view->editEvents == clipboardEdits + 1 && view->lastKind == VIVA_TEXT_PASTE_NO_TEXT);
         assert([view->lastText length] == 0);
         // Text that is only line breaks flattens to nothing and says nothing.
         [board setString:@"\n\r\n" forType:NSPasteboardTypeString];
-        edits = view->editEvents;
+        clipboardEdits = view->editEvents;
         [view paste:nil];
-        assert(view->editEvents == edits);
+        assert(view->editEvents == clipboardEdits);
         [board clearContents];
 
         // A password field never exports its text but accepts a paste.
@@ -502,28 +760,202 @@ int main(void) {
         [board clearContents];
         [board setString:@"clip" forType:NSPasteboardTypeString];
         [view selectTextRange:NSMakeRange(0, 2)];
-        edits = view->editEvents;
+        clipboardEdits = view->editEvents;
         assert([view performKeyEquivalent:keyEvent(@"c", command)]);
         assert([[board stringForType:NSPasteboardTypeString] isEqualToString:@"clip"]);
         assert([view performKeyEquivalent:keyEvent(@"x", command)]);
         assert([[board stringForType:NSPasteboardTypeString] isEqualToString:@"clip"]);
-        assert(view->editEvents == edits);
+        assert(view->editEvents == clipboardEdits);
         assert([view performKeyEquivalent:keyEvent(@"v", command)]);
-        assert(view->editEvents == edits + 1 && [view->lastText isEqualToString:@"clip"]);
+        assert(view->editEvents == clipboardEdits + 1 && [view->lastText isEqualToString:@"clip"]);
         [view setSecure:NO];
 
         // Only a bare Command chord counts, and only while a field is editing.
-        edits = view->editEvents;
+        clipboardEdits = view->editEvents;
         assert(![view performKeyEquivalent:keyEvent(@"v", command | NSEventModifierFlagShift)]);
         assert(![view performKeyEquivalent:keyEvent(@"v", NSEventModifierFlagControl)]);
         assert(![view performKeyEquivalent:keyEvent(@"v", command | NSEventModifierFlagOption)]);
         [view setEditing:NO];
         assert(![view performKeyEquivalent:keyEvent(@"v", command)]);
         assert(![view performKeyEquivalent:keyEvent(@"c", command)]);
-        assert(view->editEvents == edits);
+        assert(view->editEvents == clipboardEdits);
         [view setEditing:YES];
         view->recordEdits = NO;
         viva_test_pasteboard = nil;
+
+        // A single-line field gives composing Enter and Escape to the input
+        // method; once committed, Enter is the application's key again.
+        [view resetText:@"marked"];
+        [view enableKeyCallbacks];
+        view->recordEdits = YES;
+        [view beginComposition];
+        rawCount = 0;
+        [view keyDown:keyEvent(@"\r", 0)];
+        unichar escapeKey = 0x1b;
+        [view keyDown:keyEvent([NSString stringWithCharacters:&escapeKey length:1], 0)];
+        assert(rawCount == 0);
+        [view endComposition];
+        [view keyDown:keyEvent(@"\r", 0)];
+        assert(rawCount == 1 && rawKeys[0] == VIVA_KEY_ENTER);
+        view->recordEdits = NO;
+
+        // An input method's explicit Escape cancellation is one distinct event.
+        // A non-empty update, no update, an ordinary empty mark, Unmark and a
+        // commit are not cancellation, and duplicate callbacks from the same
+        // Escape interpretation do not emit a second one.
+        [view resetText:@"A中B"];
+        view->recordEdits = YES;
+        rawCount = 0;
+        NSEvent *escape = keyEvent([NSString stringWithCharacters:&escapeKey length:1], 0);
+        NSUInteger edits = view->editEvents;
+        NSUInteger cancels = view->cancelEvents;
+        [view beginComposition];
+        view->fakeMarkedMode = 2;
+        [view keyDown:escape];
+        assert(view->editEvents == edits + 1);
+        assert(view->cancelEvents == cancels + 1);
+        assert(view->lastKind == VIVA_TEXT_CANCEL_COMPOSITION);
+        assert([view->lastText length] == 0);
+        assert(rawCount == 0);
+
+        edits = view->editEvents;
+        cancels = view->cancelEvents;
+        [view beginComposition];
+        view->fakeMarkedMode = 3;
+        [view keyDown:escape];
+        assert(view->editEvents == edits + 1);
+        assert(view->cancelEvents == cancels + 1);
+        assert(view->lastKind == VIVA_TEXT_CANCEL_COMPOSITION);
+
+        edits = view->editEvents;
+        cancels = view->cancelEvents;
+        [view beginComposition];
+        view->fakeMarkedMode = 10;
+        [view keyDown:escape];
+        assert(view->editEvents == edits + 1);
+        assert(view->cancelEvents == cancels + 1);
+        assert(view->lastKind == VIVA_TEXT_CANCEL_COMPOSITION);
+
+        edits = view->editEvents;
+        cancels = view->cancelEvents;
+        [view beginComposition];
+        view->fakeMarkedMode = 4;
+        [view keyDown:escape];
+        assert(view->editEvents == edits + 1);
+        assert(view->cancelEvents == cancels);
+        assert(view->lastKind == VIVA_TEXT_SET_MARKED);
+        assert([view->lastText isEqualToString:@"ni"]);
+
+        edits = view->editEvents;
+        cancels = view->cancelEvents;
+        [view beginComposition];
+        view->fakeMarkedMode = 7;
+        [view keyDown:escape];
+        assert(view->editEvents == edits + 2);
+        assert(view->cancelEvents == cancels);
+        assert(view->lastKind == VIVA_TEXT_SET_MARKED);
+        assert([view->lastText length] == 0);
+
+        edits = view->editEvents;
+        cancels = view->cancelEvents;
+        [view beginComposition];
+        view->fakeMarkedMode = 1;
+        [view keyDown:escape];
+        assert(view->editEvents == edits);
+        assert(view->cancelEvents == cancels);
+
+        edits = view->editEvents;
+        cancels = view->cancelEvents;
+        [view beginComposition];
+        view->fakeMarkedMode = 5;
+        [view keyDown:escape];
+        assert(view->editEvents == edits + 1);
+        assert(view->cancelEvents == cancels + 1);
+        assert(view->lastKind == VIVA_TEXT_CANCEL_COMPOSITION);
+
+        edits = view->editEvents;
+        cancels = view->cancelEvents;
+        [view beginComposition];
+        view->fakeMarkedMode = 6;
+        [view keyDown:escape];
+        assert(view->editEvents == edits + 2);
+        assert(view->cancelEvents == cancels + 1);
+        assert(view->lastKind == VIVA_TEXT_SET_MARKED);
+        assert([view->lastText length] == 0);
+
+        edits = view->editEvents;
+        cancels = view->cancelEvents;
+        [view beginComposition];
+        view->fakeMarkedMode = 8;
+        [view keyDown:escape];
+        assert(view->editEvents == edits + 1);
+        assert(view->cancelEvents == cancels + 1);
+        assert(view->lastKind == VIVA_TEXT_CANCEL_COMPOSITION);
+
+        edits = view->editEvents;
+        cancels = view->cancelEvents;
+        [view beginComposition];
+        view->fakeMarkedMode = 9;
+        [view keyDown:escape];
+        assert(view->editEvents == edits + 1);
+        assert(view->cancelEvents == cancels);
+        assert(view->lastKind == VIVA_TEXT_INSERT);
+        assert([view->lastText isEqualToString:@"x"]);
+
+        edits = view->editEvents;
+        cancels = view->cancelEvents;
+        [view beginComposition];
+        view->fakeMarkedMode = 11;
+        [view keyDown:escape];
+        assert(view->editEvents == edits + 1);
+        assert(view->cancelEvents == cancels);
+        assert(view->lastKind == VIVA_TEXT_UNMARK);
+
+        // A second Escape is a new interpretation and cancels again.
+        edits = view->editEvents;
+        cancels = view->cancelEvents;
+        [view beginComposition];
+        view->fakeMarkedMode = 2;
+        [view keyDown:escape];
+        [view keyDown:escape];
+        assert(view->editEvents == edits + 2);
+        assert(view->cancelEvents == cancels + 2);
+
+        // Outside an Escape interpretation an empty mark and an empty insert
+        // stay ordinary text events rather than being inferred as cancellation.
+        edits = view->editEvents;
+        cancels = view->cancelEvents;
+        view->fakeMarkedMode = 0;
+        [view beginComposition];
+        [view setMarkedText:@"" selectedRange:NSMakeRange(0, 0) replacementRange:NSMakeRange(NSNotFound, 0)];
+        assert(view->editEvents == edits + 1);
+        assert(view->cancelEvents == cancels);
+        assert(view->lastKind == VIVA_TEXT_SET_MARKED);
+        [view insertText:@"" replacementRange:NSMakeRange(NSNotFound, 0)];
+        assert(view->editEvents == edits + 2);
+        assert(view->cancelEvents == cancels);
+        assert(view->lastKind == VIVA_TEXT_INSERT);
+
+        // cancelOperation: is cancellation only while composing, and Escape
+        // when idle still reaches the application as a raw key.
+        edits = view->editEvents;
+        cancels = view->cancelEvents;
+        [view beginComposition];
+        [view doCommandBySelector:@selector(cancelOperation:)];
+        assert(view->editEvents == edits + 1);
+        assert(view->cancelEvents == cancels + 1);
+        assert(view->lastKind == VIVA_TEXT_CANCEL_COMPOSITION);
+        [view endComposition];
+        edits = view->editEvents;
+        cancels = view->cancelEvents;
+        [view doCommandBySelector:@selector(cancelOperation:)];
+        assert(view->editEvents == edits);
+        rawCount = 0;
+        [view keyDown:escape];
+        assert(rawCount == 1 && rawKeys[0] == VIVA_KEY_ESCAPE);
+        assert(view->editEvents == edits);
+        assert(view->cancelEvents == cancels);
+        view->recordEdits = NO;
 
         // A terminal view: every key that is not text goes to the application
         // raw, text and composition go to the text system, the cursor is steady
@@ -597,13 +1029,67 @@ int main(void) {
         assert([view performKeyEquivalent:keyEvent(@"v", NSEventModifierFlagCommand)]);
         assert(view->editEvents == pastes + 1 && view->lastKind == VIVA_TEXT_PASTE);
         assert([view->lastText isEqualToString:@"ls\nrm\r\n"]);
+        // An input source can resolve Command+V to v while exposing a
+        // different text character when Command is ignored.
+        NSEvent *imePaste = [NSEvent keyEventWithType:NSEventTypeKeyDown location:NSZeroPoint
+            modifierFlags:NSEventModifierFlagCommand timestamp:0 windowNumber:0 context:nil
+            characters:@"v" charactersIgnoringModifiers:@"女" isARepeat:NO keyCode:9];
+        pastes = view->editEvents;
+        assert([view performKeyEquivalent:imePaste]);
+        assert(view->editEvents == pastes + 1 && view->lastKind == VIVA_TEXT_PASTE);
+        assert([view->lastText isEqualToString:@"ls\nrm\r\n"]);
+        // The application shortcut/raw-key path uses the same identity.
+        rawCount = 0;
+        [view keyDown:imePaste];
+        assert(rawCount == 1 && strcmp(rawText[0], "v") == 0 && rawModifiers[0] == VIVA_MODIFIER_META);
+        // Identity is independent of the input source's text. Shift remains
+        // meaningful, while Control/Option must not turn a Command shortcut
+        // into a control code or an Option-generated symbol.
+        for (NSArray<NSString *> *pair in @[@[@"c", @"金"], @[@"a", @"日"],
+                @[@"f", @"火"], @[@"v", @"м"], @[@"V", @"女"]]) {
+            NSEvent *shortcut = [NSEvent keyEventWithType:NSEventTypeKeyDown location:NSZeroPoint
+                modifierFlags:NSEventModifierFlagCommand timestamp:0 windowNumber:0 context:nil
+                characters:pair[0] charactersIgnoringModifiers:pair[1] isARepeat:NO keyCode:0];
+            assert([viva_key_characters(shortcut) isEqualToString:pair[0]]);
+        }
+        // Control and Option must not change what the Command chord means,
+        // whatever the layout maps the physical key to: compare against the
+        // same key with Command alone.
+        NSEvent *commandV = viva_test_keyboard_event(9, kCGEventFlagMaskCommand);
+        assert([viva_key_characters(viva_test_keyboard_event(9,
+            kCGEventFlagMaskCommand | kCGEventFlagMaskAlternate)) isEqualToString:viva_key_characters(commandV)]);
+        assert([viva_key_characters(viva_test_keyboard_event(9,
+            kCGEventFlagMaskCommand | kCGEventFlagMaskControl)) isEqualToString:viva_key_characters(commandV)]);
+        // Named keys keep their NSEvent character. Re-applying the modifiers
+        // would turn them into control codes (Up became U+001E, Forward
+        // Delete U+007F) and the application would lose the key.
+        NSEvent *commandOptionUp =
+            viva_test_keyboard_event(126, kCGEventFlagMaskCommand | kCGEventFlagMaskAlternate);
+        assert([viva_key_characters(commandOptionUp) isEqualToString:commandOptionUp.charactersIgnoringModifiers]);
+        rawCount = 0;
+        [view keyDown:commandOptionUp];
+        assert(rawCount == 1 && rawKeys[0] == VIVA_KEY_UP && rawModifiers[0] == (VIVA_MODIFIER_META | VIVA_MODIFIER_ALT));
+        NSEvent *commandControlDelete =
+            viva_test_keyboard_event(117, kCGEventFlagMaskCommand | kCGEventFlagMaskControl);
+        rawCount = 0;
+        [view keyDown:commandControlDelete];
+        assert(rawCount == 1 && rawKeys[0] == VIVA_KEY_DELETE);
+        NSEvent *commandOptionBackspace =
+            viva_test_keyboard_event(51, kCGEventFlagMaskCommand | kCGEventFlagMaskAlternate);
+        assert([viva_key_characters(commandOptionBackspace) isEqualToString:commandOptionBackspace.charactersIgnoringModifiers]);
+        assert([viva_key_characters(controlC) isEqualToString:@"c"]);
+        NSEvent *optionV = [NSEvent keyEventWithType:NSEventTypeKeyDown location:NSZeroPoint
+            modifierFlags:NSEventModifierFlagOption timestamp:0 windowNumber:0 context:nil
+            characters:@"√" charactersIgnoringModifiers:@"v" isARepeat:NO keyCode:9];
+        assert([viva_key_characters(optionV) isEqualToString:@"v"]);
         assert(![view performKeyEquivalent:keyEvent(@"a", NSEventModifierFlagCommand)]);
         assert(![view performKeyEquivalent:keyEvent(@"x", NSEventModifierFlagCommand)]);
-        // A terminal is never told of a paste with no text.
+        // A terminal receives the non-text paste so it can handle images.
         [terminalBoard clearContents];
         pastes = view->editEvents;
         [view paste:nil];
-        assert(view->editEvents == pastes);
+        assert(view->editEvents == pastes + 1 && view->lastKind == VIVA_TEXT_PASTE_NO_TEXT);
+        assert([view->lastText length] == 0);
         // Moving the editor does not cancel a composition and checks its size.
         [view beginComposition];
         assert([view moveTextInputToFrame:NSMakeRect(100, 50, 8, 16)] == 0);

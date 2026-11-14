@@ -3,14 +3,15 @@
 package linux
 
 import (
+	"fmt"
 	"math"
 	"os"
 	"sync/atomic"
 	"time"
 
+	"github.com/vivaui/viva/gfx"
 	"github.com/vivaui/viva/internal/input"
 	"github.com/vivaui/viva/internal/platform"
-	"github.com/vivaui/viva/ui"
 )
 
 // gtkWindow is one top-level window of the GTK shell. GTK owns the window, the pointer and the
@@ -45,7 +46,7 @@ type gtkWindow struct {
 	allocated0    bool
 	cairoSurface  uintptr
 
-	frame      atomic.Pointer[ui.Rect]
+	frame      atomic.Pointer[gfx.Rect]
 	maximized  bool
 	fullscreen atomic.Bool
 	minimized  bool
@@ -64,7 +65,7 @@ type gtkWindow struct {
 	// imageCursor is the GDK cursor made for cursorImage, the application picture in use, and
 	// imagePixels the bytes the surface it was made from read.
 	imageCursor uintptr
-	cursorImage *ui.CursorImage
+	cursorImage *gfx.CursorImage
 	imagePixels []byte
 
 	redrawRequested atomic.Bool
@@ -283,6 +284,28 @@ func (w *gtkWindow) SetFullscreen(fullscreen bool) error {
 
 func (w *gtkWindow) Fullscreen() bool { return w.fullscreen.Load() }
 
+func (w *gtkWindow) SetAlwaysOnTop(enabled bool) error {
+	if w == nil || w.app == nil {
+		return fmt.Errorf("linux: window is closed")
+	}
+	if w.config.WindowMode == platform.WindowPanel || w.config.WindowMode == platform.WindowPreview {
+		return platform.ErrAlwaysOnTopUnsupported
+	}
+	if w.app.wayland {
+		return platform.ErrAlwaysOnTopUnsupported
+	}
+	w.app.enqueue(func() {
+		if !w.closed {
+			value := int32(0)
+			if enabled {
+				value = 1
+			}
+			w.g.windowKeepAbove(w.toplevel, value)
+		}
+	})
+	return nil
+}
+
 func (w *gtkWindow) Show() {
 	w.app.enqueue(func() {
 		if !w.closed {
@@ -301,11 +324,11 @@ func (w *gtkWindow) Show() {
 	})
 }
 
-func (w *gtkWindow) Frame() (ui.Rect, bool) {
+func (w *gtkWindow) Frame() (gfx.Rect, bool) {
 	if frame := w.frame.Load(); frame != nil {
 		return *frame, true
 	}
-	return ui.Rect{}, false
+	return gfx.Rect{}, false
 }
 
 // wake is the Waker: one OnRedraw on the loop's thread, however many wakes came before it ran.
@@ -340,6 +363,11 @@ func (w *gtkWindow) destroy() {
 		return
 	}
 	w.destroying = true
+	// Input modules may disconnect signals from the widget that owns this window.
+	if ime := w.ime; ime != nil {
+		w.ime = nil
+		ime.close()
+	}
 	w.g.widgetDestroy(w.toplevel)
 }
 
@@ -533,6 +561,12 @@ func (w *gtkWindow) present(frame platform.Frame, err error) {
 	if dirty {
 		w.apply(merged)
 	}
+	if w.config.FramePresented != nil {
+		// The frame is shown, or had nothing to show: a present-paced frame
+		// clock asks for the next one only now, so the event loop stays idle
+		// between frames and keeps reading input.
+		w.config.FramePresented()
+	}
 }
 
 // apply puts a frame the text layer has merged into the scene, and on to the screen.
@@ -633,7 +667,7 @@ func (w *gtkWindow) reportFrame() {
 	}
 	var x, y int32
 	w.g.gdkWindowOrigin(window, &x, &y)
-	frame := ui.Rect{X: float32(x) / w.ratio, Y: float32(y) / w.ratio, Width: w.width, Height: w.height}
+	frame := gfx.Rect{X: float32(x) / w.ratio, Y: float32(y) / w.ratio, Width: w.width, Height: w.height}
 	if previous := w.frame.Load(); previous != nil && *previous == frame {
 		return
 	}

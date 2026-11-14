@@ -1,9 +1,9 @@
 //go:build darwin || windows || linux || viva_custom_backend
 
 // Package singleinstance keeps an application to one running copy per user.
-// It is separate from package app because it uses a local socket and the net
-// package: an application that does not import this package does not link
-// them.
+// It is separate from package app because it uses a local socket or named pipe
+// and the net package: an application that does not import this package does not
+// link them.
 package singleinstance
 
 import (
@@ -35,9 +35,12 @@ func (claim *Instance) Close() {
 // primary is false, and the caller should exit without opening a window.
 //
 // id names the application and must be the same for every copy, as its bundle
-// or reverse-DNS identifier. Copies run by different users do not meet. An error
-// means the claim could not be made either way; the caller may carry on as an
-// unclaimed copy.
+// or reverse-DNS identifier. Copies run by different users do not meet. The
+// claim lives at a per-user address the platform keeps across launches (a Unix
+// socket in a per-user directory on macOS and Linux, a named pipe on Windows),
+// so copies started from a desktop and from a terminal meet whatever temporary
+// directories their shells set. An error means the claim could not be made
+// either way; the caller may carry on as an unclaimed copy.
 func SingleInstance(id string, args []string, onLaunch func(args []string)) (claim *Instance, primary bool, err error) {
 	if onLaunch == nil {
 		return nil, false, errors.New("singleinstance: a launch handler is required")

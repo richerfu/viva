@@ -1,4 +1,4 @@
-//go:build darwin || windows || linux || viva_custom_backend
+//go:build (darwin || windows || linux || (js && wasm)) || viva_custom_backend
 
 package app
 
@@ -11,11 +11,11 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/vivaui/viva/gfx"
 	"github.com/vivaui/viva/internal/input"
 	"github.com/vivaui/viva/internal/platform"
 	"github.com/vivaui/viva/internal/scene"
 	"github.com/vivaui/viva/text"
-	"github.com/vivaui/viva/ui"
 )
 
 // ErrNoTextInput is returned by Driver.Type and the editing shortcuts when no
@@ -40,21 +40,21 @@ var ErrNoTerminal = errors.New("app: no focused terminal")
 // next time the driver is called (or by Pump).
 type Driver struct {
 	config  Config
-	canvas  *ui.Canvas
+	canvas  *gfx.Canvas
 	painter *painter
 
 	// origin is where Config.Origin put the content area; MoveWindow changes it
 	// as a window manager would.
-	origin             ui.Point
+	origin             gfx.Point
 	minimized          bool
 	maximized          bool
 	fullscreen         bool
-	fullscreenRestore  ui.Rect
-	fullscreenMonitor  ui.Rect
+	fullscreenRestore  gfx.Rect
+	fullscreenMonitor  gfx.Rect
 	fullscreenChanging bool
 	fullscreenTarget   bool
 	frameMu            sync.Mutex
-	frame              ui.Rect
+	frame              gfx.Rect
 
 	now       time.Duration
 	animating bool
@@ -63,10 +63,12 @@ type Driver struct {
 	wakeSent  chan struct{}
 
 	// modifierKeys is the modifier keys KeyDown holds, one bit per
-	// ui.KeyShiftLeft..ui.KeyMetaRight.
+	// gfx.KeyShiftLeft..ui.KeyMetaRight.
 	modifierKeys uint8
 
 	clipboard      string
+	notifications  []Notification
+	notificationMu sync.Mutex
 	openedURL      string
 	hasOpenedURL   bool
 	openedPath     string
@@ -93,23 +95,47 @@ type Driver struct {
 	saveFileCount            int
 	lastSaveFileRequest      SaveFileOptions
 	hasSaveFileRequest       bool
+	lastSaveFileCheckbox     SaveFileCheckbox
+	hasSaveFileCheckbox      bool
 }
 
 // NewDriver creates a driver for config, painting into canvas (a fresh canvas
-// when nil). The first frame has been painted when it returns.
-func NewDriver(config Config, canvas *ui.Canvas) (*Driver, error) {
+// when nil). Config.Invalidator is bound before the first paint, so a wake the
+// application makes while that paint runs is kept for the next Pump. The first
+// frame has been painted when it returns.
+func NewDriver(config Config, canvas *gfx.Canvas) (*Driver, error) {
 	normalized, err := config.normalize()
 	if err != nil {
 		return nil, err
 	}
 	if canvas == nil {
-		canvas = &ui.Canvas{}
+		canvas = &gfx.Canvas{}
 	}
 	driver := &Driver{config: normalized, canvas: canvas, wakeSent: make(chan struct{}, 1),
 		origin: normalized.originPoint()}
-	driver.frame = ui.Rect{X: driver.origin.X, Y: driver.origin.Y, Width: float32(normalized.Width), Height: float32(normalized.Height)}
+	driver.frame = gfx.Rect{X: driver.origin.X, Y: driver.origin.Y, Width: float32(normalized.Width), Height: float32(normalized.Height)}
 
 	liveDrivers.Acquire()
+	// The first paint runs the application's code: if it panics, give back what
+	// the driver holds before the panic goes on, so a failed test leaves no
+	// driver behind.
+	built := false
+	defer func() {
+		if !built {
+			driver.Close()
+		}
+	}()
+	// Bind before the first paint: the application's first paint can start an
+	// effect that finishes at once, and a wake with nothing bound is dropped.
+	// requestWake touches only state made above, so this is safe before the
+	// painter exists, and Close unbinds on every failure path below.
+	if invalidator := driver.config.Invalidator; invalidator != nil {
+		invalidator.waker.Bind(driver.requestWake)
+	}
+	// The first paint happens below: it must already see the driver's appearance,
+	// not ask the machine (which, off the main thread, may never answer).
+	enterDriverAppearance()
+	driver.appearanceOpen = true
 	// Motion preferences are the user's, not the test's: run animations.
 	canvas.SetReduceMotion(false)
 
@@ -118,9 +144,12 @@ func NewDriver(config Config, canvas *ui.Canvas) (*Driver, error) {
 		driver.Close()
 		return nil, err
 	}
-	driver.painter.setClipboardText = func(value string) { driver.clipboard, driver.system.clipboardImage = value, nil }
+	driver.painter.setClipboardText = func(value string) {
+		driver.clipboard, driver.system.clipboardImage, driver.system.clipboardFiles = value, nil, nil
+		driver.system.clipboardHTML = ""
+	}
 	driver.painter.setCursor = func(Cursor) error { return nil }
-	driver.painter.setCursorImage = func(*ui.CursorImage) error { return nil }
+	driver.painter.setCursorImage = func(*gfx.CursorImage) error { return nil }
 	driver.painter.scheduleFrame = func(delay time.Duration) {
 		due := driver.now + delay
 		if !driver.animating || due < driver.frameDue {
@@ -133,11 +162,7 @@ func NewDriver(config Config, canvas *ui.Canvas) (*Driver, error) {
 		driver.Close()
 		return nil, err
 	}
-	enterDriverAppearance()
-	driver.appearanceOpen = true
-	if invalidator := driver.config.Invalidator; invalidator != nil {
-		invalidator.waker.Bind(driver.requestWake)
-	}
+	built = true
 	return driver, nil
 }
 
@@ -208,6 +233,16 @@ func (driver *Driver) Transitioning() bool {
 // Now is the driver's virtual time, which starts at zero.
 func (driver *Driver) Now() time.Duration { return driver.now }
 
+// Paint processes work other goroutines posted and paints one frame now. A
+// test that changed what a view shows from outside it, without input, calls it
+// to see the result without moving the clock.
+func (driver *Driver) Paint() error {
+	if err := driver.Pump(); err != nil {
+		return err
+	}
+	return driver.redraw()
+}
+
 // Advance moves virtual time forward by duration, repainting at frame cadence
 // while an animation is in flight and applying background wakes. An idle
 // application repaints nothing, as in a window.
@@ -239,7 +274,7 @@ func (driver *Driver) Resize(width, height int) error {
 	if err := driver.Pump(); err != nil {
 		return err
 	}
-	driver.storeFrame(ui.Rect{X: driver.origin.X, Y: driver.origin.Y, Width: float32(width), Height: float32(height)})
+	driver.storeFrame(gfx.Rect{X: driver.origin.X, Y: driver.origin.Y, Width: float32(width), Height: float32(height)})
 	_, err := driver.painter.resize(platform.Size{Width: float32(width), Height: float32(height)})
 	if err == nil && driver.config.OnFrameChange != nil && !driver.fullscreen {
 		driver.config.OnFrameChange(driver.Frame())
@@ -247,12 +282,12 @@ func (driver *Driver) Resize(width, height int) error {
 	return err
 }
 
-func (driver *Driver) pointer(kind platform.PointerEventKind, x, y float32, button ui.PointerButton, clicks int) error {
+func (driver *Driver) pointer(kind platform.PointerEventKind, x, y float32, button gfx.PointerButton, clicks int) error {
 	if err := driver.Pump(); err != nil {
 		return err
 	}
 	origin := driver.origin
-	_, err := driver.painter.pointer(platform.PointerEvent{
+	_, err := driver.painter.pointerEvent(platform.PointerEvent{
 		Kind: kind, Button: button, Modifiers: driver.heldModifiers(), X: x, Y: y, ScreenX: origin.X + x, ScreenY: origin.Y + y, ClickCount: clicks,
 	})
 	return err
@@ -261,14 +296,14 @@ func (driver *Driver) pointer(kind platform.PointerEventKind, x, y float32, butt
 // Frame is the window's content area in screen coordinates: where Config.Origin
 // or the last MoveWindow put it (the screen's corner when neither), at the
 // window's current size. Frame alone is safe to call from another goroutine.
-func (driver *Driver) Frame() ui.Rect {
+func (driver *Driver) Frame() gfx.Rect {
 	driver.frameMu.Lock()
 	frame := driver.frame
 	driver.frameMu.Unlock()
 	return frame
 }
 
-func (driver *Driver) storeFrame(frame ui.Rect) {
+func (driver *Driver) storeFrame(frame gfx.Rect) {
 	driver.frameMu.Lock()
 	driver.frame = frame
 	driver.frameMu.Unlock()
@@ -283,8 +318,8 @@ func (driver *Driver) MoveWindow(x, y float32) error {
 	if driver.fullscreen {
 		return nil
 	}
-	driver.origin = ui.Point{X: x, Y: y}
-	driver.storeFrame(ui.Rect{X: x, Y: y, Width: driver.painter.size.Width, Height: driver.painter.size.Height})
+	driver.origin = gfx.Point{X: x, Y: y}
+	driver.storeFrame(gfx.Rect{X: x, Y: y, Width: driver.painter.size.Width, Height: driver.painter.size.Height})
 	if driver.config.OnFrameChange != nil {
 		driver.config.OnFrameChange(driver.Frame())
 	}
@@ -305,6 +340,19 @@ func (driver *Driver) SetMinimized(minimized bool) error {
 		driver.config.OnMinimize(minimized)
 	}
 	return nil
+}
+
+// ActivateWindow reports the window as activated, as the window manager would
+// when the user switches back to it, and calls OnActivate. A closed driver
+// reports nothing.
+func (driver *Driver) ActivateWindow() error {
+	if err := driver.Pump(); err != nil {
+		return err
+	}
+	if !driver.closed && driver.config.OnActivate != nil {
+		driver.config.OnActivate()
+	}
+	return driver.Pump()
 }
 
 // Minimized reports the state SetMinimized last reported.
@@ -332,8 +380,8 @@ func (driver *Driver) Maximized() bool { return driver.maximized }
 // HitTest returns the front-most enabled interaction target at a logical-pixel
 // point. It applies the same focus-scope and blocking-region rules as pointer
 // input without moving the pointer or repainting.
-func (driver *Driver) HitTest(x, y float32) (ui.ID, bool) {
-	return driver.painter.router.HitTest(x, y)
+func (driver *Driver) HitTest(x, y float32) (gfx.ID, bool) {
+	return driver.painter.focus.Router().HitTest(x, y)
 }
 
 // PressAt reports what a press at a point would do in a custom-titlebar window:
@@ -347,24 +395,31 @@ func (driver *Driver) PressAt(x, y float32) PressKind {
 
 // Move moves the pointer to a point in logical pixels.
 func (driver *Driver) Move(x, y float32) error {
-	return driver.pointer(platform.PointerMove, x, y, ui.PointerButtonNone, 0)
+	return driver.pointer(platform.PointerMove, x, y, gfx.PointerButtonNone, 0)
 }
 
 // Leave moves the pointer out of the window.
 func (driver *Driver) Leave() error {
-	return driver.pointer(platform.PointerExit, 0, 0, ui.PointerButtonNone, 0)
+	return driver.pointer(platform.PointerExit, 0, 0, gfx.PointerButtonNone, 0)
+}
+
+// Cancel ends the press the way the platform does when it takes the press for
+// itself, as a custom titlebar starting a window move: no release follows, and
+// the application's press ends here.
+func (driver *Driver) Cancel() error {
+	return driver.pointer(platform.PointerCancel, 0, 0, gfx.PointerButtonNone, 0)
 }
 
 // Press presses a pointer button at a point (moving there first) as a lone
 // click.
-func (driver *Driver) Press(x, y float32, button ui.PointerButton) error {
+func (driver *Driver) Press(x, y float32, button gfx.PointerButton) error {
 	return driver.PressCount(x, y, button, 1)
 }
 
 // PressCount presses a button as the clicks-th press of a click sequence (2
 // for the second press of a double click), the way the operating system
 // reports it.
-func (driver *Driver) PressCount(x, y float32, button ui.PointerButton, clicks int) error {
+func (driver *Driver) PressCount(x, y float32, button gfx.PointerButton, clicks int) error {
 	if err := driver.Move(x, y); err != nil {
 		return err
 	}
@@ -372,12 +427,12 @@ func (driver *Driver) PressCount(x, y float32, button ui.PointerButton, clicks i
 }
 
 // Release releases a pointer button at a point, as the lone click's release.
-func (driver *Driver) Release(x, y float32, button ui.PointerButton) error {
+func (driver *Driver) Release(x, y float32, button gfx.PointerButton) error {
 	return driver.ReleaseCount(x, y, button, 1)
 }
 
 // ReleaseCount releases a button with the count of the press it ends.
-func (driver *Driver) ReleaseCount(x, y float32, button ui.PointerButton, clicks int) error {
+func (driver *Driver) ReleaseCount(x, y float32, button gfx.PointerButton, clicks int) error {
 	return driver.pointer(platform.PointerUp, x, y, button, max(clicks, 1))
 }
 
@@ -387,8 +442,8 @@ func (driver *Driver) Click(x, y float32) error {
 }
 
 // ClickButton moves to a point and presses and releases the given button once:
-// ui.PointerButtonSecondary is the right button, whose press opens context menus.
-func (driver *Driver) ClickButton(x, y float32, button ui.PointerButton) error {
+// gfx.PointerButtonSecondary is the right button, whose press opens context menus.
+func (driver *Driver) ClickButton(x, y float32, button gfx.PointerButton) error {
 	if err := driver.PressCount(x, y, button, 1); err != nil {
 		return err
 	}
@@ -406,10 +461,10 @@ func (driver *Driver) DoubleClick(x, y float32) error {
 // its position in the sequence.
 func (driver *Driver) ClickCount(x, y float32, clicks int) error {
 	for press := 1; press <= max(clicks, 1); press++ {
-		if err := driver.PressCount(x, y, ui.PointerButtonPrimary, press); err != nil {
+		if err := driver.PressCount(x, y, gfx.PointerButtonPrimary, press); err != nil {
 			return err
 		}
-		if err := driver.ReleaseCount(x, y, ui.PointerButtonPrimary, press); err != nil {
+		if err := driver.ReleaseCount(x, y, gfx.PointerButtonPrimary, press); err != nil {
 			return err
 		}
 	}
@@ -419,7 +474,7 @@ func (driver *Driver) ClickCount(x, y float32, clicks int) error {
 // Scroll delivers a scroll gesture at a logical-pixel window point. Positive
 // deltas reveal content below and to the right. Target and Viewport are derived
 // from the current frame; the other fields are delivered as supplied.
-func (driver *Driver) Scroll(event ui.ScrollEvent) error {
+func (driver *Driver) Scroll(event gfx.ScrollEvent) error {
 	if err := driver.Pump(); err != nil {
 		return err
 	}
@@ -433,7 +488,7 @@ func (driver *Driver) Scroll(event ui.ScrollEvent) error {
 // Drop delivers a drag of files from the system: a hover (FileDropOver) at a
 // point, its end (FileDropLeave), or the drop with its paths. It reports whether
 // the hit under the point took the files.
-func (driver *Driver) Drop(event ui.FileDropEvent) (bool, error) {
+func (driver *Driver) Drop(event gfx.FileDropEvent) (bool, error) {
 	if err := driver.Pump(); err != nil {
 		return false, err
 	}
@@ -449,10 +504,10 @@ func (driver *Driver) editing() bool {
 }
 
 // heldModifiers is the modifiers KeyDown is holding.
-func (driver *Driver) heldModifiers() ui.Modifiers {
-	var modifiers ui.Modifiers
-	for key := ui.KeyShiftLeft; key <= ui.KeyMetaRight; key++ {
-		if driver.modifierKeys&(1<<(key-ui.KeyShiftLeft)) != 0 {
+func (driver *Driver) heldModifiers() gfx.Modifiers {
+	var modifiers gfx.Modifiers
+	for key := gfx.KeyShiftLeft; key <= gfx.KeyMetaRight; key++ {
+		if driver.modifierKeys&(1<<(key-gfx.KeyShiftLeft)) != 0 {
 			modifiers |= key.Modifier()
 		}
 	}
@@ -465,8 +520,8 @@ func (driver *Driver) heldModifiers() ui.Modifiers {
 func (driver *Driver) HoldsKeys() bool { return driver.painter.keysWanted() }
 
 // driverKeyCode is the Code a driven key has: stable between its press and release.
-func driverKeyCode(key ui.Key, character string) uint32 {
-	if key != ui.KeyUnknown {
+func driverKeyCode(key gfx.Key, character string) uint32 {
+	if key != gfx.KeyUnknown {
 		return 0x10000 + uint32(key)
 	}
 	for _, r := range strings.ToLower(character) {
@@ -477,50 +532,63 @@ func driverKeyCode(key ui.Key, character string) uint32 {
 
 // driverTyped is the text a driven printable key types: the character, in capitals
 // while Shift is held. Shift with a symbol key has no layout to consult here.
-func driverTyped(key ui.Key, character string, modifiers ui.Modifiers) string {
-	if key != ui.KeyUnknown || modifiers&(ui.ModifierControl|ui.ModifierMeta|ui.ModifierAlt) != 0 {
+func driverTyped(key gfx.Key, character string, modifiers gfx.Modifiers) string {
+	if key != gfx.KeyUnknown || modifiers&(gfx.ModifierControl|gfx.ModifierMeta|gfx.ModifierAlt) != 0 {
 		return ""
 	}
-	if modifiers&ui.ModifierShift != 0 {
+	if modifiers&gfx.ModifierShift != 0 {
 		return strings.ToUpper(character)
 	}
 	return character
 }
 
 // KeyDown presses a key and keeps it down until KeyUp, as a person holding it
-// would. Modifier keys (ui.KeyShiftLeft and the like) stay held for every pointer,
+// would. Modifier keys (gfx.KeyShiftLeft and the like) stay held for every pointer,
 // scroll and key the driver delivers meanwhile, so Shift-click and Ctrl-click
 // work. A focused terminal that asked for releases (HoldsKeys) gets the press as
 // a KeyEvent: a named key by Key, a printable key by Text, which character
 // names; any other focus gets the key as Key or Chord would deliver it, and
 // KeyUp then does nothing.
-func (driver *Driver) KeyDown(key ui.Key, character string) error {
+func (driver *Driver) KeyDown(key gfx.Key, character string) error {
 	if err := driver.Pump(); err != nil {
 		return err
 	}
 	if key.IsModifier() {
-		driver.modifierKeys |= 1 << (key - ui.KeyShiftLeft)
+		driver.modifierKeys |= 1 << (key - gfx.KeyShiftLeft)
 	}
 	modifiers := driver.heldModifiers()
 	if !driver.HoldsKeys() {
 		switch {
 		case key.IsModifier():
-			return nil
-		case key != ui.KeyUnknown:
+			if driver.painter.onModifierTap == nil {
+				return nil
+			}
+			// A window reports a lone modifier to the runtime when the application
+			// listens for taps (Config.OnModifierTap), and to nothing else.
+			_, err := driver.painter.key(platform.KeyEvent{
+				Key: input.Key(key), Modifiers: input.Modifiers(modifiers), Code: driverKeyCode(key, ""),
+			})
+			return err
+		case key != gfx.KeyUnknown:
 			return driver.Key(key, modifiers)
-		case modifiers&(ui.ModifierControl|ui.ModifierMeta|ui.ModifierAlt) != 0:
+		case modifiers&(gfx.ModifierControl|gfx.ModifierMeta|gfx.ModifierAlt) != 0:
 			return driver.Chord(modifiers, character)
+		}
+		if driver.config.OnShortcut != nil {
+			if err := driver.Chord(modifiers, character); err != ErrNoTerminal {
+				return err
+			}
 		}
 		return driver.Type(character)
 	}
 	text := strings.ToLower(character)
-	if key == ui.KeyUnknown && modifiers&(ui.ModifierControl|ui.ModifierMeta) != 0 {
+	if key == gfx.KeyUnknown && driver.config.OnShortcut != nil && !driver.painter.nativeText.State.Composing {
 		_, handled, err := driver.painter.shortcut(platform.KeyEvent{Modifiers: modifiers, Text: text})
 		if err != nil || handled {
 			return err
 		}
 	}
-	if key == ui.KeyUnknown && modifiers&ui.ModifierAlt != 0 && modifiers&(ui.ModifierControl|ui.ModifierMeta) == 0 &&
+	if key == gfx.KeyUnknown && modifiers&gfx.ModifierAlt != 0 && modifiers&(gfx.ModifierControl|gfx.ModifierMeta) == 0 &&
 		!driver.painter.nativeText.AltSendsEscape {
 		// Without Alt-as-Meta the text system owns the chord, as in a window.
 		return driver.textEvent(platform.TextEvent{Kind: platform.TextInsert, Text: character})
@@ -533,14 +601,14 @@ func (driver *Driver) KeyDown(key ui.Key, character string) error {
 }
 
 // KeyUp releases a key KeyDown pressed. A key that is not down is ignored.
-func (driver *Driver) KeyUp(key ui.Key, character string) error {
+func (driver *Driver) KeyUp(key gfx.Key, character string) error {
 	if err := driver.Pump(); err != nil {
 		return err
 	}
 	if key.IsModifier() {
-		driver.modifierKeys &^= 1 << (key - ui.KeyShiftLeft)
+		driver.modifierKeys &^= 1 << (key - gfx.KeyShiftLeft)
 	}
-	if !driver.HoldsKeys() {
+	if !driver.HoldsKeys() && !(key.IsModifier() && driver.painter.onModifierTap != nil) {
 		return nil
 	}
 	_, err := driver.painter.key(platform.KeyEvent{
@@ -567,16 +635,21 @@ func (driver *Driver) terminal() bool {
 }
 
 // Key delivers a key press with its modifiers. While a text field is being
-// edited the key goes where a native window would send it: Tab and Escape (and
-// Enter in a single-line field) to the application, everything else to the
-// text system as an editing command. A terminal gets every named key raw, as
-// ui.KeyEvents.
-func (driver *Driver) Key(key ui.Key, modifiers ui.Modifiers) error {
+// edited the key goes where a native window would send it: Tab, Escape,
+// function keys (and Enter in a single-line field) to the application, other
+// keys to the text system. A terminal gets every named key raw, as gfx.KeyEvents.
+func (driver *Driver) Key(key gfx.Key, modifiers gfx.Modifiers) error {
 	if err := driver.Pump(); err != nil {
 		return err
 	}
 	modifiers |= driver.heldModifiers()
-	if key == ui.KeyEnter && modifiers&(ui.ModifierControl|ui.ModifierMeta) != 0 {
+	if key == gfx.KeySpace && driver.config.OnShortcut != nil && !driver.painter.nativeText.State.Composing {
+		_, handled, err := driver.painter.shortcut(platform.KeyEvent{Modifiers: modifiers, Text: " "})
+		if err != nil || handled {
+			return err
+		}
+	}
+	if key == gfx.KeyEnter && modifiers&(gfx.ModifierControl|gfx.ModifierMeta) != 0 {
 		// As on a window: Control+Enter is offered to the application before the
 		// text system, which would make a line break of it.
 		event := platform.KeyEvent{Key: input.KeyEnter, Modifiers: input.Modifiers(modifiers)}
@@ -589,8 +662,18 @@ func (driver *Driver) Key(key ui.Key, modifiers ui.Modifiers) error {
 	if driver.terminal() {
 		return driver.terminalKey(key, modifiers, "")
 	}
-	if driver.editing() && key != ui.KeyTab && key != ui.KeyEscape && (key != ui.KeyEnter || driver.painter.nativeText.Multiline) {
-		if driver.navigationKey(key) || driver.rowKey(key, modifiers) {
+	if driver.editing() && driver.painter.nativeText.State.Composing && key == gfx.KeyEnter &&
+		modifiers&(gfx.ModifierControl|gfx.ModifierMeta) == 0 {
+		// While an input method composes, Return belongs to it: a native window
+		// hands the key to the input context, which commits the candidate instead
+		// of inserting a line break (see viva_text_input_should_interpret_key,
+		// where composing keeps every key but Tab and Escape). A headless window
+		// has no input context to ask, so it commits what the composition holds,
+		// which leaves the same text and no newline.
+		return driver.textEvent(platform.TextEvent{Kind: platform.TextUnmark})
+	}
+	if driver.editing() && key != gfx.KeyTab && key != gfx.KeyEscape && (key != gfx.KeyEnter || driver.painter.nativeText.Multiline) {
+		if driver.navigationKey(key) || driver.rowKey(key, modifiers) || key >= gfx.KeyF1 && key <= gfx.KeyF12 {
 			_, err := driver.painter.key(platform.KeyEvent{Key: key, Modifiers: modifiers})
 			return err
 		}
@@ -603,13 +686,13 @@ func (driver *Driver) Key(key ui.Key, modifiers ui.Modifiers) error {
 // navigationKey reports whether a key moves between choices outside the focused
 // field (such as a dropdown, autocomplete list or command palette) when the field
 // requested NavigationKeys.
-func (driver *Driver) navigationKey(key ui.Key) bool {
+func (driver *Driver) navigationKey(key gfx.Key) bool {
 	text := &driver.painter.nativeText
 	if !text.NavigationKeys || text.State.Composing {
 		return false
 	}
 	switch key {
-	case ui.KeyUp, ui.KeyDown, ui.KeyPageUp, ui.KeyPageDown:
+	case gfx.KeyUp, gfx.KeyDown, gfx.KeyPageUp, gfx.KeyPageDown:
 		return true
 	}
 	return false
@@ -619,16 +702,16 @@ func (driver *Driver) navigationKey(key ui.Key) bool {
 // which lays them out itself: the platform's text system knows one line, so
 // these reach the application as key events unless an input method is composing
 // (platform.TextInput.Placed).
-func (driver *Driver) rowKey(key ui.Key, modifiers ui.Modifiers) bool {
+func (driver *Driver) rowKey(key gfx.Key, modifiers gfx.Modifiers) bool {
 	text := &driver.painter.nativeText
 	if !text.Placed || text.State.Composing {
 		return false
 	}
 	switch key {
-	case ui.KeyUp, ui.KeyDown, ui.KeyHome, ui.KeyEnd, ui.KeyPageUp, ui.KeyPageDown:
+	case gfx.KeyUp, gfx.KeyDown, gfx.KeyHome, gfx.KeyEnd, gfx.KeyPageUp, gfx.KeyPageDown:
 		return true
-	case ui.KeyLeft, ui.KeyRight:
-		return modifiers&ui.ModifierMeta != 0
+	case gfx.KeyLeft, gfx.KeyRight:
+		return modifiers&gfx.ModifierMeta != 0
 	}
 	return false
 }
@@ -636,10 +719,10 @@ func (driver *Driver) rowKey(key ui.Key, modifiers ui.Modifiers) bool {
 // terminalKey delivers a key to a focused terminal the way a native window
 // does: a plain space is text unless the terminal requested Alt-as-Meta;
 // everything else is a raw key event.
-func (driver *Driver) terminalKey(key ui.Key, modifiers ui.Modifiers, text string) error {
-	altRaw := modifiers&ui.ModifierAlt != 0 && driver.painter.nativeText.AltSendsEscape &&
+func (driver *Driver) terminalKey(key gfx.Key, modifiers gfx.Modifiers, text string) error {
+	altRaw := modifiers&gfx.ModifierAlt != 0 && driver.painter.nativeText.AltSendsEscape &&
 		!driver.painter.nativeText.State.Composing
-	if key == ui.KeySpace && modifiers&(ui.ModifierControl|ui.ModifierMeta) == 0 && !altRaw {
+	if key == gfx.KeySpace && modifiers&(gfx.ModifierControl|gfx.ModifierMeta) == 0 && !altRaw {
 		return driver.textEvent(platform.TextEvent{Kind: platform.TextInsert, Text: " "})
 	}
 	_, err := driver.painter.key(platform.KeyEvent{Key: key, Modifiers: modifiers, Text: text})
@@ -651,11 +734,11 @@ func (driver *Driver) terminalKey(key ui.Key, modifiers ui.Modifiers, text strin
 // Text "c"). Alt is raw only when the focused terminal requested
 // AltSendsEscape and no input-method composition is active. It fails unless a
 // terminal has the keyboard. Characters typed with only Shift are text.
-func (driver *Driver) Chord(modifiers ui.Modifiers, character string) error {
+func (driver *Driver) Chord(modifiers gfx.Modifiers, character string) error {
 	if err := driver.Pump(); err != nil {
 		return err
 	}
-	if modifiers&(ui.ModifierControl|ui.ModifierMeta) != 0 {
+	if driver.config.OnShortcut != nil && !driver.painter.nativeText.State.Composing {
 		_, handled, err := driver.painter.shortcut(platform.KeyEvent{Modifiers: modifiers, Text: strings.ToLower(character)})
 		if err != nil || handled {
 			return err
@@ -664,18 +747,18 @@ func (driver *Driver) Chord(modifiers ui.Modifiers, character string) error {
 	if !driver.terminal() {
 		return ErrNoTerminal
 	}
-	raw := modifiers&(ui.ModifierControl|ui.ModifierMeta) != 0
-	if modifiers&ui.ModifierAlt != 0 && driver.painter.nativeText.AltSendsEscape &&
+	raw := modifiers&(gfx.ModifierControl|gfx.ModifierMeta) != 0
+	if modifiers&gfx.ModifierAlt != 0 && driver.painter.nativeText.AltSendsEscape &&
 		!driver.painter.nativeText.State.Composing {
 		raw = true
 	}
 	if !raw {
 		return driver.textEvent(platform.TextEvent{Kind: platform.TextInsert, Text: character})
 	}
-	return driver.terminalKey(ui.KeyUnknown, modifiers, strings.ToLower(character))
+	return driver.terminalKey(gfx.KeyUnknown, modifiers, strings.ToLower(character))
 }
 
-func (driver *Driver) textKey(key ui.Key, modifiers ui.Modifiers) error {
+func (driver *Driver) textKey(key gfx.Key, modifiers gfx.Modifiers) error {
 	editKey := platform.KeyEvent{Key: input.Key(key), Modifiers: input.Modifiers(modifiers)}
 	if action := platform.TextClipboardAction(editKey); action != 0 {
 		return driver.clipboardEdit(action)
@@ -686,32 +769,32 @@ func (driver *Driver) textKey(key ui.Key, modifiers ui.Modifiers) error {
 	if command, ok := platform.AppleTextEditingCommand(editKey); ok {
 		return driver.textEvent(platform.TextEvent{Kind: platform.TextCommandEvent, Command: command})
 	}
-	extend := modifiers&ui.ModifierShift != 0
+	extend := modifiers&gfx.ModifierShift != 0
 	var event platform.TextEvent
 	switch key {
-	case ui.KeyBackspace:
+	case gfx.KeyBackspace:
 		event = platform.TextEvent{Kind: platform.TextCommandEvent, Command: platform.TextDeleteBackward}
-	case ui.KeyDelete:
+	case gfx.KeyDelete:
 		event = platform.TextEvent{Kind: platform.TextCommandEvent, Command: platform.TextDeleteForward}
-	case ui.KeyLeft:
+	case gfx.KeyLeft:
 		command := platform.TextMoveLeft
 		if extend {
 			command = platform.TextMoveLeftAndModifySelection
 		}
 		event = platform.TextEvent{Kind: platform.TextCommandEvent, Command: command}
-	case ui.KeyRight:
+	case gfx.KeyRight:
 		command := platform.TextMoveRight
 		if extend {
 			command = platform.TextMoveRightAndModifySelection
 		}
 		event = platform.TextEvent{Kind: platform.TextCommandEvent, Command: command}
-	case ui.KeyEnter:
+	case gfx.KeyEnter:
 		command := platform.TextInsertNewline
 		if extend {
 			command = platform.TextInsertLineBreak
 		}
 		event = platform.TextEvent{Kind: platform.TextCommandEvent, Command: command}
-	case ui.KeySpace:
+	case gfx.KeySpace:
 		event = platform.TextEvent{Kind: platform.TextInsert, Text: " "}
 	default:
 		return nil // the text system has no command for this key
@@ -776,14 +859,14 @@ func (driver *Driver) SelectText(start, end int) error {
 // Shortcut delivers a Command-key shortcut. It is retained as the compact
 // editing helper; use ShortcutChord when the complete modifier set matters.
 func (driver *Driver) Shortcut(character rune) (bool, error) {
-	return driver.ShortcutChord(ui.ModifierMeta, character)
+	return driver.ShortcutChord(gfx.ModifierMeta, character)
 }
 
 // ShortcutChord handles ordinary text editing before offering other chords to
 // the application and applying the terminal fallback. The complete
 // modifier set is preserved, which lets headless tests exercise application
 // shortcuts such as Command+Alt+X without bypassing the native text path.
-func (driver *Driver) ShortcutChord(modifiers ui.Modifiers, character rune) (bool, error) {
+func (driver *Driver) ShortcutChord(modifiers gfx.Modifiers, character rune) (bool, error) {
 	if err := driver.Pump(); err != nil {
 		return false, err
 	}
@@ -810,11 +893,11 @@ func (driver *Driver) ShortcutChord(modifiers ui.Modifiers, character rune) (boo
 		// A terminal owns every modified chord except an unadorned primary
 		// paste, which the text system delivers with the driver's private
 		// clipboard.
-		if character != 'v' || modifiers&(ui.ModifierAlt|ui.ModifierShift) != 0 {
-			return true, driver.terminalKey(ui.KeyUnknown, modifiers, shortcut)
+		if character != 'v' || modifiers&(gfx.ModifierAlt|gfx.ModifierShift) != 0 {
+			return true, driver.terminalKey(gfx.KeyUnknown, modifiers, shortcut)
 		}
 		if driver.clipboard == "" {
-			return true, nil
+			return true, driver.textEvent(platform.TextEvent{Kind: platform.TextPasteNoText})
 		}
 		return true, driver.textEvent(platform.TextEvent{Kind: platform.TextPaste, Text: driver.clipboard})
 	}
@@ -822,7 +905,7 @@ func (driver *Driver) ShortcutChord(modifiers ui.Modifiers, character rune) (boo
 }
 
 func (driver *Driver) clipboardEdit(action byte) error {
-	event, changed, err := platform.TextClipboardEvent(driver.painter.nativeText.State, driver.painter.nativeText.Secure, action,
+	event, changed, err := platform.TextClipboardEvent(driver.painter.nativeText.ClipboardState(action), driver.painter.nativeText.Secure, action,
 		func() (string, error) { return driver.clipboard, nil },
 		func(value string) error { driver.SetClipboard(value); return nil })
 	if err != nil || !changed {
@@ -866,12 +949,13 @@ func (driver *Driver) NativeAppearance() Appearance {
 }
 
 // Clipboard is the driver's private clipboard, including text an application
-// returns through ui.EventResult.ClipboardText.
+// returns through gfx.EventResult.ClipboardText.
 func (driver *Driver) Clipboard() string { return driver.clipboard }
 
 // SetClipboard replaces the driver's private clipboard.
 func (driver *Driver) SetClipboard(value string) {
-	driver.clipboard, driver.system.clipboardImage = value, nil
+	driver.clipboard, driver.system.clipboardImage, driver.system.clipboardFiles = value, nil, nil
+	driver.system.clipboardHTML = ""
 }
 
 // LastOpenedURL returns the most recent target passed to OpenURL while this
@@ -912,9 +996,9 @@ const (
 // within a layer; higher layers paint over lower ones.
 type Primitive struct {
 	Kind   PrimitiveKind
-	Bounds ui.Rect
-	Points [3]ui.Point
-	Color  ui.Color
+	Bounds gfx.Rect
+	Points [3]gfx.Point
+	Color  gfx.Color
 	Radius float32
 	Layer  uint16
 	// EdgeMask selects the boundary edges feathered for TrianglePrimitive.
@@ -923,38 +1007,49 @@ type Primitive struct {
 	// Points[1] and Points[2], Color being that of Points[0]; the color varies
 	// linearly between them.
 	Shaded bool
-	Shade  [2]ui.Color
+	Shade  [2]gfx.Color
 	// Shadow places and blurs a ShadowPrimitive.
-	Shadow ui.ShadowStyle
+	Shadow gfx.ShadowStyle
 	// Clipped reports that the primitive is drawn only inside Clip, a region of
 	// the window in logical pixels that cuts it; Bounds and Points are whole.
 	Clipped bool
-	Clip    ui.Rect
+	Clip    gfx.Rect
 }
 
 // Label is one line of text to draw.
 type Label struct {
 	Value  string
-	Bounds ui.Rect
+	Bounds gfx.Rect
+	// Identity is platform.TextLabel's stable text identity, when one was
+	// supplied.
+	Identity gfx.TextIdentity
 	// OriginX and OriginY are platform.TextLabel's: the text's sub-pixel position
 	// within Bounds.
 	OriginX, OriginY float32
 	FontSize         float32
 	Weight           float32
-	Color            ui.Color
+	Italic           bool
+	Color            gfx.Color
 	Layer            uint16
+	// ShapesBefore is how many shape instances the frame painted before this
+	// label. Shapes and labels are sent in separate lists; a renderer merges
+	// them back into paint order at this index.
+	ShapesBefore uint32
 	// FontGeneration is platform.TextLabel's: the interface font the text was laid out
 	// in, 0 for text that does not follow it.
 	FontGeneration uint32
 	// Mono, MonoFace, CellWidth and Runs describe a fixed-pitch grid line (see
-	// ui.Canvas.LabelRuns); Runs is empty for an ordinary label.
+	// gfx.Canvas.LabelRuns); Runs is empty for an ordinary label.
 	Mono      bool
-	MonoFace  ui.MonoFace
+	MonoFace  gfx.MonoFace
 	CellWidth float32
-	Runs      []ui.TextRun
+	// Baseline is platform.TextLabel's: the row of a fixed-pitch line's glyphs, counted
+	// from the top of Bounds.
+	Baseline float32
+	Runs     []gfx.TextRun
 	// Clip is the region the label may paint into when Clipped (see
 	// platform.TextLabel.Clip).
-	Clip          ui.Rect
+	Clip          gfx.Rect
 	Clipped       bool
 	Bitmap        []byte
 	BitmapWidth   int
@@ -963,17 +1058,25 @@ type Label struct {
 	BitmapID      uint64
 	BitmapVersion uint32
 	BitmapUpload  bool
+	// Quad, while HasQuad, is where the label's picture lands: four corners in
+	// logical pixels with the colour multiplied into each, as gfx.Canvas.LabelQuad
+	// draws it. Bounds stays the box the picture was rasterised in.
+	Quad    [4]gfx.Point
+	Tint    [4]gfx.Color
+	HasQuad bool
 }
 
 // Editor is the native text editor's overlay, drawn above everything else
 // while a text field has keyboard focus. Selection and Composition are rune
 // ranges into Value.
 type Editor struct {
-	Bounds      ui.Rect
+	Bounds      gfx.Rect
 	FontSize    float32
+	Weight      float32
+	Alignment   gfx.Alignment
 	Layer       uint16
-	MonoFace    ui.MonoFace
-	Color       ui.Color
+	MonoFace    gfx.MonoFace
+	Color       gfx.Color
 	Value       string
 	Selection   [2]int
 	Composition [2]int
@@ -999,23 +1102,45 @@ type Snapshot struct {
 	Editor *Editor
 	// Texts is every text the application painted this frame, before clipping,
 	// for queries; Labels holds what is actually drawn.
-	Texts []ui.Text
+	Texts []gfx.Text
+	// TextWidths is the painted width of each Texts entry, measured with the same
+	// canvas font engine as the renderer. Headless layout checks prefer it over
+	// the approximate textmetrics table; a missing or zero entry falls back.
+	TextWidths []float32
 	// Runs are the text runs Texts refer to; see TextRuns.
-	Runs []ui.TextRun
-	Hits []ui.Hit
+	Runs []gfx.TextRun
+	Hits []gfx.Hit
+	// HitTexts is dense: one entry per Hits entry, zero for a hit that
+	// declared no text geometry. Use HitTextAt.
+	HitTexts []gfx.HitText
 	// Tree is the identity tree the hits are named in, for printing them.
-	Tree *ui.Tree
+	Tree *gfx.Tree
 	// Focused and Hovered are hit identities (0 for none).
-	Focused ui.ID
-	Hovered ui.ID
+	Focused gfx.ID
+	Hovered gfx.ID
 	Cursor  Cursor
 	// CursorImage is the picture shown as the pointer while Cursor is CursorImage.
-	CursorImage *ui.CursorImage
+	CursorImage *gfx.CursorImage
 	Now         time.Duration
 }
 
+// HitTextAt returns the text geometry of the hit at index in Hits, and false
+// when that hit declared none.
+func (snapshot Snapshot) HitTextAt(index int) (gfx.HitText, bool) {
+	if index < 0 || index >= len(snapshot.Hits) {
+		return gfx.HitText{}, false
+	}
+	if index < len(snapshot.HitTexts) {
+		text := snapshot.HitTexts[index]
+		if text.Bounds != (gfx.Rect{}) || text.Size != 0 || text.Weight != 0 || text.Color != (gfx.Color{}) || text.Placement != nil {
+			return text, true
+		}
+	}
+	return gfx.HitText{}, false
+}
+
 // TextRuns returns the runs of one of the snapshot's Texts.
-func (snapshot Snapshot) TextRuns(text ui.Text) []ui.TextRun {
+func (snapshot Snapshot) TextRuns(text gfx.Text) []gfx.TextRun {
 	if text.RunCount == 0 || int(text.RunFirst+text.RunCount) > len(snapshot.Runs) {
 		return nil
 	}
@@ -1026,28 +1151,45 @@ func (snapshot Snapshot) TextRuns(text ui.Text) []ui.TextRun {
 // driver calls.
 func (driver *Driver) Snapshot() Snapshot {
 	painter := driver.painter
+	hits := painter.canvas.Hits()
+	hitTexts := make([]gfx.HitText, len(hits))
+	for index := range hits {
+		hitTexts[index], _ = painter.canvas.HitText(&hits[index])
+	}
 	snapshot := Snapshot{
 		Title: driver.config.Title, Width: int(painter.size.Width), Height: int(painter.size.Height),
-		Clear:   driver.config.ClearColor,
-		Texts:   append([]ui.Text(nil), painter.canvas.Texts()...),
-		Runs:    append([]ui.TextRun(nil), painter.canvas.AllTextRuns()...),
-		Hits:    append([]ui.Hit(nil), painter.canvas.Hits()...),
-		Tree:    painter.canvas.Tree(),
-		Focused: painter.focused, Hovered: painter.hovered, Cursor: painter.cursor, CursorImage: painter.cursorImage, Now: driver.now,
+		Clear:    driver.config.ClearColor,
+		Texts:    append([]gfx.Text(nil), painter.canvas.Texts()...),
+		Runs:     append([]gfx.TextRun(nil), painter.canvas.AllTextRuns()...),
+		Hits:     append([]gfx.Hit(nil), hits...),
+		HitTexts: hitTexts,
+		Tree:     painter.canvas.Tree(),
+		Focused:  painter.focus.Focused(), Hovered: painter.pointer.Hovered(), Cursor: painter.cursor, CursorImage: painter.cursorImage, Now: driver.now,
+	}
+	// Keep the widths aligned with Texts: the platform font engine can differ
+	// from the approximate metrics table by a fraction of a pixel per CJK run.
+	// Terminal grids, shaped runs, monospaced and empty texts are laid out by
+	// cells or runs, not by line width, so they are left unmeasured (zero).
+	snapshot.TextWidths = make([]float32, len(snapshot.Texts))
+	for index, text := range snapshot.Texts {
+		if text.Value == "" || text.CellWidth > 0 || text.RunCount > 0 || text.Style.Mono {
+			continue
+		}
+		snapshot.TextWidths[index] = painter.canvas.TextWidthStyle(text.Value, text.Style)
 	}
 	for _, rectangle := range painter.renderer.Rectangles() {
 		primitive := Primitive{
-			Bounds: ui.Rect{X: rectangle.Bounds.X, Y: rectangle.Bounds.Y, Width: rectangle.Bounds.Width, Height: rectangle.Bounds.Height},
-			Color:  ui.Color{Red: rectangle.Color.Red, Green: rectangle.Color.Green, Blue: rectangle.Color.Blue, Alpha: rectangle.Color.Alpha},
+			Bounds: gfx.Rect{X: rectangle.Bounds.X, Y: rectangle.Bounds.Y, Width: rectangle.Bounds.Width, Height: rectangle.Bounds.Height},
+			Color:  gfx.Color{Red: rectangle.Color.Red, Green: rectangle.Color.Green, Blue: rectangle.Color.Blue, Alpha: rectangle.Color.Alpha},
 			Radius: rectangle.Radius, Layer: rectangle.Layer,
 		}
 		if rectangle.Clipped {
 			primitive.Clipped = true
-			primitive.Clip = ui.Rect{X: rectangle.Clip.X, Y: rectangle.Clip.Y, Width: rectangle.Clip.Width, Height: rectangle.Clip.Height}
+			primitive.Clip = gfx.Rect{X: rectangle.Clip.X, Y: rectangle.Clip.Y, Width: rectangle.Clip.Width, Height: rectangle.Clip.Height}
 		}
 		if rectangle.Kind == scene.KindShadow {
 			primitive.Kind = ShadowPrimitive
-			primitive.Shadow = ui.ShadowStyle(rectangle.Shadow)
+			primitive.Shadow = gfx.ShadowStyle(rectangle.Shadow)
 		}
 		if rectangle.Kind == scene.KindTriangle {
 			primitive.Kind = TrianglePrimitive
@@ -1055,28 +1197,36 @@ func (driver *Driver) Snapshot() Snapshot {
 			if rectangle.Shade.On {
 				primitive.Shaded = true
 				for index, color := range rectangle.Shade.Colors {
-					primitive.Shade[index] = ui.Color(color)
+					primitive.Shade[index] = gfx.Color(color)
 				}
 			}
 			for index, point := range rectangle.Points {
-				primitive.Points[index] = ui.Point{X: point.X, Y: point.Y}
+				primitive.Points[index] = gfx.Point{X: point.X, Y: point.Y}
 			}
 		}
 		snapshot.Primitives = append(snapshot.Primitives, primitive)
 	}
 	for _, label := range painter.labels {
 		captured := Label{
-			Value:   label.Value,
-			Bounds:  ui.Rect{X: label.X, Y: label.Y, Width: label.Width, Height: label.Height},
-			OriginX: label.OriginX, OriginY: label.OriginY,
-			FontSize: label.FontSize, Weight: label.Weight,
-			Color: ui.Color{Red: float32(label.Color.Red), Green: float32(label.Color.Green), Blue: float32(label.Color.Blue), Alpha: float32(label.Color.Alpha)},
-			Layer: label.Layer, FontGeneration: label.FontGeneration,
-			Mono: label.Mono, MonoFace: label.MonoFace, CellWidth: label.CellWidth, Runs: append([]ui.TextRun(nil), label.Runs...),
+			Value:    label.Value,
+			Bounds:   gfx.Rect{X: label.X, Y: label.Y, Width: label.Width, Height: label.Height},
+			Identity: label.Identity,
+			OriginX:  label.OriginX, OriginY: label.OriginY,
+			FontSize: label.FontSize, Weight: label.Weight, Italic: label.Italic,
+			Color: gfx.Color{Red: float32(label.Color.Red), Green: float32(label.Color.Green), Blue: float32(label.Color.Blue), Alpha: float32(label.Color.Alpha)},
+			Layer: label.Layer, ShapesBefore: label.ShapesBefore, FontGeneration: label.FontGeneration,
+			Mono: label.Mono, MonoFace: label.MonoFace, CellWidth: label.CellWidth, Baseline: label.Baseline, Runs: append([]gfx.TextRun(nil), label.Runs...),
 			Clip: label.Clip, Clipped: label.Clipped,
 			BitmapWidth: label.BitmapWidth, BitmapHeight: label.BitmapHeight, BitmapStride: label.BitmapStride,
 			BitmapID: label.BitmapID, BitmapVersion: label.BitmapVersion,
 			BitmapUpload: label.BitmapUpload,
+			Quad:         label.Quad, HasQuad: label.HasQuad,
+		}
+		for corner, tint := range label.Tint {
+			captured.Tint[corner] = gfx.Color{
+				Red: float32(tint.Red), Green: float32(tint.Green),
+				Blue: float32(tint.Blue), Alpha: float32(tint.Alpha),
+			}
 		}
 		captured.Bitmap = append([]byte(nil), label.Bitmap...)
 		snapshot.Labels = append(snapshot.Labels, captured)
@@ -1084,14 +1234,14 @@ func (driver *Driver) Snapshot() Snapshot {
 	if driver.editing() {
 		input := painter.nativeText
 		snapshot.Editor = &Editor{
-			Bounds:   ui.Rect{X: input.X, Y: input.Y, Width: input.Width, Height: input.Height},
-			FontSize: input.FontSize,
+			Bounds:   gfx.Rect{X: input.X, Y: input.Y, Width: input.Width, Height: input.Height},
+			FontSize: input.FontSize, Weight: input.Weight, Alignment: input.Alignment,
 			// Layer keeps a field inside a popup, dialog or sheet above that
 			// surface's own paint in an offscreen render, as it already is in a
 			// window.
 			Layer:    input.Layer,
 			MonoFace: input.MonoFace,
-			Color:    ui.Color{Red: float32(input.Color.Red), Green: float32(input.Color.Green), Blue: float32(input.Color.Blue), Alpha: float32(input.Color.Alpha)},
+			Color:    gfx.Color{Red: float32(input.Color.Red), Green: float32(input.Color.Green), Blue: float32(input.Color.Blue), Alpha: float32(input.Color.Alpha)},
 			Value:    input.State.Value, Selection: [2]int{input.State.Selection.Start, input.State.Selection.End},
 			Composition: [2]int{input.State.Composition.Start, input.State.Composition.End},
 			Composing:   input.State.Composing, Multiline: input.Multiline, Secure: input.Secure,

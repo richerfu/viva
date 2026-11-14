@@ -3,11 +3,12 @@
 package darwin
 
 import (
+	"math"
 	"testing"
 
+	"github.com/vivaui/viva/gfx"
 	"github.com/vivaui/viva/internal/input"
 	"github.com/vivaui/viva/text"
-	"github.com/vivaui/viva/ui"
 )
 
 func TestMeasureTextSupportsSystemFallback(t *testing.T) {
@@ -191,8 +192,65 @@ func TestTextEventRedrawRecognizesAlreadyAppliedNativeState(t *testing.T) {
 	if state.textInputAlreadyUpdated(&moved) {
 		t.Fatal("changed editor geometry was skipped")
 	}
+	aligned := *input
+	aligned.Alignment = gfx.AlignRight
+	if state.textInputAlreadyUpdated(&aligned) {
+		t.Fatal("changed editor alignment was skipped")
+	}
+	copied := *input
+	copied.CopyOverride, copied.CopyText = true, func() string { return "column rows" }
+	if state.textInputAlreadyUpdated(&copied) {
+		t.Fatal("changed clipboard selection was skipped")
+	}
 	if state.textInputAlreadyUpdated(nil) {
 		t.Fatal("disable update was skipped")
+	}
+}
+
+func TestTextInputReplacementDecidesWhetherCompositionSurvives(t *testing.T) {
+	composing := TextState{Value: "ni", Composing: true, Composition: text.Range{End: 2}}
+	input := &TextInput{
+		Target: gfx.Item(7), X: 10, Y: 20, Width: 180, Height: 32, FontSize: 14,
+		Multiline: true, Placed: true, State: composing,
+	}
+	state := &runState{}
+	state.setTextInput(input)
+
+	// The same editor with the same acknowledged text, moved or resized by a
+	// layout change, keeps the composition: a repaint may ask for a frame and
+	// mark the state as needing a redraw.
+	grown := *input
+	grown.Y, grown.Height = 10, 48
+	grown.State.Redraw = true
+	if !state.textInputKeepsComposition(&grown) {
+		t.Fatal("a layout update of the composing editor was treated as a replacement")
+	}
+	// A different field replacing this one ends the composition even when the
+	// text, geometry and presentation are identical.
+	switched := grown
+	switched.Target = gfx.Item(8)
+	if state.textInputKeepsComposition(&switched) {
+		t.Fatal("switching fields kept the previous composition")
+	}
+	// So does changing the kind of editor, or rewriting text the application
+	// has not acknowledged.
+	rewritten := *input
+	rewritten.State = TextState{Value: "nih", Composing: true, Composition: text.Range{End: 3}}
+	terminal, secure, multiline, placed := *input, *input, *input, *input
+	terminal.Terminal, secure.Secure, multiline.Multiline, placed.Placed = true, true, false, false
+	for name, changed := range map[string]TextInput{
+		"terminal": terminal, "secure": secure, "multiline": multiline, "placed": placed, "text": rewritten,
+	} {
+		if state.textInputKeepsComposition(&changed) {
+			t.Errorf("a %s update kept the composition", name)
+		}
+	}
+	if state.textInputKeepsComposition(nil) {
+		t.Fatal("disabling the editor kept the composition")
+	}
+	state.setTextInput(nil)
+	if state.textInputKeepsComposition(&grown) {
+		t.Fatal("a composition survived the editor being disabled")
 	}
 }
 
@@ -224,19 +282,27 @@ func TestNativeCaretTimerPolicy(t *testing.T) {
 
 func TestNativeTextInputKeyRouting(t *testing.T) {
 	for _, key := range []input.Key{input.KeyBackspace, input.KeyDelete, input.KeyLeft, input.KeyRight} {
-		if !nativeTextInputShouldInterpretKey(true, false, int(key)) {
+		if !nativeTextInputShouldInterpretKey(true, false, false, int(key)) {
 			t.Fatalf("editing key %v did not route to AppKit", key)
 		}
 	}
 	for _, key := range []input.Key{input.KeyTab, input.KeyEnter, input.KeyEscape} {
-		if nativeTextInputShouldInterpretKey(true, false, int(key)) {
+		if nativeTextInputShouldInterpretKey(true, false, false, int(key)) {
 			t.Fatalf("single-line focus key %v was consumed by AppKit", key)
 		}
 	}
-	if !nativeTextInputShouldInterpretKey(true, true, int(input.KeyEnter)) {
+	if nativeTextInputShouldInterpretKey(true, false, true, int(input.KeyTab)) {
+		t.Fatal("composing Tab changed its existing application routing")
+	}
+	for _, key := range []input.Key{input.KeyEnter, input.KeyEscape} {
+		if !nativeTextInputShouldInterpretKey(true, false, true, int(key)) {
+			t.Fatalf("composing key %v did not route to AppKit", key)
+		}
+	}
+	if !nativeTextInputShouldInterpretKey(true, true, false, int(input.KeyEnter)) {
 		t.Fatal("multiline Enter did not route to AppKit")
 	}
-	if nativeTextInputShouldInterpretKey(false, false, int(input.KeyBackspace)) {
+	if nativeTextInputShouldInterpretKey(false, false, false, int(input.KeyBackspace)) {
 		t.Fatal("disabled editor consumed Backspace")
 	}
 }
@@ -325,6 +391,52 @@ func TestNativeTextInputCarriesAltSendsEscape(t *testing.T) {
 	native := makeNativeTextInput(TextInput{AltSendsEscape: true}, nil)
 	if native.alt_sends_escape == 0 {
 		t.Fatal("AltSendsEscape was not passed to AppKit")
+	}
+}
+
+// A focused field has no editing command for the function keys, so they must
+// reach the application as Windows and Linux deliver them; an input method that
+// converts on F6-F10 keeps them for as long as it composes.
+func TestNativeFocusedTextInputDeliversFunctionKeysToTheApplication(t *testing.T) {
+	interpret := func(enabled, composing bool, key int) bool {
+		return nativeTextInputShouldInterpretKey(enabled, false, composing, key)
+	}
+	for key := input.KeyF1; key <= input.KeyF12; key++ {
+		if interpret(true, false, int(key)) {
+			t.Errorf("F%d went to the text system instead of the application", int(key)-int(input.KeyF1)+1)
+		}
+		if !interpret(true, true, int(key)) {
+			t.Errorf("F%d was taken from an input method that is composing", int(key)-int(input.KeyF1)+1)
+		}
+	}
+	if interpret(false, false, int(input.KeyF1)) {
+		t.Error("a function key was sent to the text system by a field that is not focused")
+	}
+	if !interpret(true, false, int(input.KeyLeft)) {
+		t.Error("an arrow key stopped going to the text system")
+	}
+}
+
+func TestNativeTextInputCarriesFontWeight(t *testing.T) {
+	native := makeNativeTextInput(TextInput{Weight: gfx.WeightSemibold}, nil)
+	if float32(native.font_weight) != gfx.WeightSemibold {
+		t.Fatalf("native font weight = %v, want %v", native.font_weight, gfx.WeightSemibold)
+	}
+}
+
+func TestNativeTextInputCarriesAlignment(t *testing.T) {
+	for _, alignment := range []gfx.Alignment{gfx.AlignLeft, gfx.AlignCenter, gfx.AlignRight} {
+		native := makeNativeTextInput(TextInput{Alignment: alignment}, nil)
+		if got := gfx.Alignment(native.alignment); got != alignment {
+			t.Errorf("native alignment = %v, want %v", got, alignment)
+		}
+	}
+}
+
+func TestNativeTextInputCarriesCopyOverride(t *testing.T) {
+	native := makeNativeTextInput(TextInput{CopyOverride: true}, nil)
+	if native.copy_override == 0 {
+		t.Fatal("native copy override was disabled")
 	}
 }
 
@@ -427,11 +539,11 @@ func TestMeasureTextIsWiderAtAHeavierWeight(t *testing.T) {
 }
 
 func TestARegisteredFamilyIsMeasuredAndAnUnknownOneFallsBackToTheSystemFace(t *testing.T) {
-	system, systemHeight, err := MeasureMono(13, ui.MonoSystem)
+	system, systemHeight, err := MeasureMono(13, gfx.MonoSystem)
 	if err != nil || system <= 0 {
 		t.Fatalf("system mono: %v %v", system, err)
 	}
-	courier := ui.MonoFamily("Courier New")
+	courier := gfx.MonoFamily("Courier New")
 	width, height, err := MeasureMono(13, courier)
 	if err != nil || width <= 0 || height <= 0 {
 		t.Fatalf("Courier New: %v %v %v", width, height, err)
@@ -439,7 +551,7 @@ func TestARegisteredFamilyIsMeasuredAndAnUnknownOneFallsBackToTheSystemFace(t *t
 	if width == system && height == systemHeight {
 		t.Fatalf("Courier New measures like the system face (%v x %v): the family was not used", width, height)
 	}
-	missing := ui.MonoFamily("No Such Family Installed")
+	missing := gfx.MonoFamily("No Such Family Installed")
 	fallbackWidth, fallbackHeight, err := MeasureMono(13, missing)
 	if err != nil || fallbackWidth != system || fallbackHeight != systemHeight {
 		t.Fatalf("a missing family measured %v x %v (%v), want the system face %v x %v", fallbackWidth, fallbackHeight, err, system, systemHeight)
@@ -447,19 +559,70 @@ func TestARegisteredFamilyIsMeasuredAndAnUnknownOneFallsBackToTheSystemFace(t *t
 }
 
 func TestFallbackFamiliesNeverChangeTheCell(t *testing.T) {
-	base := ui.MonoFamily("Menlo")
+	base := gfx.MonoFamily("Menlo")
 	plainWidth, plainHeight, err := MeasureMono(13, base)
 	if err != nil || plainWidth <= 0 {
 		t.Fatalf("Menlo: %v %v", plainWidth, err)
 	}
 	for _, fallbacks := range [][]string{{"Songti SC"}, {"No Such Family Installed", "Songti SC"}, {"Courier New", "Songti SC", "STHeiti"}} {
-		width, height, err := MeasureMono(13, ui.MonoStack(base, fallbacks...))
+		width, height, err := MeasureMono(13, gfx.MonoStack(base, fallbacks...))
 		if err != nil || width != plainWidth || height != plainHeight {
 			t.Errorf("Menlo with %q measures %v x %v (%v), want Menlo's own %v x %v", fallbacks, width, height, err, plainWidth, plainHeight)
 		}
 	}
-	system, systemHeight, _ := MeasureMono(13, ui.MonoSystem)
-	if width, height, err := MeasureMono(13, ui.MonoStack(ui.MonoSystem, "Songti SC")); err != nil || width != system || height != systemHeight {
+	system, systemHeight, _ := MeasureMono(13, gfx.MonoSystem)
+	if width, height, err := MeasureMono(13, gfx.MonoStack(gfx.MonoSystem, "Songti SC")); err != nil || width != system || height != systemHeight {
 		t.Errorf("the system face with a fallback measures %v x %v (%v), want %v x %v", width, height, err, system, systemHeight)
+	}
+}
+
+// A canvas on the platform engine lays a terminal out on the cell of the font that draws
+// it, as the platform measures that font, not on the reference 0.6 by 1.18.
+func TestACanvasOnTheEngineSizesTheTerminalCellByTheFont(t *testing.T) {
+	var canvas gfx.Canvas
+	canvas.SetPixelScale(2)
+	canvas.SetTextEngine(SharedTextEngine())
+	for _, face := range []gfx.MonoFace{gfx.MonoSystem, gfx.MonoFamily("Courier New")} {
+		advance, line, err := MeasureMono(13, face)
+		if err != nil {
+			t.Fatal(err)
+		}
+		width, height := canvas.MonoCellSize(13, face)
+		if diff := width - advance; diff < -0.25 || diff > 0.25 { // whole device pixels at scale 2
+			t.Errorf("face %v: cell width %v, font advance %v", face, width, advance)
+		}
+		if want := float32(math.Round(float64(line))); height != want {
+			t.Errorf("face %v: cell height %v, font line %v rounded to %v", face, height, line, want)
+		}
+		if baseline := canvas.MonoBaseline(13, face, height); baseline <= 0 || baseline >= height {
+			t.Errorf("face %v: baseline %v of a cell %v tall, want a row inside it", face, baseline, height)
+		}
+	}
+}
+
+// The engine reports the thicknesses the face draws its own box drawing lines with, in
+// logical pixels at the size asked: those are the strokes a cell glyph is drawn with, so box
+// drawing geometry weighs what the font's own glyphs weigh. CoreText measures the ink of the
+// light and heavy stems; a face that lacks one answers 0 for it.
+func TestTheEngineReportsTheFontsBoxDrawingStrokes(t *testing.T) {
+	engine := SharedTextEngine()
+	for _, face := range []gfx.MonoFace{gfx.MonoSystem, gfx.MonoFamily("Courier New")} {
+		cell := engine.MonoCell(13, face)
+		if cell.Advance <= 0 {
+			t.Fatalf("face %v: no cell", face)
+		}
+		if cell.Rule <= 0 || cell.Rule >= cell.Advance {
+			t.Errorf("face %v: light line %v of a cell %v wide, want a positive stroke narrower than the cell", face, cell.Rule, cell.Advance)
+		}
+		if cell.HeavyRule > 0 && cell.HeavyRule < cell.Rule {
+			t.Errorf("face %v: heavy line %v is thinner than the light one %v", face, cell.HeavyRule, cell.Rule)
+		}
+		at26 := engine.MonoCell(26, face)
+		if at26.Rule <= cell.Rule {
+			t.Errorf("face %v: light line %v at 26, %v at 13, want it to follow the size", face, at26.Rule, cell.Rule)
+		}
+		if cell.HeavyRule > 0 && at26.HeavyRule <= cell.HeavyRule {
+			t.Errorf("face %v: heavy line %v at 26, %v at 13, want it to follow the size", face, at26.HeavyRule, cell.HeavyRule)
+		}
 	}
 }

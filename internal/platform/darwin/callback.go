@@ -9,17 +9,36 @@ package darwin
 import "C"
 
 import (
+	"errors"
 	"fmt"
 	"runtime/cgo"
+	"time"
+	"unicode/utf8"
 	"unsafe"
 
+	"github.com/vivaui/viva/gfx"
+	"github.com/vivaui/viva/internal/diag"
 	"github.com/vivaui/viva/internal/input"
 	"github.com/vivaui/viva/internal/platform"
 	"github.com/vivaui/viva/internal/render"
 	"github.com/vivaui/viva/internal/scene"
 	"github.com/vivaui/viva/text"
-	"github.com/vivaui/viva/ui"
 )
+
+// resourceError reports that the native renderer could not make a GPU
+// resource: an instance buffer, a label or text-input texture, the device's
+// pipelines. Metal gives a window no other sign that its device was reset,
+// hung, unplugged or ran out of memory, so this is the loss: the window makes
+// its resources again and the frame is sent once more. A frame the renderer
+// rejects for its content is not one.
+type resourceError struct{ message string }
+
+func (err *resourceError) Error() string { return err.message }
+
+func isResourceError(err error) bool {
+	var resource *resourceError
+	return errors.As(err, &resource)
+}
 
 // vivaShapedLine is how the native drawing reaches the text engine's cache: the
 // shaped line for the text, retained for the caller, which releases it with
@@ -27,11 +46,23 @@ import (
 //
 //export vivaShapedLine
 func vivaShapedLine(utf8 *C.uchar, length C.size_t, size, weight C.double) *C.viva_text_line {
+	return vivaShapedLineStyle(utf8, length, size, weight, 0)
+}
+
+//export vivaShapedLineStyle
+func vivaShapedLineStyle(utf8 *C.uchar, length C.size_t, size, weight C.double, italic C.int) *C.viva_text_line {
 	value := ""
 	if length > 0 {
 		value = unsafe.String((*byte)(unsafe.Pointer(utf8)), int(length))
 	}
-	return sharedTextEngine().retainedLine(value, float32(size), float32(weight))
+	return sharedTextEngine().retainedLineStyle(value, float32(size), float32(weight), italic != 0)
+}
+
+//export vivaOpenFile
+func vivaOpenFile(path *C.char) {
+	if path != nil {
+		deliverOpenFile(C.GoString(path))
+	}
 }
 
 //export vivaPointerEvent
@@ -61,7 +92,7 @@ func vivaPointerEvent(
 
 	frame, err := state.pointerHandler(PointerEvent{
 		Kind:       PointerEventKind(kind),
-		Button:     ui.PointerButton(button),
+		Button:     gfx.PointerButton(button),
 		Modifiers:  input.Modifiers(modifiers),
 		X:          float32(x),
 		Y:          float32(y),
@@ -91,6 +122,11 @@ func vivaViewResized(handle C.uintptr_t, view unsafe.Pointer, width C.double, he
 
 	frame, err := state.resizeHandler(Size{Width: float32(width), Height: float32(height)})
 	if err == nil {
+		// The layer presents the frame in the same Core Animation transaction as
+		// the new bounds (see -[VivaMetalView beginLiveResizeRelaxation]), so the
+		// window never scales the previous frame. Waiting for the frame to be
+		// scheduled before returning keeps the next AppKit resize step behind
+		// the frame it belongs to.
 		err = presentFrame(state, view, frame, true)
 	}
 	if err == nil && state.web != nil {
@@ -115,7 +151,7 @@ func vivaFrameChanged(handle C.uintptr_t, view unsafe.Pointer, x, y, width, heig
 			C.viva_view_close(view)
 		}
 	}()
-	state.frameHandler(ui.Rect{X: float32(x), Y: float32(y), Width: float32(width), Height: float32(height)})
+	state.frameHandler(gfx.Rect{X: float32(x), Y: float32(y), Width: float32(width), Height: float32(height)})
 }
 
 //export vivaWindowReopenRequested
@@ -150,6 +186,22 @@ func vivaWindowMinimized(handle C.uintptr_t, view unsafe.Pointer, minimized C.in
 		}
 	}()
 	state.minimizeHandler(minimized != 0)
+}
+
+//export vivaWindowOccluded
+func vivaWindowOccluded(handle C.uintptr_t, view unsafe.Pointer, visible C.int) {
+	state := cgo.Handle(handle).Value().(*runState)
+	if state.visibilityHandler == nil {
+		return
+	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			platform.ReportFault("darwin: AppKit callback", recovered)
+			state.err = fmt.Errorf("darwin: visibility handler panicked: %v", recovered)
+			C.viva_view_close(view)
+		}
+	}()
+	state.visibilityHandler(visible != 0)
 }
 
 //export vivaRedrawRequested
@@ -245,6 +297,16 @@ func vivaTerminalCells(character C.uint32_t) C.int {
 	return C.int(platform.TerminalPreeditCells(rune(character)))
 }
 
+// vivaWindowActivated reports that the window became the key window.
+//
+//export vivaWindowActivated
+func vivaWindowActivated(handle C.uintptr_t) {
+	state, ok := runStateFor(handle)
+	if ok && !state.closed && state.onActivate != nil {
+		state.onActivate()
+	}
+}
+
 // vivaFocusLost reports that the window stopped being the keyboard window.
 //
 //export vivaFocusLost
@@ -276,7 +338,7 @@ func vivaAccessibilityAction(handle C.uintptr_t, view unsafe.Pointer, node C.uin
 	if !ok || state.closed || state.accessibility == nil {
 		return 0
 	}
-	request := platform.AccessibilityRequest{Node: ui.IDFromBits(uint64(node)), Number: float64(number)}
+	request := platform.AccessibilityRequest{Node: gfx.IDFromBits(uint64(node)), Number: float64(number)}
 	switch action {
 	case C.VIVA_AX_PRESS:
 		request.Action = platform.AccessibilityPress
@@ -302,7 +364,6 @@ func vivaAccessibilityAction(handle C.uintptr_t, view unsafe.Pointer, node C.uin
 		return 0
 	}
 	handled, err := state.accessibility(request, func(frame Frame) error {
-		state.captureFrameLayers(frame, nil)
 		return presentFrame(state, view, frame, false)
 	})
 	if err != nil {
@@ -517,6 +578,70 @@ func planTextEvent(terminal bool, previous, next TextState) textEventPlan {
 }
 
 func presentFrame(state *runState, view unsafe.Pointer, frame Frame, syncRender bool) error {
+	err := presentFrameOnce(state, view, frame, syncRender)
+	if err == nil {
+		if state != nil && state.framePresented != nil {
+			// The frame is on the screen (or had nothing to show), so the
+			// present-paced frame clock may ask for the next one.
+			state.framePresented()
+		}
+		return nil
+	}
+	if !isResourceError(err) || state == nil {
+		return err
+	}
+	err = state.recoverRenderer(view, frame, syncRender, err)
+	if err == nil && state.framePresented != nil {
+		state.framePresented()
+	}
+	return err
+}
+
+// recoverRenderer answers a frame the renderer could not make resources for: it
+// makes the window's Metal resources again and sends the frame once more as a
+// rebuild, because the new instance buffers are empty.
+func (state *runState) recoverRenderer(view unsafe.Pointer, frame Frame, syncRender bool, cause error) error {
+	if err := state.recoverResources(view, cause); err != nil {
+		return err
+	}
+	state.rebuildNextFrame = true
+	return presentFrameOnce(state, view, frame, syncRender)
+}
+
+// recoverResources makes the window's Metal device, pipelines and textures
+// again after the renderer failed to make one. Losses that keep arriving close
+// together end the window instead of spinning; Darwin has no software
+// rasterizer, so the plan that would move there is answered with the GPU again.
+func (state *runState) recoverResources(view unsafe.Pointer, cause error) error {
+	if plan := state.devices.Next(time.Now()); plan == platform.RecoverGiveUp {
+		if diag.Enabled(diag.Error) {
+			diag.Report(diag.Error, "render", "device-lost", "the graphics device was lost again and again",
+				diag.String("error", cause.Error()))
+		}
+		return fmt.Errorf("darwin: the graphics device was lost again and again: %w", cause)
+	}
+	if status := C.viva_view_recover(view); status != 0 {
+		if diag.Enabled(diag.Error) {
+			diag.Report(diag.Error, "render", "device-recovery-failed", "the graphics device could not be made again",
+				diag.String("error", cause.Error()))
+		}
+		return fmt.Errorf("darwin: the graphics device was lost and could not be made again: %w", cause)
+	}
+	if diag.Enabled(diag.Warn) {
+		diag.Report(diag.Warn, "render", "device-recovered", "the graphics device was lost and made again",
+			diag.Bool("software", false))
+	}
+	return nil
+}
+
+func presentFrameOnce(state *runState, view unsafe.Pointer, frame Frame, syncRender bool) error {
+	if state != nil && state.rebuildNextFrame {
+		// The window made its Metal resources again since the last frame, so
+		// the instance buffers hold nothing: a partial update would be
+		// rejected, and only the whole scene can be drawn.
+		state.rebuildNextFrame = false
+		frame.Update = render.Update{Count: len(frame.Rectangles), Rebuild: true}
+	}
 	if err := presentTextInput(state, view, frame.TextInput); err != nil {
 		return err
 	}
@@ -571,6 +696,9 @@ func presentTextInput(state *runState, view unsafe.Pointer, update TextInputUpda
 		// A terminal's cursor moved: follow it without cancelling a composition.
 		moved := *update.Input
 		if status := C.viva_view_move_text_input(view, C.float(moved.X), C.float(moved.Y), C.float(moved.Width), C.float(moved.Height)); status != 0 {
+			if status == 3 {
+				return &resourceError{"darwin: failed to rebuild the text input texture"}
+			}
 			return fmt.Errorf("darwin: native text input move failed with status %d", status)
 		}
 		state.setTextInput(update.Input)
@@ -586,20 +714,62 @@ func presentTextInput(state *runState, view unsafe.Pointer, update TextInputUpda
 		}
 		native = makeNativeTextInput(*update.Input, memory)
 	}
+	// A field that grows, scrolls or moves keeps the input method's
+	// composition: the text event already installed the acknowledged state,
+	// so only the place the editor and its caret occupy changed.
+	keepComposition := state.textInputKeepsComposition(update.Input)
 	previousHandler := state.textHandler
 	previousState := state.textState
 	previousInput := state.textInput
 	previousActive := state.textInputActive
 	state.setTextInput(update.Input)
-	status := C.viva_view_update_text_input(view, native)
+	var status C.int
+	if keepComposition {
+		status = C.viva_view_update_text_input_keeping_composition(view, native)
+	} else {
+		status = C.viva_view_update_text_input(view, native)
+	}
 	if status != 0 {
 		state.textHandler = previousHandler
 		state.textState = previousState
 		state.textInput = previousInput
 		state.textInputActive = previousActive
+		if status == 3 {
+			return &resourceError{"darwin: failed to rebuild the text input texture"}
+		}
 		return fmt.Errorf("darwin: native text input update failed with status %d", status)
 	}
 	return nil
+}
+
+//export vivaCopyText
+func vivaCopyText(handle C.uintptr_t, _ unsafe.Pointer, length *C.size_t) (result *C.uchar) {
+	if length == nil {
+		return nil
+	}
+	*length = 0
+	state, ok := runStateFor(handle)
+	if !ok || state.closed || !state.textInputActive || !state.textInput.CopyOverride || state.textInput.Secure || state.textInput.CopyText == nil {
+		return nil
+	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			platform.ReportFault("darwin: clipboard callback", recovered)
+			result = nil
+			*length = 0
+		}
+	}()
+	value := state.textInput.CopyText()
+	if value == "" || !utf8.ValidString(value) {
+		return nil
+	}
+	memory := C.malloc(C.size_t(len(value)))
+	if memory == nil {
+		return nil
+	}
+	copy(unsafe.Slice((*byte)(memory), len(value)), value)
+	*length = C.size_t(len(value))
+	return (*C.uchar)(memory)
 }
 
 func presentAccessibility(view unsafe.Pointer, nodes []AccessibilityNode) error {
@@ -680,6 +850,16 @@ func vivaTextInput(
 	next = next.WithoutRedraw() // a one-shot request, not editor state
 	if err == nil && plan.update {
 		err = updateText(view, next, state.redrawHandler == nil)
+		if isResourceError(err) {
+			// The editor's texture could not be made: make the window's
+			// resources again and type into the editor once more.
+			if recoverErr := state.recoverResources(view, err); recoverErr != nil {
+				err = recoverErr
+			} else {
+				state.rebuildNextFrame = true
+				err = updateText(view, next, state.redrawHandler == nil)
+			}
+		}
 	}
 	if err != nil {
 		state.err = err
@@ -740,6 +920,10 @@ func updateText(view unsafe.Pointer, state TextState, render bool) error {
 		C.int(boolInt(state.Composing)),
 		C.int(boolInt(render)),
 	)
+	if status == 3 {
+		// The editor's texture could not be made.
+		return &resourceError{"darwin: failed to rebuild the text input texture"}
+	}
 	if status != 0 {
 		return fmt.Errorf("darwin: native text update failed with status %d", status)
 	}
@@ -849,7 +1033,7 @@ func updateLabels(view unsafe.Pointer, labels []TextLabel) error {
 	case 2:
 		return fmt.Errorf("darwin: failed to rebuild a text label")
 	case 3:
-		return fmt.Errorf("darwin: failed to rebuild text label textures")
+		return &resourceError{"darwin: failed to rebuild text label textures"}
 	default:
 		return fmt.Errorf("darwin: label update failed with status %d", status)
 	}
@@ -922,13 +1106,20 @@ func makeNativeClip(rectangle render.Rectangle) C.viva_clip {
 }
 
 func rectangleUpdateStatus(status C.int) error {
+	return rectangleUpdateError(int(status))
+}
+
+// rectangleUpdateError maps the renderer's answer to a failed rectangle update.
+// Only a resource the device refused to make recovers; a range the scene got
+// wrong would fail the same way the second time.
+func rectangleUpdateError(status int) error {
 	switch status {
 	case 0:
 		return nil
 	case 2:
 		return fmt.Errorf("darwin: native renderer rejected rectangle update range")
 	case 3:
-		return fmt.Errorf("darwin: failed to rebuild rectangle instance buffer")
+		return &resourceError{"darwin: failed to rebuild rectangle instance buffer"}
 	default:
 		return fmt.Errorf("darwin: rectangle update failed with status %d", status)
 	}

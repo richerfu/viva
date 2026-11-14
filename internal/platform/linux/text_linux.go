@@ -9,9 +9,9 @@ import (
 	"unicode/utf8"
 
 	"github.com/ebitengine/purego"
+	"github.com/vivaui/viva/gfx"
 	"github.com/vivaui/viva/internal/platform"
 	"github.com/vivaui/viva/text"
-	"github.com/vivaui/viva/ui"
 )
 
 const pangoScale = 1024
@@ -27,6 +27,10 @@ type textServices struct {
 	// spans are the colors of the last LCD grid label rasterized, valid until the next call.
 	spans []colorSpan
 
+	owner    platform.GridOwner // which run owns which column of a grid label
+	ink      []platform.GridInk // how far each run's glyphs reach past its cells
+	inkCache map[inkKey]platform.GridInk
+
 	fontMapGetDefault        func() uintptr
 	fontMapCreateContext     func(uintptr) uintptr
 	layoutNew                func(uintptr) uintptr
@@ -36,9 +40,20 @@ type textServices struct {
 	layoutSetSingleParagraph func(uintptr, int32)
 	layoutGetExtents         func(uintptr, *pangoRectangle, *pangoRectangle)
 	layoutGetBaseline        func(uintptr) int32
-	layoutGetCursorPos       func(uintptr, int32, *pangoRectangle, *pangoRectangle)
-	layoutIndexToPos         func(uintptr, int32, *pangoRectangle)
-	fontFromString           func(*byte) uintptr
+	layoutSetAttributes      func(uintptr, uintptr)
+	// layoutGetUnknownGlyphs is pango_layout_get_unknown_glyphs_count; nil on a Pango old
+	// enough not to have it.
+	layoutGetUnknownGlyphs func(uintptr) int32
+	layoutGetCursorPos     func(uintptr, int32, *pangoRectangle, *pangoRectangle)
+	layoutIndexToPos       func(uintptr, int32, *pangoRectangle)
+	fontFromString         func(*byte) uintptr
+	// noFallback is the attribute list that turns Pango's font fallback off, for measuring
+	// a box drawing stroke in the face's own font; 0 when this Pango cannot make it.
+	noFallback      uintptr
+	attrListNew     func() uintptr
+	attrListUnref   func(uintptr)
+	attrListInsert  func(uintptr, uintptr)
+	attrFallbackNew func(int32) uintptr
 	// contextSetRoundGlyphs is pango_context_set_round_glyph_positions (Pango 1.44); nil
 	// before it.
 	contextSetRoundGlyphs func(uintptr, int32)
@@ -120,6 +135,15 @@ func loadTextAPI() (*textServices, error) {
 	purego.RegisterLibFunc(&services.layoutSetSingleParagraph, services.pango, "pango_layout_set_single_paragraph_mode")
 	purego.RegisterLibFunc(&services.layoutGetExtents, services.pango, "pango_layout_get_extents")
 	purego.RegisterLibFunc(&services.layoutGetBaseline, services.pango, "pango_layout_get_baseline")
+	purego.RegisterLibFunc(&services.layoutSetAttributes, services.pango, "pango_layout_set_attributes")
+	if symbol, err := purego.Dlsym(services.pango, "pango_layout_get_unknown_glyphs_count"); err == nil && symbol != 0 {
+		purego.RegisterLibFunc(&services.layoutGetUnknownGlyphs, services.pango, "pango_layout_get_unknown_glyphs_count")
+	}
+	purego.RegisterLibFunc(&services.attrListNew, services.pango, "pango_attr_list_new")
+	purego.RegisterLibFunc(&services.attrListUnref, services.pango, "pango_attr_list_unref")
+	purego.RegisterLibFunc(&services.attrListInsert, services.pango, "pango_attr_list_insert")
+	purego.RegisterLibFunc(&services.attrFallbackNew, services.pango, "pango_attr_fallback_new")
+	services.noFallback = services.fallbackOff()
 	if symbol, err := purego.Dlsym(services.pango, "pango_context_set_round_glyph_positions"); err == nil && symbol != 0 {
 		purego.RegisterLibFunc(&services.contextSetRoundGlyphs, services.pango, "pango_context_set_round_glyph_positions")
 	}
@@ -228,12 +252,32 @@ func (services *textServices) close() {
 }
 
 func (services *textServices) closeLibraries() {
+	if services.noFallback != 0 && services.attrListUnref != nil {
+		services.attrListUnref(services.noFallback)
+		services.noFallback = 0
+	}
 	for _, library := range []*uintptr{&services.gobject, &services.cairo, &services.pangoCairo, &services.pango} {
 		if *library != 0 {
 			purego.Dlclose(*library)
 			*library = 0
 		}
 	}
+}
+
+// fallbackOff is the attribute list that turns Pango's font fallback off, so a glyph laid
+// out under it comes from the description's own family; 0 when Pango cannot build it.
+func (services *textServices) fallbackOff() uintptr {
+	list := services.attrListNew()
+	if list == 0 {
+		return 0
+	}
+	attribute := services.attrFallbackNew(0) // false: no fallback
+	if attribute == 0 {
+		services.attrListUnref(list)
+		return 0
+	}
+	services.attrListInsert(list, attribute) // the list takes the attribute
+	return list
 }
 
 func cString(value string) []byte {
@@ -306,14 +350,7 @@ func (services *textServices) configureLayout(value, family string, size, weight
 		return text.Metrics{}, err
 	}
 	defer services.fontFree(description)
-	valueBytes := cString(value)
-	services.layoutSetWidth(services.layout, -1)
-	services.layoutSetFont(services.layout, description)
-	services.layoutSetText(services.layout, &valueBytes[0], int32(len(value)))
-	var logical pangoRectangle
-	services.layoutGetExtents(services.layout, nil, &logical)
-	baseline := services.layoutGetBaseline(services.layout)
-	runtime.KeepAlive(valueBytes)
+	logical, _, baseline := services.layoutValue(description, value)
 	metrics := text.Metrics{
 		Width:   float32(logical.Width) / pangoScale,
 		Height:  float32(logical.Height) / pangoScale,
@@ -321,6 +358,62 @@ func (services *textServices) configureLayout(value, family string, size, weight
 		Descent: float32(logical.Height-baseline) / pangoScale,
 	}
 	return metrics, nil
+}
+
+// layoutValue lays value out in the layout under description and reports its logical
+// extents, the ink extents of its glyphs, and its baseline.
+func (services *textServices) layoutValue(description uintptr, value string) (logical, ink pangoRectangle, baseline int32) {
+	valueBytes := cString(value)
+	services.layoutSetWidth(services.layout, -1)
+	services.layoutSetFont(services.layout, description)
+	services.layoutSetText(services.layout, &valueBytes[0], int32(len(value)))
+	services.layoutGetExtents(services.layout, &ink, &logical)
+	baseline = services.layoutGetBaseline(services.layout)
+	runtime.KeepAlive(valueBytes)
+	return logical, ink, baseline
+}
+
+// configureMonoLayout is configureLayout for a fixed-pitch face: the cell of "M" and the
+// thicknesses of the strokes the face draws a light and a heavy box drawing line with, in
+// logical pixels. The stroke is the ink width of the stem glyph in the face's own family.
+func (services *textServices) configureMonoLayout(family string, size float32) (text.Metrics, error) {
+	if !validFontSize(size) {
+		return text.Metrics{}, fmt.Errorf("linux: invalid font size")
+	}
+	description, err := services.description(family, size, 0, false)
+	if err != nil {
+		return text.Metrics{}, err
+	}
+	defer services.fontFree(description)
+	logical, _, baseline := services.layoutValue(description, "M")
+	metrics := text.Metrics{
+		Width:   float32(logical.Width) / pangoScale,
+		Height:  float32(logical.Height) / pangoScale,
+		Ascent:  float32(baseline) / pangoScale,
+		Descent: float32(logical.Height-baseline) / pangoScale,
+	}
+	metrics.Rule = services.boxRule(description, "│")
+	metrics.HeavyRule = services.boxRule(description, "┃")
+	return metrics, nil
+}
+
+// boxRule is the thickness, in logical pixels, of the stroke the face draws value with: the
+// ink width of the glyph in the description's own family, or 0 when that family lacks the
+// glyph. The layout is measured with fallback off, so a family the face does not have is
+// never taken as its weight, and a glyph the face lacks is a missing-glyph box rather than
+// another family's stem.
+func (services *textServices) boxRule(description uintptr, value string) float32 {
+	if services.noFallback == 0 || services.layoutGetUnknownGlyphs == nil {
+		return 0
+	}
+	services.layoutSetAttributes(services.layout, services.noFallback)
+	_, ink, _ := services.layoutValue(description, value)
+	unknown := services.layoutGetUnknownGlyphs(services.layout)
+	services.layoutSetAttributes(services.layout, 0)
+	if unknown > 0 {
+		return 0
+	}
+	return float32(ink.Width) / pangoScale
 }
 
 func (services *textServices) measure(value string, size, weight float32) (text.Metrics, error) {
@@ -336,7 +429,7 @@ func MeasureText(value string, size, weight float32) (text.Metrics, error) {
 	return measure(value, size, weight)
 }
 
-func MeasureMono(size float32, face ui.MonoFace) (width, height float32, err error) {
+func MeasureMono(size float32, face gfx.MonoFace) (width, height float32, err error) {
 	services, err := newTextServices()
 	if err != nil {
 		return 0, 0, err
@@ -352,17 +445,17 @@ func MeasureMono(size float32, face ui.MonoFace) (width, height float32, err err
 // monoFamily is the Pango family list of a face: its primary font, then the
 // families that draw what the primary lacks, in the order the application gave,
 // then the generic fixed-pitch family fontconfig chooses for the rest.
-func monoFamily(face ui.MonoFace) string {
-	name := ui.MonoFamilyName(face)
-	fallbacks := ui.MonoFallbacks(face)
+func monoFamily(face gfx.MonoFace) string {
+	name := gfx.MonoFamilyName(face)
+	fallbacks := gfx.MonoFallbacks(face)
 	switch {
 	case name == "" && len(fallbacks) == 0:
-		if ui.MonoIsClassic(face) {
+		if gfx.MonoIsClassic(face) {
 			return "DejaVu Sans Mono"
 		}
 		return "monospace"
 	case name == "":
-		if ui.MonoIsClassic(face) {
+		if gfx.MonoIsClassic(face) {
 			name = "DejaVu Sans Mono"
 		}
 	}
@@ -443,7 +536,7 @@ func (services *textServices) draw(label platform.TextLabel, scale float32, widt
 			} else {
 				services.setSourceColor(context, label.Color)
 			}
-			target := float64(platform.LabelBaseline(height, float64(label.FontSize*scale)))
+			target := float64(platform.TextBaseline(label, height, scale))
 			if label.Mono {
 				// A fixed-pitch label is placed on its grid, not fitted.
 				metrics, err := services.configureLayout(label.Value, family, label.FontSize*scale, label.Weight, false)
@@ -485,7 +578,7 @@ func (services *textServices) drawLine(context uintptr, label platform.TextLabel
 	}
 	engine.mu.Lock()
 	defer engine.mu.Unlock()
-	line, err := engine.lineLocked(label.Value, label.FontSize*scale, label.Weight)
+	line, err := engine.lineStyleLocked(label.Value, label.FontSize*scale, label.Weight, label.Italic)
 	if err != nil {
 		return err
 	}
@@ -504,7 +597,7 @@ func (services *textServices) setSourceColor(context uintptr, color platform.Col
 	services.cairoSetSourceRGBA(context, clampUnit64(color.Red), clampUnit64(color.Green), clampUnit64(color.Blue), clampUnit64(color.Alpha))
 }
 
-func (services *textServices) setSourceUIColor(context uintptr, color ui.Color) {
+func (services *textServices) setSourceUIColor(context uintptr, color gfx.Color) {
 	services.cairoSetSourceRGBA(context, clampUnit64(float64(color.Red)), clampUnit64(float64(color.Green)), clampUnit64(float64(color.Blue)), clampUnit64(float64(color.Alpha)))
 }
 
@@ -532,9 +625,10 @@ func (services *textServices) drawRuns(context uintptr, label platform.TextLabel
 	if err != nil {
 		return err
 	}
-	baseline := float64(platform.LabelBaseline(height, float64(label.FontSize*scale)))
+	baseline := float64(platform.TextBaseline(label, height, scale))
+	columns := services.ownedColumns(label, family, scale, pitch, width)
 	offset := 0
-	for _, run := range label.Runs {
+	for index, run := range label.Runs {
 		end := offset + int(run.Bytes)
 		if run.Bytes < 0 || run.Cells < 0 || end < offset || end > len(label.Value) {
 			return fmt.Errorf("linux: invalid fixed-pitch text run")
@@ -546,8 +640,11 @@ func (services *textServices) drawRuns(context uintptr, label platform.TextLabel
 		}
 		left := float64(run.Column) * pitch
 		span := float64(run.Cells) * pitch
+		// The run draws in the columns it owns, which are its cells and the blank cells its
+		// ink reaches into, and nowhere else.
+		owned := columns[index]
 		services.cairoSave(context)
-		services.cairoRectangle(context, left, 0, span, float64(height))
+		services.cairoRectangle(context, float64(owned.From), 0, float64(owned.To-owned.From), float64(height))
 		services.cairoClip(context)
 		source := func() {
 			if lcd {
@@ -557,8 +654,8 @@ func (services *textServices) drawRuns(context uintptr, label platform.TextLabel
 			}
 		}
 		source()
-		if lcd && run.Cells > 0 && piece != "" {
-			from, to := platform.GridColumns(left, span, width)
+		if lcd && run.Cells > 0 && piece != "" && owned.To > owned.From {
+			from, to := owned.From, owned.To
 			services.addSpan(from, to, [4]float32{run.Color.Red, run.Color.Green, run.Color.Blue, run.Color.Alpha})
 		}
 		metrics := baseMetrics

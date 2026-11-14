@@ -30,6 +30,34 @@ func TestTextEventApplyPreservesUnicodeSelectionAndComposition(t *testing.T) {
 	}
 }
 
+func TestTextEventKindsAppendWithoutRenumbering(t *testing.T) {
+	if TextPasteNoText != 7 || TextCancelComposition != 8 {
+		t.Fatalf("text event kinds = %d, %d; want 7, 8", TextPasteNoText, TextCancelComposition)
+	}
+}
+
+func TestTextEventApplyCancelsComposition(t *testing.T) {
+	editor := text.NewEditor("A中B")
+	editor.SetSelection(text.Range{Start: 3, End: 1})
+	TextEvent{Kind: TextSetMarked, Text: "pin", MarkedSelection: text.Range{Start: 3, End: 3}}.Apply(editor)
+	TextEvent{Kind: TextCancelComposition}.Apply(editor)
+	if value := editor.String(); value != "A中B" {
+		t.Fatalf("cancel value = %q", value)
+	}
+	if selection := editor.Selection(); selection != (text.Range{Start: 1, End: 3}) {
+		t.Fatalf("cancel selection = %+v", selection)
+	}
+	if editor.Caret() != 1 {
+		t.Fatalf("cancel caret = %d", editor.Caret())
+	}
+	if _, composing := editor.Composition(); composing {
+		t.Fatal("cancel left the composition active")
+	}
+	if editor.CanUndo() || editor.CanRedo() {
+		t.Fatal("cancel created a history unit")
+	}
+}
+
 func TestTextHistoryCommandUsesPlatformConventionalChords(t *testing.T) {
 	for _, test := range []struct {
 		name    string
@@ -85,6 +113,34 @@ func TestTextEventApplyCommands(t *testing.T) {
 	}
 }
 
+func TestTextEventApplyFollowsTheEditorsCodeOptions(t *testing.T) {
+	editor := text.NewEditor("if x {")
+	editor.SetCode(text.CodeOptions{TabWidth: 2, AutoIndent: true, AutoClose: true, IndentAfter: "{"})
+	apply := func(event TextEvent) { event.Apply(editor) }
+	apply(TextEvent{Kind: TextCommandEvent, Command: TextInsertNewline})
+	if got := editor.String(); got != "if x {\n  " {
+		t.Fatalf("Enter after an opener = %q", got)
+	}
+	apply(TextEvent{Kind: TextInsert, Text: "("})
+	if got := editor.String(); got != "if x {\n  ()" || editor.Caret() != len([]rune("if x {\n  (")) {
+		t.Fatalf("typing an opener = %q with the caret at %d", got, editor.Caret())
+	}
+	apply(TextEvent{Kind: TextCommandEvent, Command: TextDeleteBackward})
+	if got := editor.String(); got != "if x {\n  " {
+		t.Fatalf("Backspace between a pair = %q", got)
+	}
+	apply(TextEvent{Kind: TextCommandEvent, Command: TextInsertTab})
+	if got := editor.String(); got != "if x {\n    " {
+		t.Fatalf("Tab = %q, want spaces to the next stop", got)
+	}
+	// Pasted and composed text is never rewritten.
+	apply(TextEvent{Kind: TextPaste, Text: "("})
+	apply(TextEvent{Kind: TextSetMarked, Text: "(", MarkedSelection: text.Range{Start: 1, End: 1}})
+	if got := editor.String(); got != "if x {\n    ((" {
+		t.Fatalf("paste and composition = %q", got)
+	}
+}
+
 func TestTextEventApplyHonorsTheEditorsRestrictions(t *testing.T) {
 	editor := text.NewEditor("")
 	editor.Restrict(func(r rune) bool { return r >= '0' && r <= '9' }, 4)
@@ -124,5 +180,98 @@ func TestTextInputRedrawRequestForcesAFrameOnceWithoutChangingTheState(t *testin
 	// again unless it asks to.
 	if TextInputPresentationChanged(true, request.WithoutRedraw(), empty) {
 		t.Fatal("the request outlived its event")
+	}
+}
+
+// A marked update that names the active composition's range continues the
+// composition instead of ending it: the replacement range must not be selected
+// first, or the cancel snapshot would hold the previous preedit.
+func TestTextEventApplyContinuesCompositionAcrossExplicitReplacement(t *testing.T) {
+	editor := text.NewEditor("abc")
+	editor.SetSelection(text.Range{Start: 0, End: 1})
+	TextEvent{Kind: TextSetMarked, Text: "ni", MarkedSelection: text.Range{Start: 2, End: 2}}.Apply(editor)
+	composition, composing := editor.Composition()
+	if !composing {
+		t.Fatal("the first marked update did not start a composition")
+	}
+	TextEvent{Kind: TextSetMarked, Text: "hao", MarkedSelection: text.Range{Start: 3, End: 3}, HasReplacement: true, Replacement: composition}.Apply(editor)
+	if value := editor.String(); value != "haobc" {
+		t.Fatalf("continued composition value = %q, want %q", value, "haobc")
+	}
+	TextEvent{Kind: TextCancelComposition}.Apply(editor)
+	if value := editor.String(); value != "abc" {
+		t.Fatalf("cancel after a continued composition left %q, want %q", value, "abc")
+	}
+	if selection := editor.Selection(); selection != (text.Range{Start: 0, End: 1}) {
+		t.Fatalf("cancel selection = %+v, want the replaced rune", selection)
+	}
+	if editor.Caret() != 1 {
+		t.Fatalf("cancel caret = %d, want 1", editor.Caret())
+	}
+	if _, composing := editor.Composition(); composing {
+		t.Fatal("cancel left the composition active")
+	}
+	if editor.CanUndo() || editor.CanRedo() {
+		t.Fatal("cancel after a continued composition invented history")
+	}
+}
+
+// The replacement range of a first marked update is ordered; selecting it must
+// not flip a backwards selection before the composition records it.
+func TestTextEventApplyKeepsBackwardsSelectionAcrossAReplacement(t *testing.T) {
+	editor := text.NewEditor("abc")
+	editor.SetSelection(text.Range{Start: 2, End: 1})
+	TextEvent{Kind: TextSetMarked, Text: "ni", MarkedSelection: text.Range{Start: 2, End: 2}, HasReplacement: true, Replacement: text.Range{Start: 1, End: 2}}.Apply(editor)
+	TextEvent{Kind: TextCancelComposition}.Apply(editor)
+	if value := editor.String(); value != "abc" {
+		t.Fatalf("cancel value = %q, want %q", value, "abc")
+	}
+	if selection := editor.Selection(); selection != (text.Range{Start: 1, End: 2}) {
+		t.Fatalf("cancel selection = %+v, want {1 2}", selection)
+	}
+	if editor.Caret() != 1 {
+		t.Fatalf("cancel caret = %d, want the backwards selection's moving end 1", editor.Caret())
+	}
+	if _, composing := editor.Composition(); composing {
+		t.Fatal("cancel left the composition active")
+	}
+}
+
+// An input-method commit that names the active composition's range is that
+// composition's commit: selecting the range first would end the composition and
+// leave the preedit in an undo unit of its own, so one Undo would restore the
+// preedit instead of the text the composition replaced.
+func TestTextEventApplyCommitsCompositionAsOneUndoUnit(t *testing.T) {
+	editor := text.NewEditor("abc")
+	editor.SetSelection(text.Range{Start: 1, End: 2})
+	TextEvent{Kind: TextSetMarked, Text: "ni", MarkedSelection: text.Range{Start: 2, End: 2}}.Apply(editor)
+	if value := editor.String(); value != "anic" {
+		t.Fatalf("marked value = %q, want %q", value, "anic")
+	}
+	composition, composing := editor.Composition()
+	if !composing {
+		t.Fatal("the marked update did not start a composition")
+	}
+	TextEvent{Kind: TextInsert, Text: "X", HasReplacement: true, Replacement: composition}.Apply(editor)
+	if value := editor.String(); value != "aXc" {
+		t.Fatalf("commit value = %q, want %q", value, "aXc")
+	}
+	if _, composing := editor.Composition(); composing {
+		t.Fatal("the commit left the composition active")
+	}
+	if !editor.Undo() {
+		t.Fatal("the commit produced no undo unit")
+	}
+	if value := editor.String(); value != "abc" {
+		t.Fatalf("one Undo after the commit left %q, want the original %q", value, "abc")
+	}
+	if editor.Selection() != (text.Range{Start: 1, End: 2}) {
+		t.Fatalf("Undo selection = %+v, want the replaced rune", editor.Selection())
+	}
+	if !editor.CanRedo() {
+		t.Fatal("Undo left nothing to redo")
+	}
+	if !editor.Redo() || editor.String() != "aXc" {
+		t.Fatalf("Redo value = %q, want %q", editor.String(), "aXc")
 	}
 }

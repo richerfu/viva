@@ -6,7 +6,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/vivaui/viva/ui"
+	"github.com/vivaui/viva/gfx"
 )
 
 // ErrNoWindows is returned when an application startup callback returns
@@ -19,13 +19,15 @@ var ErrNoWindows = errors.New("app: application opened no windows")
 // A fullscreen-capable host additionally implements SetFullscreen(bool) error
 // and Fullscreen() bool. It reports transitions through Config.OnFullscreen
 // before resize/frame callbacks and repaints afterward.
+// An always-on-top host additionally implements SetAlwaysOnTop(bool) error.
+// A size-capable host additionally implements SetSize(int, int) error.
 type WindowControl interface {
 	Close()
 	Hide()
 	Show()
 	// Frame is the content area in screen coordinates, false when the window
 	// cannot say (closed, or not yet placed). It may be called from any goroutine.
-	Frame() (ui.Rect, bool)
+	Frame() (gfx.Rect, bool)
 }
 
 // Host is the event loop an Application runs on. The native backends provide
@@ -34,11 +36,14 @@ type WindowControl interface {
 type Host interface {
 	// OpenWindow creates and presents a window. closed must be called exactly
 	// once, after the window has released its resources.
-	OpenWindow(config Config, canvas *ui.Canvas, closed func()) (WindowControl, error)
+	OpenWindow(config Config, canvas *gfx.Canvas, closed func()) (WindowControl, error)
 	// AddStatusItem puts an icon in the system's status area.
 	AddStatusItem(config StatusItemConfig) (StatusItemControl, error)
 	// SetDockBadge marks the application's icon in the Dock with text.
 	SetDockBadge(text string)
+	// SetProgress draws how much of the application's work is done on the icon
+	// the desktop shows for it.
+	SetProgress(fraction float32)
 	// Quit closes every window, close requests notwithstanding, and ends the
 	// loop. It is safe to call from any goroutine.
 	Quit()
@@ -57,6 +62,8 @@ type Window struct {
 	// maximized mirrors what the platform last reported through OnMaximize.
 	maximized  atomic.Bool
 	fullscreen atomic.Bool
+	topmostMu  sync.Mutex
+	topmost    atomic.Bool
 }
 
 // Close requests that the native window close. Closing the final window ends
@@ -95,14 +102,14 @@ func (window *Window) Show() {
 
 // Frame returns the window's content area in screen coordinates: logical pixels
 // from the top-left corner of the primary display, y down, the coordinates
-// ui.PointerEvent.ScreenX and ScreenY use. A drag that ends over another of the
+// gfx.PointerEvent.ScreenX and ScreenY use. A drag that ends over another of the
 // application's windows finds it by comparing its pointer with their frames. The
 // result is false for a closed window. On displays of different scale the
 // coordinates of windows on different displays are only approximately comparable.
 // It may be called from any goroutine.
-func (window *Window) Frame() (ui.Rect, bool) {
+func (window *Window) Frame() (gfx.Rect, bool) {
 	if window == nil || window.control == nil || window.closed.Load() {
-		return ui.Rect{}, false
+		return gfx.Rect{}, false
 	}
 	return window.control.Frame()
 }
@@ -173,7 +180,7 @@ type Application struct {
 }
 
 // OpenWindow creates and presents one independent retained window.
-func (application *Application) OpenWindow(config Config, canvas *ui.Canvas) (*Window, error) {
+func (application *Application) OpenWindow(config Config, canvas *gfx.Canvas) (*Window, error) {
 	if application == nil || application.host == nil {
 		return nil, errors.New("app: application is not running")
 	}
@@ -260,6 +267,25 @@ func (application *Application) SetDockBadge(text string) {
 	}
 }
 
+// SetProgress draws how much of the work the application is doing is done on
+// the icon the desktop shows for it: the Dock tile on macOS, the taskbar button
+// on Windows, the launcher entry of a Linux desktop that has one. A fraction
+// between 0 and 1 draws a bar of that length; a fraction below zero, or one that
+// is not a number, takes the bar away, which is also how a program says the work
+// is over. It describes the whole application rather than one window, so a
+// program with several windows reports what all of them are moving. It is called
+// from the startup callback or a window callback, like SetDockBadge; a desktop
+// with nowhere to draw the bar accepts it and does nothing.
+func (application *Application) SetProgress(fraction float32) {
+	if application == nil || application.host == nil {
+		return
+	}
+	if fraction > 1 {
+		fraction = 1
+	}
+	application.host.SetProgress(fraction)
+}
+
 // Quit closes every window, whatever their close requests say, and ends
 // RunApplication once their resources are released. It may be called from any
 // goroutine.
@@ -284,5 +310,8 @@ var applicationRunner ApplicationRunner
 // UseApplicationRunner makes RunApplication use run instead of native windows.
 // Package headless/auto installs this only in explicitly tagged tool builds.
 func UseApplicationRunner(run ApplicationRunner) {
+	if run != nil {
+		markNonNativeSystemUsed()
+	}
 	applicationRunner = run
 }

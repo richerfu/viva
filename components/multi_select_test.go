@@ -5,8 +5,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/vivaui/viva/gfx"
 	"github.com/vivaui/viva/text"
-	"github.com/vivaui/viva/ui"
 )
 
 func multiSelectFixture() *MultiSelectState {
@@ -26,7 +26,7 @@ func TestMultiSelectFiltersCreatesAndPreservesSelection(t *testing.T) {
 	if len(choices) != 1 || !choices[0].Create || choices[0].Value != "数据库" {
 		t.Fatal("missing create row", choices)
 	}
-	s.Key(ui.KeyEvent{Key: ui.KeyEnter})
+	s.Key(gfx.KeyEvent{Key: gfx.KeyEnter})
 	if !slices.Equal(s.Values(), []string{"开发", "测试", "数据库"}) || s.Query.String() != "" {
 		t.Fatal("create did not commit and clear query", s.Values())
 	}
@@ -39,7 +39,7 @@ func TestMultiSelectFiltersCreatesAndPreservesSelection(t *testing.T) {
 	}
 	s.Query = text.Editor{}
 	s.Query.Insert("数据库")
-	s.Key(ui.KeyEvent{Key: ui.KeyEnter})
+	s.Key(gfx.KeyEvent{Key: gfx.KeyEnter})
 	if len(s.Values()) != 3 {
 		t.Fatal("duplicate query removed or duplicated selection")
 	}
@@ -52,16 +52,16 @@ func TestMultiSelectKeyboardLimitAndIME(t *testing.T) {
 	s := multiSelectFixture()
 	s.Limit = 1
 	s.SetValidateCreate(func(value string) bool { return len([]rune(value)) <= 4 })
-	s.Key(ui.KeyEvent{Key: ui.KeyEnter})
+	s.Key(gfx.KeyEvent{Key: gfx.KeyEnter})
 	if len(s.Values()) != 0 || !s.Open {
 		t.Fatal("opening an empty select chose a value")
 	}
-	s.Key(ui.KeyEvent{Key: ui.KeyDown})
-	s.Key(ui.KeyEvent{Key: ui.KeyEnter, Repeat: true})
+	s.Key(gfx.KeyEvent{Key: gfx.KeyDown})
+	s.Key(gfx.KeyEvent{Key: gfx.KeyEnter, Repeat: true})
 	if len(s.Values()) != 0 {
 		t.Fatal("repeat Enter committed a selection")
 	}
-	s.Key(ui.KeyEvent{Key: ui.KeyEnter})
+	s.Key(gfx.KeyEvent{Key: gfx.KeyEnter})
 	if !slices.Equal(s.Values(), []string{"测试"}) {
 		t.Fatal("arrow selection failed", s.Values())
 	}
@@ -70,26 +70,26 @@ func TestMultiSelectKeyboardLimitAndIME(t *testing.T) {
 		t.Fatal("selection limit was bypassed")
 	}
 	s.Query = text.Editor{}
-	s.Key(ui.KeyEvent{Key: ui.KeyBackspace})
+	s.Key(gfx.KeyEvent{Key: gfx.KeyBackspace})
 	if len(s.Values()) != 0 {
 		t.Fatal("empty query backspace did not remove last chip")
 	}
 	s.Query.SetMarkedText("中文", text.Range{End: 2})
-	s.Key(ui.KeyEvent{Key: ui.KeyEnter})
+	s.Key(gfx.KeyEvent{Key: gfx.KeyEnter})
 	if len(s.Values()) != 0 {
 		t.Fatal("IME Enter created a value")
 	}
 	s.Query.Unmark()
-	s.Key(ui.KeyEvent{Key: ui.KeyEnter})
+	s.Key(gfx.KeyEvent{Key: gfx.KeyEnter})
 	if !slices.Equal(s.Values(), []string{"中文"}) {
 		t.Fatal("committed Chinese query was not created")
 	}
-	result := s.Key(ui.KeyEvent{Key: ui.KeyTab})
+	result := s.Key(gfx.KeyEvent{Key: gfx.KeyTab})
 	if s.Open || !result.ContinueTraversal {
 		t.Fatal("Tab trapped focus")
 	}
 	s.Open = true
-	result = s.Key(ui.KeyEvent{Key: ui.KeyTab, Modifiers: ui.ModifierShift})
+	result = s.Key(gfx.KeyEvent{Key: gfx.KeyTab, Modifiers: gfx.ModifierShift})
 	if s.Open || !result.ContinueTraversal {
 		t.Fatal("Shift+Tab trapped focus")
 	}
@@ -117,16 +117,16 @@ func TestMultiSelectCreateValidatorReachesTheCreateRow(t *testing.T) {
 }
 
 func TestMultiSelectInputOwnsNativeTextBoundsInsideThePopupScope(t *testing.T) {
-	var tree ui.Tree
+	var tree gfx.Tree
 	f := tree.Feature("multi-select-test")
-	o := MultiSelectOptions{InputID: tree.ID(f, "input"), TriggerID: tree.ID(f, "trigger"), DismissID: tree.ID(f, "dismiss"), Scope: tree.ID(f, "scope"), OptionIDs: tree.Sub(f, tree.Name("option")), RemoveIDs: tree.Sub(f, tree.Name("remove")), Label: "Tags", Placeholder: "Select tags", Viewport: ui.Rect{Width: 800, Height: 600}, Layer: 4}
+	o := MultiSelectOptions{InputID: tree.ID(f, "input"), TriggerID: tree.ID(f, "trigger"), DismissID: tree.ID(f, "dismiss"), Scope: tree.ID(f, "scope"), OptionIDs: tree.Sub(f, tree.Name("option")), RemoveIDs: tree.Sub(f, tree.Name("remove")), Label: "Tags", Placeholder: "Select tags", Viewport: gfx.Rect{Width: 800, Height: 600}, Layer: 4}
 	s := multiSelectFixture()
 	s.SetValues([]string{"开发", "测试", "生产", "a very long custom tag"})
 	s.Open = true
-	for _, theme := range []ui.Theme{ui.LightTheme(), ui.DarkTheme()} {
+	for _, theme := range []gfx.Theme{gfx.LightTheme(), gfx.DarkTheme()} {
 		for _, width := range []float32{180, 320, 600} {
-			var canvas ui.Canvas
-			layout := PaintMultiSelect(&canvas, theme, ui.Rect{X: 20, Y: 540, Width: width}, s, o)
+			var canvas gfx.Canvas
+			layout := PaintMultiSelect(&canvas, theme, gfx.Rect{X: 20, Y: 540, Width: width}, s, o)
 			if layout.Input.Width <= 0 || layout.Input.X < layout.Bounds.X || layout.Input.X+layout.Input.Width > layout.Bounds.X+layout.Bounds.Width {
 				t.Fatal("query escaped the select", layout)
 			}
@@ -137,10 +137,12 @@ func TestMultiSelectInputOwnsNativeTextBoundsInsideThePopupScope(t *testing.T) {
 				t.Fatal("popup excludes its native query input")
 			}
 			inputHits := 0
-			for _, hit := range canvas.Hits() {
+			hits := canvas.Hits()
+			for index := range hits {
+				hit := &hits[index]
 				if hit.ID == o.InputID {
 					inputHits++
-					if hit.TextBounds != layout.Input || hit.Role != ui.RoleCombobox || !hit.Expanded {
+					if hitText(&canvas, hit).Bounds != layout.Input || hit.Role != gfx.RoleCombobox || !hit.Expanded {
 						t.Fatal("native input geometry or semantics lost", hit)
 					}
 				}
@@ -152,10 +154,75 @@ func TestMultiSelectInputOwnsNativeTextBoundsInsideThePopupScope(t *testing.T) {
 	}
 }
 
+func TestMultiSelectPopupEscapesScrollClipWithoutExposingInput(t *testing.T) {
+	var tree gfx.Tree
+	feature := tree.Feature("clipped-multi-select")
+	o := MultiSelectOptions{InputID: tree.ID(feature, "input"), TriggerID: tree.ID(feature, "trigger"), DismissID: tree.ID(feature, "dismiss"), Scope: tree.ID(feature, "scope"), OptionIDs: tree.Sub(feature, tree.Name("option")), RemoveIDs: tree.Sub(feature, tree.Name("remove")), Label: "Tags", Viewport: gfx.Rect{Width: 400, Height: 300}, Layer: 4}
+	s := multiSelectFixture()
+	s.SetOptions([]MultiSelectOption{{Value: "one"}, {Value: "two"}, {Value: "three"}, {Value: "four"}, {Value: "five"}})
+	s.Open = true
+	var canvas gfx.Canvas
+	body := gfx.Rect{X: 10, Y: 20, Width: 360, Height: 65}
+	canvas.Clip(body)
+	layout := PaintMultiSelect(&canvas, gfx.LightTheme(), gfx.Rect{X: 30, Y: 60, Width: 250, Height: 32}, s, o)
+	canvas.Unclip()
+	if layout.Popup.Y+layout.Popup.Height <= body.Y+body.Height {
+		t.Fatal("fixture did not place the menu outside the scroll area", layout)
+	}
+	var input, last, dismiss gfx.Hit
+	for _, hit := range canvas.Hits() {
+		switch hit.ID {
+		case o.InputID:
+			input = hit
+		case o.OptionIDs.At(4):
+			last = hit
+		case o.DismissID:
+			dismiss = hit
+		}
+	}
+	if input.Bounds.X != layout.Input.X || input.Bounds.Y != layout.Input.Y ||
+		input.Bounds.Height >= layout.Input.Height || input.Bounds.Y+input.Bounds.Height != body.Y+body.Height ||
+		input.Scope != o.Scope || input.Layer != o.Layer ||
+		last.Bounds.Height != 32 || last.Bounds.Y <= body.Y+body.Height || last.Scope != o.Scope ||
+		dismiss.Bounds != o.Viewport || !dismiss.Backdrop {
+		t.Fatalf("incomplete or unreachable popup: input=%+v last=%+v backdrop=%+v layout=%+v", input, last, dismiss, layout)
+	}
+	foundSurface := false
+	for _, r := range canvas.Rectangles() {
+		if r.Bounds == layout.Popup {
+			foundSurface = true
+			if !r.HasClip || r.ClipOf != o.Viewport {
+				t.Fatalf("popup surface still clipped to the form: %+v", r)
+			}
+		}
+	}
+	if !foundSurface {
+		t.Fatal("popup surface was not painted")
+	}
+	// The parent still owns its scroll clip after the component returns.
+	canvas.Clip(body)
+	canvas.Hit(gfx.Item(99), gfx.Rect{X: 30, Y: 120, Width: 20, Height: 20})
+	if len(canvas.Hits()) != 0 && canvas.Hits()[len(canvas.Hits())-1].ID == gfx.Item(99) {
+		t.Fatal("the scroll area no longer clips its own content")
+	}
+	canvas.Unclip()
+}
+
+func TestMultiSelectClampsPopupToTinyViewport(t *testing.T) {
+	var canvas gfx.Canvas
+	s := multiSelectFixture()
+	s.Open = true
+	viewport := gfx.Rect{Width: 140, Height: 50}
+	layout := PaintMultiSelect(&canvas, gfx.LightTheme(), gfx.Rect{Y: 2, Width: 120, Height: 32}, s, MultiSelectOptions{Viewport: viewport})
+	if layout.Popup.Y < viewport.Y || layout.Popup.Y+layout.Popup.Height > viewport.Y+viewport.Height {
+		t.Fatalf("popup escaped the viewport: %+v", layout)
+	}
+}
+
 func BenchmarkMultiSelectPaint(b *testing.B) {
-	var tree ui.Tree
+	var tree gfx.Tree
 	f := tree.Feature("benchmark")
-	o := MultiSelectOptions{InputID: tree.ID(f, "input"), TriggerID: tree.ID(f, "trigger"), DismissID: tree.ID(f, "dismiss"), Scope: tree.ID(f, "scope"), OptionIDs: tree.Sub(f, tree.Name("option")), RemoveIDs: tree.Sub(f, tree.Name("remove")), Label: "Tags", CreatePrefix: "Create: ", Viewport: ui.Rect{Width: 800, Height: 600}, Layer: 4}
+	o := MultiSelectOptions{InputID: tree.ID(f, "input"), TriggerID: tree.ID(f, "trigger"), DismissID: tree.ID(f, "dismiss"), Scope: tree.ID(f, "scope"), OptionIDs: tree.Sub(f, tree.Name("option")), RemoveIDs: tree.Sub(f, tree.Name("remove")), Label: "Tags", CreatePrefix: "Create: ", Viewport: gfx.Rect{Width: 800, Height: 600}, Layer: 4}
 	for _, name := range []string{"closed", "open", "create", "overflow"} {
 		b.Run(name, func(b *testing.B) {
 			s := multiSelectFixture()
@@ -167,10 +234,10 @@ func BenchmarkMultiSelectPaint(b *testing.B) {
 			if name == "overflow" {
 				s.SetValues([]string{"开发", "测试", "生产", strings.Repeat("long", 8)})
 			}
-			var canvas ui.Canvas
+			var canvas gfx.Canvas
 			paint := func() {
 				canvas.Reset()
-				PaintMultiSelect(&canvas, ui.LightTheme(), ui.Rect{Width: 320, Height: 32}, s, o)
+				PaintMultiSelect(&canvas, gfx.LightTheme(), gfx.Rect{Width: 320, Height: 32}, s, o)
 			}
 			paint()
 			b.ReportAllocs()
@@ -178,5 +245,105 @@ func BenchmarkMultiSelectPaint(b *testing.B) {
 				paint()
 			}
 		})
+	}
+}
+
+func BenchmarkMultiSelectPaintInScrollArea(b *testing.B) {
+	var tree gfx.Tree
+	feature := tree.Feature("nested-popup-bench")
+	o := MultiSelectOptions{InputID: tree.ID(feature, "input"), TriggerID: tree.ID(feature, "trigger"), DismissID: tree.ID(feature, "dismiss"), Scope: tree.ID(feature, "scope"), OptionIDs: tree.Sub(feature, tree.Name("option")), RemoveIDs: tree.Sub(feature, tree.Name("remove")), Viewport: gfx.Rect{Width: 800, Height: 600}, Layer: 4}
+	for _, open := range []bool{false, true} {
+		name := "closed"
+		if open {
+			name = "open"
+		}
+		b.Run(name, func(b *testing.B) {
+			s := multiSelectFixture()
+			s.Open = open
+			var canvas gfx.Canvas
+			paint := func() {
+				canvas.Reset()
+				canvas.Clip(gfx.Rect{X: 10, Y: 10, Width: 500, Height: 100})
+				PaintMultiSelect(&canvas, gfx.LightTheme(), gfx.Rect{X: 20, Y: 70, Width: 320, Height: 32}, s, o)
+				canvas.Unclip()
+			}
+			paint()
+			b.ReportAllocs()
+			for b.Loop() {
+				paint()
+			}
+		})
+	}
+}
+
+// Hovering a row is a pointer move onto the cursor: the row under the pointer
+// becomes the row the highlight and Enter name. A pointer that stays where it
+// was never takes the cursor back from the arrow keys.
+func TestMultiSelectPointerMovesTheCursorWhenItCrossesRows(t *testing.T) {
+	var tree gfx.Tree
+	f := tree.Feature("multi-select-pointer")
+	o := MultiSelectOptions{InputID: tree.ID(f, "input"), TriggerID: tree.ID(f, "trigger"), DismissID: tree.ID(f, "dismiss"), Scope: tree.ID(f, "scope"), ScrollID: tree.ID(f, "scroll"), OptionIDs: tree.Sub(f, tree.Name("option")), Label: "标签", CreatePrefix: "创建：", Viewport: gfx.Rect{Width: 800, Height: 600}, Layer: 4}
+	s := multiSelectFixture()
+	s.Open = true
+	var canvas gfx.Canvas
+	paint := func(hovered gfx.ID) {
+		canvas.Reset()
+		canvas.SetInteraction(hovered, gfx.ID{}, o.InputID, false)
+		PaintMultiSelect(&canvas, gfx.LightTheme(), gfx.Rect{Width: 320, Height: 32}, s, o)
+	}
+
+	paint(o.OptionIDs.At(0))
+	s.Key(gfx.KeyEvent{Key: gfx.KeyDown})
+	if s.Active != 1 {
+		t.Fatalf("arrow key did not move the cursor: %d", s.Active)
+	}
+	paint(o.OptionIDs.At(0)) // the pointer has not moved since the key press
+	if s.Active != 1 {
+		t.Fatalf("a resting pointer took the cursor back to %d", s.Active)
+	}
+	paint(o.OptionIDs.At(2)) // the pointer crossed onto the third row
+	if s.Active != 2 {
+		t.Fatalf("crossing onto the third row left the cursor at %d", s.Active)
+	}
+	paint(o.OptionIDs.At(3)) // a disabled row is not a cursor target
+	if s.Active != 2 {
+		t.Fatalf("hovering a disabled row moved the cursor to %d", s.Active)
+	}
+	if !s.Key(gfx.KeyEvent{Key: gfx.KeyEnter}).Handled || !slices.Equal(s.Values(), []string{"生产"}) {
+		t.Fatalf("Enter after hovering the third row chose %v", s.Values())
+	}
+	paint(o.OptionIDs.At(2)) // the list was rebuilt; the pointer is still parked there
+	if s.Active != 2 {
+		t.Fatalf("the rebuilt list did not re-adopt the parked row: %d", s.Active)
+	}
+}
+
+// Moving the pointer down a row at a time leaves one tinted row behind on every
+// paint: the canvas stream never carries the previous row's tint, so a repaint
+// of only the changed row cannot leave stale pixels on screen.
+func TestMultiSelectPaintTintsOneRowPerHoverStep(t *testing.T) {
+	theme := gfx.LightTheme()
+	var tree gfx.Tree
+	f := tree.Feature("multi-select-hover-sweep")
+	o := MultiSelectOptions{InputID: tree.ID(f, "input"), TriggerID: tree.ID(f, "trigger"), DismissID: tree.ID(f, "dismiss"), Scope: tree.ID(f, "scope"), ScrollID: tree.ID(f, "scroll"), OptionIDs: tree.Sub(f, tree.Name("option")), Label: "标签", Viewport: gfx.Rect{Width: 800, Height: 600}, Layer: 4}
+	s := multiSelectFixture()
+	s.Open = true
+	var canvas gfx.Canvas
+	tint := func(row int) int {
+		canvas.Reset()
+		canvas.SetInteraction(o.OptionIDs.At(row), gfx.ID{}, o.InputID, false)
+		PaintMultiSelect(&canvas, theme, gfx.Rect{Width: 320, Height: 32}, s, o)
+		tinted := 0
+		for _, rectangle := range canvas.Rectangles() {
+			if rectangle.Color == theme.Accent && rectangle.Radius == theme.Metrics.RadiusItem() {
+				tinted++
+			}
+		}
+		return tinted
+	}
+	for _, row := range []int{0, 1, 2, 1, 0} {
+		if got := tint(row); got != 1 {
+			t.Fatalf("hovering row %d tinted %d rows", row, got)
+		}
 	}
 }

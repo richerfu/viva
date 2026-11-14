@@ -1,8 +1,8 @@
 package app
 
 import (
+	"github.com/vivaui/viva/gfx"
 	"github.com/vivaui/viva/internal/platform"
-	"github.com/vivaui/viva/ui"
 )
 
 type BackendSetting = platform.DesktopSetting
@@ -16,7 +16,7 @@ const (
 // application watchers. Backends call it on their serial UI executor.
 func BackendAppearanceChanged() { platform.NotifyAppearanceChanged() }
 
-func watchDesktopSettings(c *ui.Canvas, w *platform.Waker) func() {
+func watchDesktopSettings(c *gfx.Canvas, w *platform.Waker) func() {
 	if b := selectedBackend(); b != nil {
 		if watch := b.Services().WatchSettings; watch != nil {
 			stop := watch(func(changed BackendSetting) {

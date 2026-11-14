@@ -83,6 +83,10 @@ type FileType struct {
 	// which belongs to the application alone. Name a registered type, such as
 	// text/markdown, for a format other programs know too.
 	MIME string
+	// UTI is the macOS Uniform Type Identifier, such as
+	// net.daringfireball.markdown. Empty leaves LSItemContentTypes out and
+	// relies on CFBundleTypeExtensions alone.
+	UTI string
 }
 
 // Build holds settings shared by every target.
@@ -162,6 +166,10 @@ type Linux struct {
 	Homepage string
 	// Depends are the .deb's dependencies, as in Debian's Depends field.
 	Depends []string
+	// ArchDepends are the Arch packages the PKGBUILD depends on. They are
+	// written separately because Debian and Arch name the same library
+	// differently, and a Debian name in an Arch package cannot be resolved.
+	ArchDepends []string
 	// Keywords help the desktop search find the menu entry.
 	Keywords []string
 }
@@ -207,6 +215,7 @@ var (
 	schemePattern     = regexp.MustCompile(`^[a-z][a-z0-9+.-]{0,31}$`)
 	extensionPattern  = regexp.MustCompile(`^[a-z0-9][a-z0-9_+-]{0,15}$`)
 	mimePattern       = regexp.MustCompile(`^[a-z0-9][a-z0-9!#$&^_.+-]{0,126}/[a-z0-9][a-z0-9!#$&^_.+-]{0,126}$`)
+	utiPattern        = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9-]*(\.[A-Za-z0-9][A-Za-z0-9-]*)+$`)
 	plistKeyPattern   = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9._-]*$`)
 )
 
@@ -224,6 +233,7 @@ type document struct {
 			Name       string   `toml:"name"`
 			Extensions []string `toml:"extensions"`
 			MIME       string   `toml:"mime"`
+			UTI        string   `toml:"uti"`
 		} `toml:"file_types"`
 	} `toml:"app"`
 	Build struct {
@@ -252,25 +262,26 @@ type document struct {
 		URL       string `toml:"url"`
 	} `toml:"windows"`
 	Linux struct {
-		Category   string   `toml:"category"`
-		Comment    string   `toml:"comment"`
-		Maintainer string   `toml:"maintainer"`
-		Homepage   string   `toml:"homepage"`
-		Depends    []string `toml:"depends"`
-		Keywords   []string `toml:"keywords"`
+		Category    string   `toml:"category"`
+		Comment     string   `toml:"comment"`
+		Maintainer  string   `toml:"maintainer"`
+		Homepage    string   `toml:"homepage"`
+		Depends     []string `toml:"depends"`
+		ArchDepends []string `toml:"arch_depends"`
+		Keywords    []string `toml:"keywords"`
 	} `toml:"linux"`
 }
 
 // knownKeys lists the keys of each table, for error messages.
 var knownKeys = map[string][]string{
 	"app":            {"executable", "file_types", "icon", "id", "name", "package", "url_schemes", "version"},
-	"app.file_types": {"extensions", "mime", "name"},
+	"app.file_types": {"extensions", "mime", "name", "uti"},
 	"build":          {"out", "tags"},
 	"web":            {"package"},
 	"mac":            {"category", "copyright", "dmg", "entitlements", "info", "min_system"},
 	"mac.dmg":        {"app_position", "applications_position", "background", "icon_size"},
 	"windows":        {"publisher", "scope", "url"},
-	"linux":          {"category", "comment", "depends", "homepage", "keywords", "maintainer"},
+	"linux":          {"arch_depends", "category", "comment", "depends", "homepage", "keywords", "maintainer"},
 }
 
 // Parse decodes the text of a viva.toml. name labels errors and dir becomes
@@ -297,7 +308,7 @@ func Parse(name, dir, source string) (*Manifest, error) {
 		URLSchemes: doc.App.URLSchemes,
 	}
 	for _, kind := range doc.App.FileTypes {
-		manifest.App.FileTypes = append(manifest.App.FileTypes, FileType{Name: kind.Name, Extensions: kind.Extensions, MIME: kind.MIME})
+		manifest.App.FileTypes = append(manifest.App.FileTypes, FileType{Name: kind.Name, Extensions: kind.Extensions, MIME: kind.MIME, UTI: kind.UTI})
 	}
 	manifest.Build = Build{Tags: doc.Build.Tags, Out: orDefault(doc.Build.Out, base.Build.Out)}
 	manifest.Web = Web{Package: doc.Web.Package}
@@ -319,7 +330,8 @@ func Parse(name, dir, source string) (*Manifest, error) {
 	manifest.Windows = Windows{Publisher: doc.Windows.Publisher, Scope: doc.Windows.Scope, URL: doc.Windows.URL}
 	manifest.Linux = Linux{
 		Category: doc.Linux.Category, Comment: doc.Linux.Comment, Maintainer: doc.Linux.Maintainer,
-		Homepage: doc.Linux.Homepage, Depends: doc.Linux.Depends, Keywords: doc.Linux.Keywords,
+		Homepage: doc.Linux.Homepage, Depends: doc.Linux.Depends, ArchDepends: doc.Linux.ArchDepends,
+		Keywords: doc.Linux.Keywords,
 	}
 	sort.Slice(manifest.Mac.Info, func(i, j int) bool { return manifest.Mac.Info[i].Key < manifest.Mac.Info[j].Key })
 
@@ -472,7 +484,7 @@ func (app *App) validateFileTypes() error {
 	fail := func(index int, key, format string, arguments ...any) error {
 		return fmt.Errorf("[[app.file_types]] #%d %s: %s", index+1, key, fmt.Sprintf(format, arguments...))
 	}
-	extensions, mimes := map[string]int{}, map[string]int{}
+	extensions, mimes, utis := map[string]int{}, map[string]int{}, map[string]int{}
 	for index := range app.FileTypes {
 		kind := &app.FileTypes[index]
 		if kind.Name == "" || strings.IndexFunc(kind.Name, func(r rune) bool { return r < ' ' || r == 0x7f }) >= 0 {
@@ -498,6 +510,15 @@ func (app *App) validateFileTypes() error {
 		}
 		if !mimePattern.MatchString(kind.MIME) {
 			return fail(index, "mime", "%q is not a media type such as text/markdown", kind.MIME)
+		}
+		if kind.UTI != "" && !utiPattern.MatchString(kind.UTI) {
+			return fail(index, "uti", "%q is not a Uniform Type Identifier such as net.daringfireball.markdown", kind.UTI)
+		}
+		if other, taken := utis[kind.UTI]; taken {
+			return fail(index, "uti", "%q is already the type of #%d", kind.UTI, other+1)
+		}
+		if kind.UTI != "" {
+			utis[kind.UTI] = index
 		}
 		if other, taken := mimes[kind.MIME]; taken {
 			return fail(index, "mime", "%q is already the type of #%d", kind.MIME, other+1)

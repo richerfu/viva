@@ -67,8 +67,10 @@ func (application *linuxApplication) newIME(win *window, textInput *linuxTextInp
 	}
 	ime := &linuxIME{app: application, text: textInput, router: router, origin: win.contentOrigin}
 	context, err := bus.NewContext("viva", ibus.Handler{
-		Commit:  ime.commit,
-		Preedit: ime.preedit,
+		Commit: ime.commit,
+		Preedit: func(event ibus.PreeditEvent) {
+			ime.preedit(event.Text, event.Cursor, event.Visible, event.Attributes)
+		},
 		Forward: ime.forward,
 
 		DeleteSurrounding: ime.deleteSurrounding,
@@ -243,6 +245,10 @@ func (ime *linuxIME) caretRectangle() (x, y, width, height float32) {
 // processKey gives a key press to the engine. It reports whether the engine has
 // it, in which case the key reaches the field only if the engine declines it.
 func (ime *linuxIME) processKey(keysym uint32, event *xcbInputEvent, keyEvent platform.KeyEvent) bool {
+	return ime.processKeyWithShortcut(keysym, event, keyEvent, keyEvent)
+}
+
+func (ime *linuxIME) processKeyWithShortcut(keysym uint32, event *xcbInputEvent, keyEvent, shortcut platform.KeyEvent) bool {
 	if ime.dead || !ime.active || ime.context == nil || event.Detail < 8 || keysym == 0 {
 		return false
 	}
@@ -250,7 +256,7 @@ func (ime *linuxIME) processKey(keysym uint32, event *xcbInputEvent, keyEvent pl
 		if handled {
 			return
 		}
-		if err := ime.router.deliverTyped(keyEvent, keysym); err != nil {
+		if err := ime.router.deliverTypedWithShortcut(keyEvent, keysym, shortcut); err != nil {
 			ime.app.fail(err)
 		}
 	})

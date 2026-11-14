@@ -6,12 +6,12 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/vivaui/viva/gfx"
 	"github.com/vivaui/viva/internal/input"
 	"github.com/vivaui/viva/internal/platform"
 	"github.com/vivaui/viva/internal/render"
 	"github.com/vivaui/viva/internal/scene"
 	"github.com/vivaui/viva/text"
-	"github.com/vivaui/viva/ui"
 )
 
 const linuxTextCaretWidth = 2
@@ -21,11 +21,16 @@ type linuxTextInput struct {
 
 	// engine places the caret, the selection and the composition underline, and finds
 	// the character a click is on, from the same shaped line the glyphs are drawn from.
-	engine ui.TextEngine
+	engine gfx.TextEngine
 
 	input   platform.TextInput
 	state   platform.TextState
 	enabled bool
+	closed  bool
+	// Every acknowledgment advances both counters, even if its value is the
+	// same. Geometry alone supersedes a redraw, but not an event's text result.
+	stateRevision uint64
+	inputRevision uint64
 
 	caretVisible    bool
 	caretGeneration uint32
@@ -62,7 +67,7 @@ func newLinuxTextInput(config *platform.Config) (*linuxTextInput, error) {
 		// drawn: on the character boundaries of the engine's shaped line.
 		state.engine = TextEngine()
 		if state.engine == nil {
-			state.engine = ui.ReferenceTextEngine()
+			state.engine = gfx.ReferenceTextEngine()
 		}
 	}
 	if config.TextInput != nil {
@@ -83,7 +88,15 @@ func newLinuxTextInput(config *platform.Config) (*linuxTextInput, error) {
 }
 
 func (state *linuxTextInput) close() {
+	if state.closed {
+		return
+	}
+	state.closed, state.enabled = true, false
+	state.stateRevision++
+	state.inputRevision++
 	state.stopCaretBlink()
+	state.input = platform.TextInput{}
+	state.state = platform.TextState{}
 	state.engine = nil
 }
 
@@ -126,7 +139,7 @@ func copyTextLabels(destination []platform.TextLabel, source []platform.TextLabe
 	}
 	for index, label := range source {
 		destination[index] = label
-		destination[index].Runs = append([]ui.TextRun(nil), label.Runs...)
+		destination[index].Runs = append([]gfx.TextRun(nil), label.Runs...)
 	}
 	return destination
 }
@@ -164,6 +177,9 @@ func (state *linuxTextInput) initial() ([]render.Rectangle, []platform.TextLabel
 }
 
 func (state *linuxTextInput) prepare(frame platform.Frame) (platform.Frame, bool, error) {
+	if state.closed {
+		return platform.Frame{}, false, nil
+	}
 	rectanglesChanged := !frame.Update.Empty()
 	labelsChanged := frame.TextLabels != nil
 	if rectanglesChanged {
@@ -221,7 +237,7 @@ func (state *linuxTextInput) prepare(frame platform.Frame) (platform.Frame, bool
 }
 
 func (state *linuxTextInput) applyUpdate(update platform.TextInputUpdate) (bool, error) {
-	if !update.Changed {
+	if !update.Changed || state.closed {
 		return false, nil
 	}
 	if !state.config.DynamicTextInput {
@@ -229,6 +245,10 @@ func (state *linuxTextInput) applyUpdate(update platform.TextInputUpdate) (bool,
 	}
 	if err := validateLinuxTextInput(update.Input); err != nil {
 		return false, err
+	}
+	state.inputRevision++
+	if !state.enabled || update.Input == nil || !sameLinuxTextSession(state.input, *update.Input) {
+		state.stateRevision++
 	}
 	if update.Input == nil {
 		state.stopCaretBlink()
@@ -249,6 +269,15 @@ func (state *linuxTextInput) applyUpdate(update platform.TextInputUpdate) (bool,
 	state.enabled = true
 	state.restartCaretBlink()
 	return true, nil
+}
+
+func sameLinuxTextSession(previous, next platform.TextInput) bool {
+	return previous.Target == next.Target && previous.State == next.State &&
+		previous.Multiline == next.Multiline && previous.Secure == next.Secure &&
+		previous.Terminal == next.Terminal && previous.CopyOverride == next.CopyOverride &&
+		previous.AltSendsEscape == next.AltSendsEscape && previous.KeyReleases == next.KeyReleases &&
+		previous.DisableIME == next.DisableIME && previous.NavigationKeys == next.NavigationKeys &&
+		previous.Placed == next.Placed
 }
 
 func (state *linuxTextInput) rebuild() error {
@@ -273,62 +302,70 @@ func (state *linuxTextInput) rebuild() error {
 	}
 	state.labels[len(state.baseLabels)] = platform.TextLabel{
 		Value: shown, X: inputState.X, Y: inputState.Y, Width: inputState.Width, Height: inputState.Height,
-		FontSize: inputState.FontSize, Color: inputState.Color, Layer: inputState.Layer, Mono: inputState.Terminal, MonoFace: inputState.MonoFace,
+		FontSize: inputState.FontSize, Weight: inputState.Weight, FontGeneration: inputState.FontGeneration, Color: inputState.Color, Layer: inputState.Layer, Mono: inputState.Terminal, MonoFace: inputState.MonoFace, Baseline: inputState.Baseline,
+		// The editor draws over the field, caret and selection: after every shape.
+		ShapesBefore: uint32(len(state.rectangles)),
 	}
 	if inputState.Terminal {
 		state.rebuildTerminalPreedit(shown)
 		return nil
 	}
 	base := len(state.baseRectangles)
+	// The engine shapes one line, and a multi-line field's value is a document: the
+	// caret, the selection and the label are the line the caret is on, whatever the
+	// length of the rest.
+	caretIndex := state.caretIndex()
+	start, end, first := platform.TextLine(shown, caretIndex)
+	shown = shown[start:end]
+	state.labels[len(state.baseLabels)].Value = shown
 	values := []rune(shown)
+	prefixWidth := func(index int) (float32, error) {
+		return state.prefixWidth(shown, values, min(max(index-first, 0), len(values)), inputState.FontSize)
+	}
 	// The caret decides what part of a long text shows. A component that places its own
 	// text (Placed) scrolls it itself.
-	caretIndex := state.state.Selection.End
-	if state.state.Composing {
-		caretIndex = state.state.Composition.End
-	}
-	caretX, err := state.prefixWidth(shown, values, caretIndex, inputState.FontSize)
+	caretX, err := prefixWidth(caretIndex)
 	if err != nil {
 		return err
 	}
-	textWidth, err := state.prefixWidth(shown, values, len(values), inputState.FontSize)
-	if err != nil {
-		return err
-	}
+	textWidth := state.engine.Width(shown, inputState.FontSize, inputState.Weight)
 	state.scroll = 0
 	if !inputState.Placed {
 		state.scroll = state.scrollFor(inputState.Width, caretX, textWidth)
 	}
-	originX := inputState.X - state.scroll
+	inset := platform.TextAlignmentInset(inputState.Alignment, inputState.Width, textWidth, inputState.Terminal, inputState.Placed)
+	originX := inputState.X + inset - state.scroll
 	label := &state.labels[len(state.baseLabels)]
 	label.X, label.Width = originX, max(inputState.Width+state.scroll, textWidth+linuxTextCaretWidth)
-	label.Clipped, label.Clip = true, ui.Rect{X: inputState.X, Y: inputState.Y, Width: inputState.Width, Height: inputState.Height}
+	label.Clipped, label.Clip = true, gfx.Rect{X: inputState.X, Y: inputState.Y, Width: inputState.Width, Height: inputState.Height}
 	// Whatever the field shows of a highlight is the part inside it.
 	visible := func(left, width float32) (float32, float32) {
 		right := min(left+width, inputState.X+inputState.Width)
 		left = max(left, inputState.X)
 		return left, max(right-left, 0)
 	}
+	// The caret's place is where the engine puts its candidate window, so it is kept
+	// even when the field paints no native caret of its own.
+	caretTop, caretHeight := platform.TextCaretBand(inputState.Y, inputState.Height, inputState.FontSize)
+	state.caret = render.Rectangle{
+		Bounds: scene.Rect{X: platform.TextCaretInsideField(inputState.Alignment, inputState.X, inputState.Width, originX+caretX, linuxTextCaretWidth), Y: caretTop, Width: linuxTextCaretWidth, Height: caretHeight},
+		Color:  scene.Color{Red: float32(inputState.Color.Red), Green: float32(inputState.Color.Green), Blue: float32(inputState.Color.Blue), Alpha: float32(inputState.Color.Alpha)},
+		Layer:  inputState.Layer,
+	}
 	if !inputState.HideNativeOverlays {
 		selection := state.state.Selection
-		selectionStart, err := state.prefixWidth(shown, values, selection.Start, inputState.FontSize)
+		selectionStart, err := prefixWidth(selection.Start)
 		if err != nil {
 			return err
 		}
-		selectionEnd, err := state.prefixWidth(shown, values, selection.End, inputState.FontSize)
+		selectionEnd, err := prefixWidth(selection.End)
 		if err != nil {
 			return err
 		}
-		caretTop, caretHeight := platform.TextCaretBand(inputState.Y, inputState.Height, inputState.FontSize)
 		left, width := visible(originX+min(selectionStart, selectionEnd), max(selectionEnd-selectionStart, selectionStart-selectionEnd))
 		state.rectangles[base] = render.Rectangle{
 			Bounds: scene.Rect{X: left, Y: caretTop, Width: width, Height: caretHeight},
 			Color:  scene.Color{Red: 0.22, Green: 0.48, Blue: 1, Alpha: 0.34},
-			Layer:  inputState.Layer,
-		}
-		state.caret = render.Rectangle{
-			Bounds: scene.Rect{X: originX + caretX, Y: caretTop, Width: linuxTextCaretWidth, Height: caretHeight},
-			Color:  scene.Color{Red: float32(inputState.Color.Red), Green: float32(inputState.Color.Green), Blue: float32(inputState.Color.Blue), Alpha: float32(inputState.Color.Alpha)},
 			Layer:  inputState.Layer,
 		}
 		if state.caretVisible && state.caretShown() {
@@ -337,11 +374,11 @@ func (state *linuxTextInput) rebuild() error {
 	}
 	if state.state.Composing {
 		composition := state.state.Composition
-		compositionStart, err := state.prefixWidth(shown, values, composition.Start, inputState.FontSize)
+		compositionStart, err := prefixWidth(composition.Start)
 		if err != nil {
 			return err
 		}
-		compositionEnd, err := state.prefixWidth(shown, values, composition.End, inputState.FontSize)
+		compositionEnd, err := prefixWidth(composition.End)
 		if err != nil {
 			return err
 		}
@@ -373,8 +410,8 @@ func (state *linuxTextInput) scrollFor(width, caretX, textWidth float32) float32
 // platform.TextInput.Terminal), only the underline of the composition.
 func (state *linuxTextInput) rebuildTerminalPreedit(shown string) {
 	input := &state.input
-	cell := platform.TerminalPreeditCellWidth(input.FontSize)
-	color := ui.Color{Red: float32(input.Color.Red), Green: float32(input.Color.Green), Blue: float32(input.Color.Blue), Alpha: float32(input.Color.Alpha)}
+	cell := input.CellWidth
+	color := gfx.Color{Red: float32(input.Color.Red), Green: float32(input.Color.Green), Blue: float32(input.Color.Blue), Alpha: float32(input.Color.Alpha)}
 	label := &state.labels[len(state.baseLabels)]
 	// A new slice every time: the renderer may still compare against the last frame's label.
 	label.CellWidth, label.Runs = cell, platform.TerminalPreeditRuns(nil, shown, color)
@@ -398,7 +435,7 @@ func (state *linuxTextInput) prefixWidth(shown string, values []rune, end int, s
 	if end <= 0 {
 		return 0, nil
 	}
-	return state.engine.Caret(shown, size, 0, len(string(values[:end]))), nil
+	return state.engine.Caret(shown, size, state.input.Weight, len(string(values[:end]))), nil
 }
 
 // ownsChord reports whether the focused field takes this key itself, ahead of the
@@ -437,7 +474,7 @@ func (state *linuxTextInput) key(event platform.KeyEvent) (platform.Frame, bool,
 	}
 	if action := platform.TextClipboardAction(event); action != 0 {
 		// A clipboard that cannot be read or written leaves the field as it is.
-		clipboard, changed, err := platform.TextClipboardEvent(state.state, state.input.Secure, action, ClipboardText, SetClipboardText)
+		clipboard, changed, err := platform.TextClipboardEvent(state.input.ClipboardState(action), state.input.Secure, action, ClipboardText, SetClipboardText)
 		if err != nil || !changed {
 			return platform.Frame{}, true, nil
 		}
@@ -491,7 +528,7 @@ func (state *linuxTextInput) pointer(event platform.PointerEvent) (platform.Fram
 	switch event.Kind {
 	case platform.PointerDown:
 		state.dragging = false
-		if event.Button != ui.PointerButtonPrimary && event.Button != ui.PointerButtonMiddle {
+		if event.Button != gfx.PointerButtonPrimary && event.Button != gfx.PointerButtonMiddle {
 			return platform.Frame{}, false, nil
 		}
 		if event.X < inputState.X || event.X > inputState.X+inputState.Width || event.Y < inputState.Y || event.Y > inputState.Y+inputState.Height {
@@ -509,7 +546,7 @@ func (state *linuxTextInput) pointer(event platform.PointerEvent) (platform.Fram
 	}
 	// The pointer is measured against the text as it is scrolled, and a drag keeps
 	// selecting once it leaves the field, to the nearest end.
-	index, err := state.nearestTextIndex(event.X - inputState.X + state.scroll)
+	index, err := state.nearestTextIndex(event.X - state.labels[len(state.baseLabels)].X)
 	if err != nil {
 		return platform.Frame{}, true, err
 	}
@@ -517,7 +554,7 @@ func (state *linuxTextInput) pointer(event platform.PointerEvent) (platform.Fram
 		frame, err := state.textEvent(platform.TextEvent{Kind: platform.TextSetSelection, Selection: text.Range{Start: state.dragAnchor, End: index}})
 		return frame, true, err
 	}
-	if event.Button == ui.PointerButtonPrimary {
+	if event.Button == gfx.PointerButtonPrimary {
 		state.dragging, state.dragAnchor = true, index
 		if event.Modifiers&input.ModifierShift != 0 {
 			state.dragAnchor = state.state.Selection.Start
@@ -581,6 +618,15 @@ func primaryCandidate(private bool, previous, next platform.TextState) (string, 
 	return string(runes[selection.Start:selection.End]), true
 }
 
+// caretIndex is the rune index of the caret: the end of the selection, or of the composition
+// while one is being typed.
+func (state *linuxTextInput) caretIndex() int {
+	if state.state.Composing {
+		return state.state.Composition.End
+	}
+	return state.state.Selection.End
+}
+
 func (state *linuxTextInput) nearestTextIndex(x float32) (int, error) {
 	shown := state.state.Value
 	if state.input.Secure {
@@ -589,8 +635,11 @@ func (state *linuxTextInput) nearestTextIndex(x float32) (int, error) {
 	if shown == "" {
 		return 0, nil
 	}
-	offset := state.engine.OffsetAt(shown, state.input.FontSize, 0, x)
-	return utf8.RuneCountInString(shown[:max(0, min(offset, len(shown)))]), nil
+	// One line is laid out: the caret's (see rebuild), and the click is on it.
+	start, end, first := platform.TextLine(shown, state.caretIndex())
+	shown = shown[start:end]
+	offset := state.engine.OffsetAt(shown, state.input.FontSize, state.input.Weight, x)
+	return first + utf8.RuneCountInString(shown[:max(0, min(offset, len(shown)))]), nil
 }
 
 func (state *linuxTextInput) textEvent(event platform.TextEvent) (platform.Frame, error) {
@@ -598,7 +647,11 @@ func (state *linuxTextInput) textEvent(event platform.TextEvent) (platform.Frame
 		return platform.Frame{}, nil
 	}
 	previous := state.state
+	revision := state.stateRevision
 	next, err := state.input.OnEvent(event)
+	if err == nil && state.stateRevision != revision {
+		return state.currentTextFrame(), nil
+	}
 	if err == nil {
 		err = validateLinuxTextState(next)
 	}
@@ -607,6 +660,8 @@ func (state *linuxTextInput) textEvent(event platform.TextEvent) (platform.Frame
 	}
 	redraw := platform.TextInputPresentationChanged(state.input.Terminal, previous, next)
 	next = next.WithoutRedraw() // a one-shot request, not editor state
+	state.stateRevision++
+	state.inputRevision++
 	state.state = next
 	state.input.State = next
 	state.publishPrimary(previous, next)
@@ -614,14 +669,31 @@ func (state *linuxTextInput) textEvent(event platform.TextEvent) (platform.Frame
 		return platform.Frame{}, nil
 	}
 	state.restartCaretBlink()
+	revision = state.inputRevision
 	if state.config.OnRedraw != nil {
 		frame, err := state.config.OnRedraw()
+		if err == nil && state.inputRevision != revision {
+			// The callback's scene and input belong to an older acknowledgment.
+			// Refresh the current mirror, including after a nested terminal no-op.
+			return state.currentTextFrame(), nil
+		}
 		if err == nil && !frame.TextInput.Changed {
 			frame.TextInput = platform.TextInputUpdate{Changed: true, Input: &state.input}
 		}
 		return frame, err
 	}
 	return platform.Frame{TextInput: platform.TextInputUpdate{Changed: true, Input: &state.input}}, nil
+}
+
+func (state *linuxTextInput) currentTextFrame() platform.Frame {
+	if state.closed {
+		return platform.Frame{}
+	}
+	var current *platform.TextInput
+	if state.enabled {
+		current = &state.input
+	}
+	return platform.Frame{TextInput: platform.TextInputUpdate{Changed: true, Input: current}}
 }
 
 // caretShown says whether the field has a native caret to draw: not a terminal,

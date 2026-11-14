@@ -53,16 +53,22 @@ typedef struct viva_text_line {
     double ascent;
     double descent;
     int references;
+    // italic says the line was asked for in italics: glyphs of a font that has no italic
+    // face (the CJK fallback, say) are slanted when it is drawn.
+    int italic;
 } viva_text_line;
 
 typedef struct {
     const unsigned char *utf8;
     size_t utf8_length;
+    int copy_override;
     float x;
     float y;
     float width;
     float height;
     float font_size;
+    float font_weight;
+    int alignment;
     float red;
     float green;
     float blue;
@@ -85,6 +91,9 @@ typedef struct {
 	int mono_face;
     // The width of one terminal cell, which a terminal's preedit text is laid on.
     float cell_width;
+    // The row of a terminal's field, counted from its top, on which the preedit's glyphs
+    // stand (platform.TextInput.Baseline); 0 for every other field.
+    float baseline;
     // Printable Option chords become raw key events carrying their base
     // character, so terminal encoders can send Escape-prefixed Meta input.
     int alt_sends_escape;
@@ -133,6 +142,7 @@ enum {
     VIVA_LABEL_BITMAP = 2,
     // The label may only paint inside clip_x/clip_y/clip_width/clip_height.
     VIVA_LABEL_CLIPPED = 8,
+    VIVA_LABEL_ITALIC = 16,
 };
 
 typedef struct {
@@ -149,7 +159,7 @@ typedef struct {
     float blue;
     float alpha;
     uint16_t layer;
-    // mono_face is the ui.MonoFace of a fixed-pitch label: 0 system, 1 classic,
+    // mono_face is the gfx.MonoFace of a fixed-pitch label: 0 system, 1 classic,
     // or a family registered with viva_register_mono_family.
     uint16_t mono_face;
     // The generation of the interface font the proportional text was laid out in
@@ -177,6 +187,22 @@ typedef struct {
     // Where layout put the text, less x and y, in logical pixels (platform.TextLabel.OriginX).
     float origin_x;
     float origin_y;
+    // baseline is the row a fixed-pitch label's glyphs stand on, counted from the top of
+    // the label in logical pixels (platform.TextLabel.Baseline); 0 for every other label,
+    // which stands on the row all proportional text shares.
+    float baseline;
+    // When quad holds any value other than all zeros the label paints that
+    // shape instead of x, y, width, height: the four corners in the order
+    // top-left, top-right, bottom-left, bottom-right, in logical pixels, and the
+    // straight RGBA colour multiplied into the pixels at each corner
+    // (platform.TextLabel.Quad). x, y, width and height stay the rasterisation
+    // box, so the picture of the label is what the quad places.
+    float quad[8];
+    float tint[16];
+    // shapes_before is how many shape instances the frame painted before this
+    // label (platform.TextLabel.ShapesBefore): the composite plan interleaves
+    // text and shapes at that index.
+    uint32_t shapes_before;
 } viva_text_label;
 
 // viva_clip is the region, in logical pixels, that one rectangle or triangle
@@ -202,6 +228,9 @@ typedef struct {
     float clip_y;
     float clip_width;
     float clip_height;
+    // sequence is where this command falls in the frame's paint order. Commands
+    // are drawn layer by layer, and in sequence order within a layer.
+    uint32_t sequence;
 } viva_composite_command;
 
 enum {
@@ -230,7 +259,7 @@ typedef struct {
     int multiline;
     int read_only;
     int secure;
-    // The control's identity (ui.ID.Bits), echoed back by an accessibility action.
+    // The control's identity (gfx.ID.Bits), echoed back by an accessibility action.
     uint64_t id;
     int focusable;
     int expandable;
@@ -293,14 +322,19 @@ typedef struct {
     // Nonzero reports the window being minimized and restored through
     // vivaWindowMinimized.
     int minimize_events_enabled;
+    // Nonzero reports the window becoming visible or occluded (covered, minimized,
+    // hidden, on another space) through vivaWindowOccluded.
+    int visibility_events_enabled;
     int key_events_enabled;
     int scroll_events_enabled;
+    int modifier_taps_enabled;
     // Nonzero makes the window a target for files dragged from Finder.
     int file_drop_enabled;
     int redraw_events_enabled;
     int dynamic_text_input;
     int window_mode;
     float titlebar_height;
+    float traffic_light_scale;
     int close_intercept_enabled;
     uintptr_t callback_handle;
     // Where a panel opens: the screen rectangle of its status item, in the
@@ -337,6 +371,7 @@ void viva_probe_front(void);
 void viva_probe_close(void);
 int viva_offscreen_set_rectangles(void *offscreen, const viva_rectangle *rectangles, const viva_clip *clips, size_t count);
 int viva_offscreen_set_labels(void *offscreen, const viva_text_label *labels, size_t count);
+size_t viva_offscreen_label_texture_bytes(void *offscreen);
 int viva_offscreen_set_text_input(void *offscreen, viva_text_input_config config);
 int viva_offscreen_render(
     void *offscreen,
@@ -354,8 +389,13 @@ void *viva_application_open_window(viva_window_config config);
  * coordinates and returns 1, or returns 0 when there is no such window. Safe from
  * any thread; off the main thread it waits for it. */
 int viva_application_window_frame(void *window, double *out);
+/* Puts the window's content area at x, y in top-left screen coordinates. */
+void viva_application_move_window(void *window, double x, double y);
+/* Posts a content resize to the AppKit event loop. */
+void viva_application_set_window_size(void *window, double width, double height);
 int viva_application_set_fullscreen(void *window, int fullscreen);
 int viva_application_fullscreen(void *window);
+int viva_application_set_always_on_top(void *window, int enabled);
 int viva_application_run(void);
 void viva_application_close_all(void);
 void viva_application_close_window(void *window);
@@ -374,17 +414,26 @@ int viva_view_update_rectangles(
     int rebuild,
     int render
 );
+/* Makes the window's Metal device, pipelines and textures again after the
+ * renderer lost its resources; the scene must be sent again as a rebuild.
+ * Returns 0 on success. */
+int viva_view_recover(void *view);
 int viva_view_update_labels(
     void *view,
     const viva_text_label *labels,
     size_t count
 );
 
+/* The instance slots the renderer's rectangle buffers need for count
+ * instances, given the slots they already hold: the same capacity while it
+ * covers the count, doubled until it does otherwise. */
+size_t viva_rectangle_capacity(size_t capacity, size_t count);
 int viva_plan_composite(
     const viva_rectangle *rectangles,
     const viva_clip *clips,
     size_t rectangle_count,
     const uint16_t *text_layers,
+    const uint32_t *text_shapes_before,
     size_t text_count,
     viva_composite_command *commands,
     size_t command_capacity,
@@ -418,6 +467,12 @@ int viva_view_update_text(
     int render
 );
 int viva_view_update_text_input(void *view, viva_text_input_config text_input);
+// viva_view_update_text_input_keeping_composition mirrors the same editor
+// again after its frame, caret or style moved, without ending the input
+// method's composition. The application has already acknowledged the text and
+// selection it passes, so a field that grows a row or is scrolled under the
+// pointer keeps the pinyin, kana or hangul being composed.
+int viva_view_update_text_input_keeping_composition(void *view, viva_text_input_config text_input);
 int viva_text_input_caret_should_blink(
     int enabled,
     size_t selected_length,
@@ -425,7 +480,10 @@ int viva_text_input_caret_should_blink(
     int terminal,
     int hide_native_overlays
 );
-int viva_text_input_should_interpret_key(int enabled, int multiline, int key);
+// viva_text_input_should_interpret_key says whether a key goes to the text
+// system instead of the application. A composing input method owns Enter and
+// Escape; a single-line field keeps Tab's application routing.
+int viva_text_input_should_interpret_key(int enabled, int multiline, int composing, int key);
 // viva_text_input_row_key_is_raw says whether a key typed into a field that lays
 // its rows out itself goes to the application as a raw key event (1) rather than
 // to the text system, which knows one line: the keys that move between rows, and
@@ -462,8 +520,17 @@ int viva_measure_text(
 // viva_text_set_family names the family viva_text_line_create shapes in, or "" (or
 // NULL) for the system font. It copies the name; call it before any line is shaped.
 void viva_text_set_family(const char *family);
+// viva_text_set_thickening draws Viva's text with a thicker stroke (nonzero, CoreText's
+// font smoothing) or with the font's own outlines (zero). It returns whether the weight
+// changed, so a caller can leave everything drawn with the old one alone.
+int viva_text_set_thickening(int thickening);
+// viva_text_system_thickening reports whether the user leaves the system's own font
+// smoothing on (AppleFontSmoothing absent or nonzero; zero, or a value that is not a
+// number, off). The engine starts its weight there, as AppKit's own text does.
+int viva_text_system_thickening(void);
 
 viva_text_line *viva_text_line_create(const unsigned char *utf8, size_t length, double font_size, double font_weight);
+viva_text_line *viva_text_line_create_style(const unsigned char *utf8, size_t length, double font_size, double font_weight, int italic);
 void viva_text_line_retain(viva_text_line *line);
 void viva_text_line_release(viva_text_line *line);
 // Offsets are UTF-16 units of the string, as CoreText counts them; an offset inside a
@@ -475,10 +542,23 @@ size_t viva_text_line_index_at(const viva_text_line *line, double x);
 // to right, and returns how many it wrote (at most capacity): one, or several where the
 // selection crosses a change of direction.
 size_t viva_text_line_selection(const viva_text_line *line, size_t start, size_t end, double *spans, size_t capacity);
+int viva_text_line_rasterize(
+    const viva_text_line *line,
+    double font_size,
+    double scale,
+    size_t width,
+    size_t height,
+    double red,
+    double green,
+    double blue,
+    double alpha,
+    unsigned char *pixels
+);
 
-// viva_measure_mono reports the system fixed-pitch font's cell advance and line
-// height at a size.
-int viva_measure_mono(double font_size, int mono_face, double *advance, double *height);
+// viva_measure_mono reports the system fixed-pitch font's cell at a size: the advance of
+// one character, the ascent, descent and leading of its line box, and the thickness of
+// the strokes it draws its light and heavy box drawing lines with.
+int viva_measure_mono(double font_size, int mono_face, double *advance, double *ascent, double *descent, double *leading, double *rule, double *heavy);
 // viva_register_mono_family teaches what a mono_face number (2 and up) stands for: the
 // installed family it draws in first (empty for a stack over a built-in face), whether
 // that built-in face is the classic one, and the families that draw the characters the

@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include "system_darwin.h"
+#include "cursor_owner_darwin.h"
 
 static const size_t viva_max_clipboard_bytes = 64u << 20;
 
@@ -207,6 +208,147 @@ static NSPasteboard *viva_pasteboard_named(const char *name) {
     return [NSPasteboard pasteboardWithName:viva_string(name)];
 }
 
+// viva_system_pasteboard_put_html writes html as public.html beside alt as
+// public.utf8-plain-text, the pair a rich copy leaves: a reader takes whichever
+// flavour it knows, and a plain reader still pastes.
+int viva_system_pasteboard_put_html(const char *pasteboard, const char *html, const char *alt) {
+    __block char *failure = NULL;
+    dispatch_block_t operation = ^{
+        @autoreleasepool {
+            NSString *rich = viva_string(html);
+            NSString *plain = viva_string(alt);
+            if (rich == nil || plain == nil) {
+                failure = viva_copy_utf8(@"clipboard html is not valid UTF-8");
+                return;
+            }
+            NSPasteboard *board = viva_pasteboard_named(pasteboard);
+            NSData *data = [rich dataUsingEncoding:NSUTF8StringEncoding];
+            [board clearContents];
+            if (![board setData:data forType:NSPasteboardTypeHTML]) {
+                failure = viva_copy_utf8(@"AppKit refused clipboard html");
+                return;
+            }
+            [board setString:plain forType:NSPasteboardTypeString];
+        }
+    };
+    if (pasteboard == NULL) {
+        viva_on_main_sync(operation);
+    } else {
+        operation();
+    }
+    if (failure != NULL) {
+        free(failure);
+        return -1;
+    }
+    return 0;
+}
+
+// viva_system_pasteboard_html reads a named pasteboard's public.html as UTF-8,
+// "" when it holds none. Status: 0 html in *value, -1 failure with *error_message.
+int viva_system_pasteboard_html(const char *pasteboard, char **value, char **error_message) {
+    if (value == NULL) {
+        viva_set_error(error_message, @"clipboard output is missing");
+        return -1;
+    }
+    *value = NULL;
+    __block int status = 0;
+    __block char *result = NULL;
+    __block char *failure = NULL;
+    dispatch_block_t operation = ^{
+        @autoreleasepool {
+            NSPasteboard *board = viva_pasteboard_named(pasteboard);
+            NSData *data = [board dataForType:NSPasteboardTypeHTML];
+            if (data == nil) {
+                return;
+            }
+            if (data.length > viva_max_clipboard_bytes) {
+                failure = viva_copy_utf8(@"clipboard html exceeds 64 MiB");
+                status = -1;
+                return;
+            }
+            NSString *html = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+            if (html == nil) {
+                failure = viva_copy_utf8(@"clipboard html is not valid UTF-8");
+                status = -1;
+                return;
+            }
+            result = viva_copy_utf8(html);
+            if (result == NULL) {
+                failure = viva_copy_utf8(@"failed to allocate clipboard html");
+                status = -1;
+            }
+        }
+    };
+    if (pasteboard == NULL) {
+        viva_on_main_sync(operation);
+    } else {
+        operation();
+    }
+    if (status != 0) {
+        if (error_message != NULL) {
+            *error_message = failure;
+        } else {
+            free(failure);
+        }
+        return status;
+    }
+    if (result == NULL) {
+        result = strdup("");
+    }
+    *value = result;
+    return 0;
+}
+
+// viva_system_pasteboard_text is viva_system_clipboard_text for a named
+// pasteboard, the plain flavour of the pair put_html writes.
+int viva_system_pasteboard_text(const char *pasteboard, char **value, char **error_message) {
+    if (value == NULL) {
+        viva_set_error(error_message, @"clipboard output is missing");
+        return -1;
+    }
+    *value = NULL;
+    __block int status = 0;
+    __block char *result = NULL;
+    __block char *failure = NULL;
+    dispatch_block_t operation = ^{
+        @autoreleasepool {
+            NSPasteboard *board = viva_pasteboard_named(pasteboard);
+            NSString *text = [board stringForType:NSPasteboardTypeString];
+            if (text == nil) {
+                return;
+            }
+            if ([text lengthOfBytesUsingEncoding:NSUTF8StringEncoding] > viva_max_clipboard_bytes) {
+                failure = viva_copy_utf8(@"clipboard text exceeds 64 MiB");
+                status = -1;
+                return;
+            }
+            result = viva_copy_utf8(text);
+            if (result == NULL) {
+                failure = viva_copy_utf8(@"failed to allocate clipboard text");
+                status = -1;
+            }
+        }
+    };
+    if (pasteboard == NULL) {
+        viva_on_main_sync(operation);
+    } else {
+        operation();
+    }
+    if (status != 0) {
+        if (error_message != NULL) {
+            *error_message = failure;
+        } else {
+            free(failure);
+        }
+        return status;
+    }
+    if (result == NULL) {
+        result = strdup("");
+    }
+    *value = result;
+    return 0;
+}
+
 static NSArray<NSPasteboardType> *viva_image_types(void) {
     return @[NSPasteboardTypePNG, NSPasteboardTypeTIFF];
 }
@@ -314,6 +456,100 @@ int viva_system_pasteboard_put_image(const char *pasteboard, const uint8_t *png,
     }
 }
 
+int viva_system_clipboard_files(const char *pasteboard, size_t max, viva_system_string_array *paths, char **error_message) {
+    if (paths == NULL) {
+        viva_set_error(error_message, @"clipboard files output is missing");
+        return -1;
+    }
+    paths->items = NULL;
+    paths->count = 0;
+    __block int status = 1;
+    __block char **items = NULL;
+    __block size_t count = 0;
+    dispatch_block_t operation = ^{
+        @autoreleasepool {
+            NSPasteboard *board = viva_pasteboard_named(pasteboard);
+            NSArray *urls = [board readObjectsForClasses:@[NSURL.class]
+                                                 options:@{NSPasteboardURLReadingFileURLsOnlyKey: @YES}];
+            NSUInteger wanted = MIN(urls.count, (NSUInteger)max);
+            if (wanted == 0) {
+                return;
+            }
+            items = calloc(wanted, sizeof(char *));
+            if (items == NULL) {
+                status = -1;
+                return;
+            }
+            for (NSURL *url in urls) {
+                if (count == wanted) {
+                    break;
+                }
+                // A file reference URL (file:///.file/id=...) names the file by
+                // identity; its file path URL is the path the file has now.
+                NSURL *located = url.isFileReferenceURL ? url.filePathURL : url;
+                NSString *path = located.path;
+                char *copy = path.length > 0 ? viva_copy_utf8(path) : NULL;
+                if (copy != NULL) {
+                    items[count++] = copy;
+                }
+            }
+            if (count > 0) {
+                status = 0;
+            }
+        }
+    };
+    if (pasteboard == NULL) {
+        viva_on_main_sync(operation);
+    } else {
+        operation();
+    }
+    if (status == 0) {
+        paths->items = items;
+        paths->count = count;
+        return 0;
+    }
+    viva_system_string_array partial = {items, count};
+    viva_system_free_string_array(partial);
+    if (status != 1) {
+        viva_set_error(error_message, @"failed to allocate clipboard files");
+    }
+    return status;
+}
+
+int viva_system_pasteboard_put_files(const char *pasteboard, const char *const *paths, size_t count, const char *names) {
+    __block int status = -1;
+    dispatch_block_t operation = ^{
+        @autoreleasepool {
+            NSPasteboard *board = viva_pasteboard_named(pasteboard);
+            NSMutableArray<NSURL *> *urls = [NSMutableArray arrayWithCapacity:count];
+            for (size_t index = 0; index < count; index++) {
+                NSString *path = viva_string(paths[index]);
+                if (path == nil) {
+                    return;
+                }
+                [urls addObject:[NSURL fileURLWithPath:path]];
+            }
+            [board clearContents];
+            if (![board writeObjects:urls]) {
+                return;
+            }
+            if (names != NULL) {
+                NSString *text = viva_string(names);
+                if (text != nil) {
+                    [board setString:text forType:NSPasteboardTypeString];
+                }
+            }
+            status = 0;
+        }
+    };
+    if (pasteboard == NULL) {
+        viva_on_main_sync(operation);
+    } else {
+        operation();
+    }
+    return status;
+}
+
 static NSCursor *viva_cursor(uint8_t shape, NSString **error) {
     switch (shape) {
         case 0:
@@ -334,26 +570,35 @@ static NSCursor *viva_cursor(uint8_t shape, NSString **error) {
         case 6:
             return NSCursor.resizeUpDownCursor;
         case 7:
+            // An SDK older than 15 does not declare the symbols, so the
+            // compile-time check has to come before @available: the runtime
+            // check alone still needs the names to compile.
+#if defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 150000
             if (@available(macOS 15.0, *)) {
                 return [NSCursor frameResizeCursorFromPosition:NSCursorFrameResizePositionTopLeft
                                                  inDirections:NSCursorFrameResizeDirectionsAll];
             }
+#endif
             if (error != NULL) {
                 *error = @"diagonal resize cursors require macOS 15 or newer";
             }
             return nil;
         case 8:
+#if defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 150000
             if (@available(macOS 15.0, *)) {
                 return [NSCursor frameResizeCursorFromPosition:NSCursorFrameResizePositionTopRight
                                                  inDirections:NSCursorFrameResizeDirectionsAll];
             }
+#endif
             if (error != NULL) {
                 *error = @"diagonal resize cursors require macOS 15 or newer";
             }
             return nil;
         case 9:
             return NSCursor.operationNotAllowedCursor;
-        case 10: {
+        case 10:
+            return NSCursor.closedHandCursor;
+        case 11: {
             // A fully transparent cursor: a surface that draws its own pointer
             // (a remote desktop picture) uses it to keep the system pointer
             // out of the way. Its masks touch no pixel of the screen.
@@ -379,7 +624,13 @@ static NSCursor *viva_cursor(uint8_t shape, NSString **error) {
 
 // viva_apply_cursor shows cursor now and keeps it for every window, on the main thread.
 static void viva_apply_cursor(NSCursor *cursor) {
-    [cursor set];
+    // Only the frontmost window under the pointer may defer cursor control to its native content.
+    NSWindow *underPointer = viva_window_at_pointer();
+    NSView *root = underPointer.contentView;
+    BOOL native = root != nil && viva_view_has_native_cursor(root, [root convertPoint:underPointer.mouseLocationOutsideOfEventStream fromView:nil]);
+    if (!native) {
+        [cursor set];
+    }
     for (NSWindow *window in NSApp.windows) {
         NSView *view = window.contentView;
         if (view == nil) {
@@ -569,21 +820,28 @@ int viva_system_open_files(
     return 0;
 }
 
-int viva_system_save_file(
+static int viva_system_save_file_internal(
     const char *title,
     const char *suggested_name,
     const char *default_extension,
     const char *const *extensions,
     size_t extension_count,
+    const char *checkbox_label,
+    int checkbox_initial,
+    int *checkbox_checked,
     char **path,
     char **error_message
 ) {
-    if (path == NULL) {
+    if (path == NULL || (checkbox_label != NULL && checkbox_checked == NULL)) {
         viva_set_error(error_message, @"save file output is missing");
         return -1;
     }
     *path = NULL;
+    if (checkbox_checked != NULL) {
+        *checkbox_checked = 0;
+    }
     __block int status = 0;
+    __block int selected = 0;
     __block char *failure = NULL;
     __block char *result = NULL;
     viva_on_main_sync(^{
@@ -593,7 +851,8 @@ int viva_system_save_file(
             NSString *panelTitle = viva_string(title);
             NSString *name = viva_string(suggested_name);
             NSString *defaultType = viva_string(default_extension);
-            if ((extension_count > 0 && allowed == nil) || panelTitle == nil || name == nil || defaultType == nil) {
+            NSString *checkboxLabel = checkbox_label != NULL ? viva_string(checkbox_label) : nil;
+            if ((extension_count > 0 && allowed == nil) || panelTitle == nil || name == nil || defaultType == nil || (checkbox_label != NULL && checkboxLabel == nil)) {
                 failure = viva_copy_utf8(extensionError ?: @"save file options are not valid UTF-8");
                 status = -1;
                 return;
@@ -602,6 +861,15 @@ int viva_system_save_file(
                 allowed = [@[defaultType] arrayByAddingObjectsFromArray:allowed ?: @[]];
             }
             NSSavePanel *panel = [NSSavePanel savePanel];
+            NSButton *checkbox = nil;
+            if (checkboxLabel != nil) {
+                NSView *accessory = [[[NSView alloc] initWithFrame:NSMakeRect(0, 0, 400, 32)] autorelease];
+                checkbox = [NSButton checkboxWithTitle:checkboxLabel target:nil action:nil];
+                checkbox.frame = NSMakeRect(0, 0, 400, 28);
+                checkbox.state = checkbox_initial != 0 ? NSControlStateValueOn : NSControlStateValueOff;
+                [accessory addSubview:checkbox];
+                panel.accessoryView = accessory;
+            }
             if (panelTitle.length > 0) {
                 panel.title = panelTitle;
             }
@@ -636,6 +904,8 @@ int viva_system_save_file(
             if (result == NULL) {
                 failure = viva_copy_utf8(@"failed to allocate save file path");
                 status = -1;
+            } else if (checkbox != nil) {
+                selected = checkbox.state == NSControlStateValueOn ? 1 : 0;
             }
         }
     });
@@ -651,7 +921,27 @@ int viva_system_save_file(
         return status;
     }
     *path = result;
+    if (checkbox_checked != NULL) {
+        *checkbox_checked = selected;
+    }
     return 0;
+}
+
+int viva_system_save_file(
+    const char *title, const char *suggested_name, const char *default_extension,
+    const char *const *extensions, size_t extension_count, char **path, char **error_message
+) {
+    return viva_system_save_file_internal(title, suggested_name, default_extension,
+        extensions, extension_count, NULL, 0, NULL, path, error_message);
+}
+
+int viva_system_save_file_with_checkbox(
+    const char *title, const char *suggested_name, const char *default_extension,
+    const char *const *extensions, size_t extension_count, const char *checkbox_label,
+    int checkbox_initial, int *checkbox_checked, char **path, char **error_message
+) {
+    return viva_system_save_file_internal(title, suggested_name, default_extension,
+        extensions, extension_count, checkbox_label, checkbox_initial, checkbox_checked, path, error_message);
 }
 
 int viva_system_reduce_motion(void) {
@@ -770,6 +1060,33 @@ int viva_system_open_url(const char *target, char **error_message) {
             }
             if (![NSWorkspace.sharedWorkspace openURL:url]) {
                 failure = viva_copy_utf8(@"NSWorkspace could not open the external URL");
+                status = -1;
+            }
+        }
+    });
+    if (status != 0) {
+        if (error_message != NULL) {
+            *error_message = failure;
+        } else {
+            free(failure);
+        }
+    }
+    return status;
+}
+
+int viva_system_reveal_path(const char *path, char **error_message) {
+    __block int status = 0;
+    __block char *failure = NULL;
+    viva_on_main_sync(^{
+        @autoreleasepool {
+            NSString *value = viva_string(path);
+            if (value == nil) {
+                failure = viva_copy_utf8(@"file path is not valid UTF-8");
+                status = -1;
+                return;
+            }
+            if (![NSWorkspace.sharedWorkspace selectFile:value inFileViewerRootedAtPath:@""]) {
+                failure = viva_copy_utf8(@"Finder could not select the file");
                 status = -1;
             }
         }

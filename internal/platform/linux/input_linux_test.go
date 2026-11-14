@@ -8,11 +8,11 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/vivaui/viva/gfx"
 	"github.com/vivaui/viva/internal/input"
 	"github.com/vivaui/viva/internal/platform"
 	"github.com/vivaui/viva/internal/render"
 	"github.com/vivaui/viva/internal/scene"
-	"github.com/vivaui/viva/ui"
 )
 
 func TestNormalizedKeysym(t *testing.T) {
@@ -94,14 +94,14 @@ func TestXCBModifiers(t *testing.T) {
 func TestXCBPointerButtons(t *testing.T) {
 	for _, testCase := range []struct {
 		button uint8
-		want   ui.PointerButton
+		want   gfx.PointerButton
 	}{
-		{xcbButtonLeft, ui.PointerButtonPrimary},
-		{xcbButtonRight, ui.PointerButtonSecondary},
-		{xcbButtonMiddle, ui.PointerButtonMiddle},
-		{xcbButtonBack, ui.PointerButtonBack},
-		{xcbButtonForward, ui.PointerButtonForward},
-		{xcbButtonScrollUp, ui.PointerButtonNone},
+		{xcbButtonLeft, gfx.PointerButtonPrimary},
+		{xcbButtonRight, gfx.PointerButtonSecondary},
+		{xcbButtonMiddle, gfx.PointerButtonMiddle},
+		{xcbButtonBack, gfx.PointerButtonBack},
+		{xcbButtonForward, gfx.PointerButtonForward},
+		{xcbButtonScrollUp, gfx.PointerButtonNone},
 	} {
 		if got := xcbPointerButton(testCase.button); got != testCase.want {
 			t.Fatalf("button %d = %d, want %d", testCase.button, got, testCase.want)
@@ -170,7 +170,7 @@ func TestEventRouterRoutesNativeInputAndFrames(t *testing.T) {
 	if handled, err := router.scroll(&native); err != nil || !handled {
 		t.Fatalf("scroll handled=%v err=%v", handled, err)
 	}
-	if len(pointers) != 2 || pointers[0] != (platform.PointerEvent{Kind: platform.PointerDown, Button: ui.PointerButtonPrimary, Modifiers: input.ModifierShift, X: 17, Y: 23, ClickCount: 1}) || pointers[1].Kind != platform.PointerExit {
+	if len(pointers) != 2 || pointers[0] != (platform.PointerEvent{Kind: platform.PointerDown, Button: gfx.PointerButtonPrimary, Modifiers: input.ModifierShift, X: 17, Y: 23, ClickCount: 1}) || pointers[1].Kind != platform.PointerExit {
 		t.Fatalf("pointer events = %+v", pointers)
 	}
 	if len(keys) != 1 || keys[0] != (platform.KeyEvent{Key: input.KeyTab, Modifiers: input.ModifierShift, Repeat: true}) {
@@ -814,5 +814,45 @@ func TestModifierBitLayoutLevels(t *testing.T) {
 	}
 	if got := modifierBit(keysymAltR, input.KeyAltRight); got != input.ModifierAlt {
 		t.Fatalf("modifierBit(keysymAltR) = %#x, want Alt", got)
+	}
+}
+
+// An application that listens for a modifier pressed on its own hears the
+// press and release of modifiers only, with the code that pairs them; a letter
+// stays with the text system as it does without the option.
+func TestX11ModifierTapsDeliverOnlyModifiers(t *testing.T) {
+	for _, listens := range []bool{false, true} {
+		var keys []platform.KeyEvent
+		router := eventRouter{
+			config: platform.Config{ModifierTaps: listens, OnKey: func(event platform.KeyEvent) (platform.Frame, error) {
+				keys = append(keys, event)
+				return platform.Frame{}, nil
+			}},
+			present:      func(platform.Frame) error { return nil },
+			modifierKeys: newModifierTracker(),
+		}
+		keymap := xcbKeymap{first: 9, last: 10, perKeycode: 2, keysyms: []uint32{'a', 'A', keysymShiftL, 0}}
+		shift := xcbInputEvent{Detail: 10}
+		if err := router.key(&keymap, &shift, false); err != nil {
+			t.Fatal(err)
+		}
+		shift.State = xcbModShift
+		if err := router.release(&keymap, &shift); err != nil {
+			t.Fatal(err)
+		}
+		letter := xcbInputEvent{Detail: 9}
+		if err := router.release(&keymap, &letter); err != nil {
+			t.Fatal(err)
+		}
+		var want []platform.KeyEvent
+		if listens {
+			want = []platform.KeyEvent{
+				{Key: input.KeyShiftLeft, Modifiers: input.ModifierShift, Code: 10},
+				{Key: input.KeyShiftLeft, Release: true, Code: 10},
+			}
+		}
+		if !reflect.DeepEqual(keys, want) {
+			t.Fatalf("listens=%v: keys =\n%+v\nwant\n%+v", listens, keys, want)
+		}
 	}
 }

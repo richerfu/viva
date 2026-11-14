@@ -3,12 +3,17 @@
 package darwin
 
 import (
+	"bytes"
+	"fmt"
+	"strings"
 	"testing"
+	"unicode/utf8"
 
+	"github.com/vivaui/viva/gfx"
 	"github.com/vivaui/viva/internal/platform"
 	"github.com/vivaui/viva/internal/render"
 	"github.com/vivaui/viva/internal/scene"
-	"github.com/vivaui/viva/ui"
+	"github.com/vivaui/viva/text"
 )
 
 func pixelAt(pixels []byte, width, x, y int) (blue, green, red, alpha byte) {
@@ -185,6 +190,138 @@ func TestOffscreenRendersRectanglesLabelsAndTheEditorWithoutAWindow(t *testing.T
 	}
 }
 
+func TestOffscreenEditorAlignsFittedGlyphsAndMarkedText(t *testing.T) {
+	offscreen, err := NewOffscreen(300, 80, 1, Color{Alpha: 1})
+	if err != nil {
+		t.Skipf("no Metal device: %v", err)
+	}
+	defer offscreen.Close()
+	input := &TextInput{
+		X: 20, Y: 20, Width: 240, Height: 40, FontSize: 20,
+		Color:   platform.Color{Red: 1, Green: 1, Blue: 1, Alpha: 1},
+		State:   TextState{Value: "列A"},
+		OnEvent: func(TextEvent) (TextState, error) { return TextState{}, nil },
+	}
+	firstGlyph := func(alignment gfx.Alignment, marked bool) int {
+		t.Helper()
+		input.Alignment = alignment
+		input.State.Composing = marked
+		if marked {
+			input.State.Composition = text.Range{Start: 0, End: 2}
+		}
+		if err := offscreen.Set(nil, nil, input); err != nil {
+			t.Fatal(err)
+		}
+		pixels, width, _, err := offscreen.Render()
+		if err != nil {
+			t.Fatal(err)
+		}
+		for x := 20; x < 260; x++ {
+			for y := 20; y < 60; y++ {
+				if _, green, red, _ := pixelAt(pixels, width, x, y); red > 160 && green > 160 {
+					return x
+				}
+			}
+		}
+		t.Fatal("native editor drew no glyphs")
+		return 0
+	}
+	left, center, right := firstGlyph(gfx.AlignLeft, false), firstGlyph(gfx.AlignCenter, false), firstGlyph(gfx.AlignRight, false)
+	if center-left < 50 || right-center < 50 || right >= 260 {
+		t.Fatalf("aligned glyph origins: left=%d center=%d right=%d", left, center, right)
+	}
+	if marked := firstGlyph(gfx.AlignRight, true); marked != right {
+		t.Errorf("marked text origin = %d, want %d", marked, right)
+	}
+}
+
+func TestOffscreenEditorAlignmentPreservesDefaultTerminalAndOverlongPixels(t *testing.T) {
+	offscreen, err := NewOffscreen(300, 80, 1, Color{Alpha: 1})
+	if err != nil {
+		t.Skipf("no Metal device: %v", err)
+	}
+	defer offscreen.Close()
+	input := &TextInput{
+		X: 20, Y: 20, Width: 240, Height: 40, FontSize: 20,
+		Color:   platform.Color{Red: 1, Green: 1, Blue: 1, Alpha: 1},
+		State:   TextState{Value: "列A"},
+		OnEvent: func(TextEvent) (TextState, error) { return TextState{}, nil },
+	}
+	render := func(value string, terminal bool, alignment gfx.Alignment) []byte {
+		t.Helper()
+		input.State.Value, input.Terminal, input.Alignment = value, terminal, alignment
+		if err := offscreen.Set(nil, nil, input); err != nil {
+			t.Fatal(err)
+		}
+		pixels, _, _, err := offscreen.Render()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return pixels
+	}
+	if left, explicit := render("列A", false, 0), render("列A", false, gfx.AlignLeft); !bytes.Equal(left, explicit) {
+		t.Fatal("explicit left alignment changed default pixels")
+	}
+	if left, right := render("列A", true, gfx.AlignLeft), render("列A", true, gfx.AlignRight); !bytes.Equal(left, right) {
+		t.Fatal("alignment changed terminal preedit pixels")
+	}
+	long := strings.Repeat("m", 80)
+	if left, right := render(long, false, gfx.AlignLeft), render(long, false, gfx.AlignRight); !bytes.Equal(left, right) {
+		t.Fatal("alignment moved an overlong line instead of preserving its clipped behavior")
+	}
+	input.Secure = true
+	if first, second := render("secret", false, gfx.AlignRight), render("foobar", false, gfx.AlignRight); !bytes.Equal(first, second) {
+		t.Fatal("aligned secure input exposed or measured its raw characters")
+	}
+}
+
+func TestOffscreenRightAlignedEndCaretRemainsVisible(t *testing.T) {
+	for _, scale := range []float64{1, 2} {
+		for _, value := range []string{"", "abc", "A中B"} {
+			t.Run(fmt.Sprintf("%gx/%q", scale, value), func(t *testing.T) {
+				offscreen, err := NewOffscreen(180, 80, scale, Color{Alpha: 1})
+				if err != nil {
+					t.Skipf("no Metal device: %v", err)
+				}
+				defer offscreen.Close()
+				input := &TextInput{
+					X: 20, Y: 20, Width: 120, Height: 32, FontSize: 18, Alignment: gfx.AlignRight,
+					Color:   platform.Color{Red: 1, Green: 1, Blue: 1, Alpha: 1},
+					State:   TextState{Value: value, Selection: text.Range{Start: utf8.RuneCountInString(value), End: utf8.RuneCountInString(value)}},
+					OnEvent: func(TextEvent) (TextState, error) { return TextState{}, nil },
+				}
+				if err := offscreen.Set(nil, nil, input); err != nil {
+					t.Fatal(err)
+				}
+				visible, width, _, err := offscreen.Render()
+				if err != nil {
+					t.Fatal(err)
+				}
+				input.HideNativeOverlays = true
+				if err := offscreen.Set(nil, nil, input); err != nil {
+					t.Fatal(err)
+				}
+				hidden, _, _, err := offscreen.Render()
+				if err != nil {
+					t.Fatal(err)
+				}
+				changed := 0
+				for y := int(20 * scale); y < int(52*scale); y++ {
+					for x := int(20 * scale); x < int(140*scale); x++ {
+						index := (y*width + x) * 4
+						if !bytes.Equal(visible[index:index+4], hidden[index:index+4]) {
+							changed++
+						}
+					}
+				}
+				if changed == 0 {
+					t.Fatal("right-aligned end caret is completely clipped")
+				}
+			})
+		}
+	}
+}
+
 // gridLabels builds a 120x40 terminal screen: one fixed-pitch label per row,
 // colored in stretches of colorRun characters. With wide set, every other
 // stretch is a double-width character of its own run, as CJK text is.
@@ -193,16 +330,16 @@ func gridLabels(wide bool) []TextLabel {
 	labels := make([]TextLabel, rows)
 	for row := range labels {
 		var text []byte
-		var runs []ui.TextRun
+		var runs []gfx.TextRun
 		for column := 0; column < columns; {
-			color := ui.Color{Red: 0.9, Green: 0.9, Blue: 0.9, Alpha: 1}
+			color := gfx.Color{Red: 0.9, Green: 0.9, Blue: 0.9, Alpha: 1}
 			if (column/colorRun+row)%3 == 1 {
-				color = ui.Color{Green: 0.8, Blue: 0.3, Alpha: 1}
+				color = gfx.Color{Green: 0.8, Blue: 0.3, Alpha: 1}
 			}
 			if wide && column%24 >= 12 && column+2 <= columns {
 				piece := "世"
 				text = append(text, piece...)
-				runs = append(runs, ui.TextRun{Column: int32(column), Bytes: int32(len(piece)), Cells: 2, Color: color})
+				runs = append(runs, gfx.TextRun{Column: int32(column), Bytes: int32(len(piece)), Cells: 2, Color: color})
 				column += 2
 				continue
 			}
@@ -210,7 +347,7 @@ func gridLabels(wide bool) []TextLabel {
 			for ; column < end; column++ {
 				text = append(text, byte('a'+(column+row)%26))
 			}
-			runs = append(runs, ui.TextRun{Column: int32(end - colorRun), Bytes: int32(colorRun), Cells: int32(colorRun), Color: color})
+			runs = append(runs, gfx.TextRun{Column: int32(end - colorRun), Bytes: int32(colorRun), Cells: int32(colorRun), Color: color})
 		}
 		labels[row] = TextLabel{
 			Value: string(text), X: 0, Y: float32(row * 16), Width: 120 * 7.8, Height: 16, FontSize: 13,
@@ -278,7 +415,7 @@ func TestOffscreenScissorsAClippedLabelToItsClip(t *testing.T) {
 		t.Fatal("the unclipped label does not cover its bounds")
 	}
 
-	label.Clip, label.Clipped = ui.Rect{X: 0, Y: 0, Width: 10, Height: 6}, true
+	label.Clip, label.Clipped = gfx.Rect{X: 0, Y: 0, Width: 10, Height: 6}, true
 	got, width = render(label)
 	if !lit(got, width, 5, 5) {
 		t.Fatal("the clipped label lost the part inside its clip")
@@ -292,7 +429,7 @@ func TestOffscreenScissorsAClippedLabelToItsClip(t *testing.T) {
 
 	// A clip with no area paints nothing, and the next frame without a clip
 	// paints the whole label again: the scissor does not leak.
-	label.Clip = ui.Rect{X: 30, Y: 0, Width: 5, Height: 5}
+	label.Clip = gfx.Rect{X: 30, Y: 0, Width: 5, Height: 5}
 	got, width = render(label)
 	if lit(got, width, 5, 5) || lit(got, width, 15, 5) {
 		t.Fatal("a clip outside the target still painted")

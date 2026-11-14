@@ -6,8 +6,8 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/vivaui/viva/gfx"
 	darwinplatform "github.com/vivaui/viva/internal/platform/darwin"
-	"github.com/vivaui/viva/ui"
 )
 
 func defaultNativeClipboardText() (string, error) { return darwinplatform.ClipboardText() }
@@ -16,10 +16,14 @@ func defaultNativeHasClipboardImage() bool { return darwinplatform.HasClipboardI
 
 func defaultNativeClipboardImagePNG() ([]byte, error) { return darwinplatform.ClipboardImagePNG() }
 
+func defaultNativeClipboardFiles() ([]string, error) { return darwinplatform.ClipboardFiles() }
+
+func defaultNativeSetClipboardFiles(paths []string) error { return darwinplatform.SetClipboardFiles(paths) }
+
 func defaultNativeReduceMotion() bool { return darwinplatform.ReduceMotion() }
 
 // nativeTextEngine is the platform's text engine; nil keeps the reference metrics.
-func defaultNativeTextEngine() ui.TextEngine { return darwinplatform.SharedTextEngine() }
+func defaultNativeTextEngine() gfx.TextEngine { return darwinplatform.SharedTextEngine() }
 
 func defaultNativePreferredLanguages() []string { return darwinplatform.PreferredLanguages() }
 
@@ -35,7 +39,7 @@ func defaultNativeSetCursor(cursor Cursor) error {
 	return darwinplatform.SetCursorShape(uint8(cursor))
 }
 
-func defaultNativeSetCursorImage(image *ui.CursorImage) error {
+func defaultNativeSetCursorImage(image *gfx.CursorImage) error {
 	return darwinplatform.SetCursorImage(image)
 }
 
@@ -76,7 +80,27 @@ func defaultNativeSaveFile(options SaveFileOptions) (string, error) {
 	return path, err
 }
 
+func defaultNativeSaveFileWithCheckbox(options SaveFileOptions, checkbox SaveFileCheckbox) (SaveFileSelection, error) {
+	filters := make([]darwinplatform.FileFilter, len(options.Filters))
+	for index, filter := range options.Filters {
+		filters[index] = darwinplatform.FileFilter{Name: filter.Name, Pattern: filter.Pattern}
+	}
+	path, checked, canceled, err := darwinplatform.SaveFileWithCheckbox(darwinplatform.SaveFileOptions{
+		Title: options.Title, SuggestedName: options.SuggestedName,
+		DefaultExtension: options.DefaultExtension, Filters: filters,
+	}, checkbox.Label, checkbox.Checked)
+	if canceled {
+		return SaveFileSelection{}, ErrCanceled
+	}
+	if err != nil {
+		return SaveFileSelection{}, err
+	}
+	return SaveFileSelection{Path: path, Checked: checked}, nil
+}
+
 func defaultNativeOpenURL(target string) error { return darwinplatform.OpenURL(target) }
+
+func defaultNativeRevealPath(path string) error { return darwinplatform.RevealPath(path) }
 
 func defaultNativeOpenWith(executable, path string) error {
 	return darwinplatform.OpenWith(executable, path)

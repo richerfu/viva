@@ -44,21 +44,28 @@ func scenery(snapshot app.Snapshot) ([]render.Rectangle, []platform.TextLabel, *
 	for index, label := range snapshot.Labels {
 		labels[index] = platform.TextLabel{
 			Value: label.Value, X: label.Bounds.X, Y: label.Bounds.Y, Width: label.Bounds.Width, Height: label.Bounds.Height,
-			OriginX: label.OriginX, OriginY: label.OriginY,
-			FontSize: label.FontSize, Weight: label.Weight, Layer: label.Layer, FontGeneration: label.FontGeneration,
+			Identity: label.Identity,
+			OriginX:  label.OriginX, OriginY: label.OriginY,
+			FontSize: label.FontSize, Weight: label.Weight, Italic: label.Italic, Layer: label.Layer, ShapesBefore: label.ShapesBefore, FontGeneration: label.FontGeneration,
 			Mono: label.Mono, MonoFace: label.MonoFace, CellWidth: label.CellWidth, Runs: label.Runs,
 			Clip: label.Clip, Clipped: label.Clipped,
 			Bitmap: label.Bitmap, BitmapWidth: label.BitmapWidth, BitmapHeight: label.BitmapHeight,
 			BitmapStride: label.BitmapStride, BitmapID: label.BitmapID, BitmapVersion: label.BitmapVersion,
 			BitmapUpload: len(label.Bitmap) > 0,
-			Color:        platform.Color{Red: float64(label.Color.Red), Green: float64(label.Color.Green), Blue: float64(label.Color.Blue), Alpha: float64(label.Color.Alpha)},
+			Quad:         label.Quad, HasQuad: label.HasQuad,
+			Color: platform.Color{Red: float64(label.Color.Red), Green: float64(label.Color.Green), Blue: float64(label.Color.Blue), Alpha: float64(label.Color.Alpha)},
+		}
+		for corner, tint := range label.Tint {
+			labels[index].Tint[corner] = platform.Color{
+				Red: float64(tint.Red), Green: float64(tint.Green), Blue: float64(tint.Blue), Alpha: float64(tint.Alpha),
+			}
 		}
 	}
 	var input *platform.TextInput
 	if editor := snapshot.Editor; editor != nil {
 		input = &platform.TextInput{
 			X: editor.Bounds.X, Y: editor.Bounds.Y, Width: editor.Bounds.Width, Height: editor.Bounds.Height,
-			FontSize: editor.FontSize, Layer: editor.Layer, Multiline: editor.Multiline, Secure: editor.Secure,
+			FontSize: editor.FontSize, Weight: editor.Weight, Alignment: editor.Alignment, Layer: editor.Layer, Multiline: editor.Multiline, Secure: editor.Secure,
 			Terminal:           editor.Terminal,
 			HideNativeOverlays: editor.HideNativeOverlays,
 			MonoFace:           editor.MonoFace,

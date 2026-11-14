@@ -5,21 +5,45 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/vivaui/viva/gfx"
 	"github.com/vivaui/viva/internal/platform"
 	"github.com/vivaui/viva/text"
-	"github.com/vivaui/viva/ui"
 )
 
 // TextInputContext describes the focused editable Canvas text-field hit.
 type TextInputContext struct {
-	ID        ui.ID
-	Bounds    ui.Rect
-	Multiline bool
-	// TextBounds, FontSize and TextColor are the text geometry the component
-	// declared; they fill whatever the returned input leaves unset.
-	TextBounds ui.Rect
-	FontSize   float32
-	TextColor  ui.Color
+	ID     gfx.ID
+	Bounds gfx.Rect
+	// Layer is the compositing layer captured by the focused hit.
+	Layer          uint16
+	Multiline      bool
+	ReadOnly       bool
+	Secure         bool
+	NavigationKeys bool
+	// Terminal reports a RoleTerminal hit. Plain keys reach the application as
+	// text events and the rest as raw key events, as they do natively.
+	Terminal bool
+	// TypeAhead reports a hit that takes typed text without being a text field.
+	TypeAhead bool
+	// TextBounds, FontSize, FontWeight, TextColor and Alignment are the text
+	// geometry the component declared; they fill what the input leaves unset.
+	TextBounds         gfx.Rect
+	FontSize           float32
+	FontWeight         float32
+	TextColor          gfx.Color
+	Alignment          gfx.Alignment
+	HideNativeOverlays bool
+}
+
+func textAlignCSS(alignment gfx.Alignment) string {
+	switch alignment {
+	case gfx.AlignCenter:
+		return "center"
+	case gfx.AlignRight:
+		return "right"
+	default:
+		return "left"
+	}
 }
 
 // TextInputProvider resolves one focused editable hit into an application-owned
@@ -35,7 +59,7 @@ type TextInputProvider func(TextInputContext) *platform.TextInput
 //
 // The provider keeps one TextInput and reuses it, so resolving the focused hit
 // on every repaint allocates nothing beyond the editor's own snapshot.
-func EditorInputs(lookup func(id ui.ID) (*text.Editor, bool)) TextInputProvider {
+func EditorInputs(lookup func(id gfx.ID) (*text.Editor, bool)) TextInputProvider {
 	var editor *text.Editor
 	input := platform.TextInput{
 		OnEvent: func(event platform.TextEvent) (platform.TextState, error) {
@@ -62,6 +86,18 @@ type TextInput = platform.TextInput
 type TextState = platform.TextState
 type TextEvent = platform.TextEvent
 type TextEventKind = platform.TextEventKind
+
+func browserCopyCut(input platform.TextInput, action byte) (string, platform.TextEvent, bool) {
+	if !input.CopyOverride {
+		return "", platform.TextEvent{}, false
+	}
+	var copied string
+	edit, _, _ := platform.TextClipboardEvent(input.ClipboardState(action), input.Secure, action, nil, func(value string) error {
+		copied = value
+		return nil
+	})
+	return copied, edit, true
+}
 
 const (
 	TextInsert       = platform.TextInsert

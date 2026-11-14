@@ -27,8 +27,10 @@ func commands() []command {
 			detail: "Builds with -trimpath and a stripped, reproducible link, and reports the size. Settings come from\n" +
 				"viva.toml when there is one; the package argument overrides [app] package (or [web] package for\n" +
 				"--target web, which also writes the loader and an index.html). macOS builds are compiled for\n" +
-				"[mac] min_system, not for the macOS of the machine building them. Windows release builds use\n" +
-				"the GUI subsystem; with --debug they keep the console.",
+				"[mac] min_system, not for the macOS of the machine building them, and reach Cocoa through cgo;\n" +
+				"Linux and Windows builds use no cgo, so their programs do not depend on the C library of the\n" +
+				"machine that built them and a package built on a newer distribution still starts on an older one.\n" +
+				"Windows release builds use the GUI subsystem; with --debug they keep the console.",
 			run: func(arguments []string, output, errorOutput io.Writer) error {
 				return runBuild(arguments, output, errorOutput)
 			}},
@@ -50,7 +52,7 @@ func commands() []command {
 				"and the Homebrew build on Apple Silicon crashes, so build it on Linux or Windows), --target linux a\n" +
 				"tar.gz with an install script or a .deb (tar.gz, deb). --program packages an executable you built\n" +
 				"(or signed) yourself instead of building one. [app] url_schemes and [[app.file_types]] (name, extensions,\n" +
-				"optional mime) register the links and documents the program opens with every format; on Windows and\n" +
+				"optional mime and macOS uti) register the links and documents the program opens with every format; on Windows and\n" +
 				"Linux they arrive as arguments of a new process (app/singleinstance hands them to the running copy).\n" +
 				"macOS signing and notarization are optional and off unless an identity is given: --sign-identity or\n" +
 				"$APPLE_SIGNING_IDENTITY (\"-\" signs ad hoc, for this Mac only), $APPLE_CERTIFICATE and\n" +
@@ -62,13 +64,36 @@ func commands() []command {
 				"Windows), timestamped by $WINDOWS_TIMESTAMP_URL; --sign-command or $WINDOWS_SIGN_COMMAND names a command\n" +
 				"that signs {file} in place, for keys in a token or a signing service. A program given with --program\n" +
 				"is used as it is. --no-sign skips all signing. Unsigned, macOS blocks a downloaded bundle and Windows\n" +
-				"SmartScreen warns about the installer; Linux packages are not signed.",
+				"SmartScreen warns about the installer; Linux packages are not signed. On Windows, --file SRC=DEST\n" +
+				"(repeatable) ships SRC beside the program at the relative DEST, in both the installer and the zip.",
 			run: func(arguments []string, output, errorOutput io.Writer) error {
 				return runPackage(arguments, output, errorOutput)
 			}},
+		{name: "feed", usage: "feed [flags]",
+			summary: "Generate and sign the update feed for packaged archives.",
+			detail: "Scans the archives viva package wrote ([build] out, or -dir), names each one by the platform,\n" +
+				"architecture and format in its file name, and writes latest.json with its detached Ed25519\n" +
+				"signature. The feed lists only files named the way viva package names them; anything else in\n" +
+				"the directory is ignored. -base-url is where the archives are served from and must be HTTPS,\n" +
+				"as -notes must be when given. The signing key is -key, or $VIVA_UPDATE_KEY: the base64 64-byte\n" +
+				"private key 'viva update-keygen' writes. App, version and archive directory default to viva.toml.\n" +
+				"--patch-from os/arch=version=archive (repeatable) writes a delta update from that earlier\n" +
+				"release beside the archives and lists it on the asset; it works for darwin, linux and windows.",
+			run: func(arguments []string, output, errorOutput io.Writer) error {
+				return runFeed(arguments, output, errorOutput)
+			}},
+		{name: "update-keygen", usage: "update-keygen [flags]",
+			summary: "Generate the Ed25519 key pair that signs update feeds.",
+			detail: "Writes the private key as base64 of its 64 bytes to -private (update.key by default) and prints\n" +
+				"the public key as base64 of its 32 bytes, ready for the application's configuration or a\n" +
+				"go:embed file. -public also writes the public key to a file. A key file that already exists is\n" +
+				"left alone unless -force is given. The private key is never printed.",
+			run: func(arguments []string, output, errorOutput io.Writer) error {
+				return runUpdateKeygen(arguments, output, errorOutput)
+			}},
 		{name: "init", usage: "init [flags] <directory>",
 			summary: "Create a runnable project with a test and a guide for writing its UI.",
-			detail: "Writes main.go (a window laid out with github.com/vivaui/viva/flex), main_test.go (drives it without a window), viva.toml,\n" +
+			detail: "Writes main.go (a window laid out with github.com/vivaui/viva/ui), main_test.go (drives it without a window), viva.toml,\n" +
 				"go.mod and AGENTS.md, the short guide to the layout, identities, clicks and tests, which a coding\n" +
 				"assistant reads before it changes the UI. The project builds against the Viva source it finds above the\n" +
 				"working directory, or the one named by -viva.",
@@ -92,8 +117,28 @@ func commands() []command {
 			run:     func(arguments []string, output, _ io.Writer) error { return runList(arguments, output) }},
 		{name: "icons", usage: "icons [-o file] [-pkg name] [-license file] <svg files or directories>",
 			summary: "Compile SVG icons into Go source.",
-			detail:  "Produces ui.Icon values, so no SVG parser ships in the application.",
+			detail:  "Produces gfx.Icon values, so no SVG parser ships in the application.",
 			run:     func(arguments []string, output, _ io.Writer) error { return runIcons(arguments, output) }},
+		{name: "vet", usage: "vet [-C dir] [packages]",
+			summary: "Find the mistakes in a page that compile but do the wrong thing.",
+			detail: "Reports a Button with the same label in every row of a loop whose rows have no Key (a click can move\n" +
+				"to the wrong row), a ui.C, Box or Frame kept past the paint it belongs to or given to a goroutine, and a\n" +
+				"ui.Memo whose value does not cover a field its function reads. Run it with go vet; a line, or the line\n" +
+				"above it, with \"viva:ignore <check>\" silences one. The exit status is non-zero when it finds something.\n" +
+				"Packages default to ./...",
+			run: func(arguments []string, output, errorOutput io.Writer) error {
+				return runVet(arguments, output, errorOutput)
+			}},
+		{name: "form", usage: "form [-C dir] [-type T,...]",
+			summary: "Write a Form method declaring a control for each field of a struct tagged form.",
+			detail: "Writes viva_form.go in the package's directory: func (v *T) Form(c ui.C) ui.Box, a column with a\n" +
+				"Switch for a bool (form:\"Label,checkbox\" for a Checkbox), a TextField for a ui.Field (placeholder:\"...\"),\n" +
+				"a Slider for a ui.SliderState, and a Choice for a field with choices:\"options\" or choices:\"options,nameFunc\"\n" +
+				"naming a package-level slice and a func(T) string (form:\"Label,select\" for a Select). Fields without a form\n" +
+				"tag, or with form:\"-\", get nothing. Run it from go:generate: //go:generate go tool viva form",
+			run: func(arguments []string, output, errorOutput io.Writer) error {
+				return runForm(arguments, output, errorOutput)
+			}},
 		{name: "doctor", usage: "doctor [-C dir]",
 			summary: "Check that this machine and project can build with viva.",
 			detail: "Reports the Go toolchain, the platform libraries Viva loads (Xcode tools on macOS, XCB and Vulkan on\n" +
@@ -125,8 +170,13 @@ func printOverview(output io.Writer) {
 	fmt.Fprintln(output, "usage: viva <command> [arguments]")
 	fmt.Fprintln(output)
 	fmt.Fprintln(output, "commands:")
-	for _, c := range commands() {
-		fmt.Fprintf(output, "  %-8s %s\n", c.name, c.summary)
+	list := commands()
+	width := 8
+	for _, c := range list {
+		width = max(width, len(c.name))
+	}
+	for _, c := range list {
+		fmt.Fprintf(output, "  %-*s %s\n", width, c.name, c.summary)
 	}
 	fmt.Fprintln(output)
 	fmt.Fprintln(output, "Run 'viva help <command>' for a command's usage and flags.")

@@ -6,9 +6,9 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/vivaui/viva/gfx"
 	"github.com/vivaui/viva/internal/input"
 	"github.com/vivaui/viva/internal/platform"
-	"github.com/vivaui/viva/ui"
 )
 
 const xcbWheelStep = 48
@@ -160,6 +160,12 @@ func (router eventRouter) wantsKeyReleases() bool {
 	return router.text != nil && router.text.enabled && router.text.input.Terminal && router.text.input.KeyReleases
 }
 
+// wantsModifierTap reports whether the application listens for a modifier
+// pressed on its own (platform.Config.ModifierTaps) and key is one.
+func (router eventRouter) wantsModifierTap(key input.Key) bool {
+	return router.config.ModifierTaps && router.config.OnKey != nil && key.IsModifier()
+}
+
 func (router eventRouter) pointer(kind platform.PointerEventKind, event *xcbInputEvent) error {
 	button := xcbPointerButton(event.Detail)
 	scale := router.displayScale()
@@ -231,8 +237,18 @@ func (router eventRouter) key(keymap *xcbKeymap, event *xcbInputEvent, repeat bo
 	if handled, err := router.modifierPress(keyEvent, keysym, uint32(event.Detail)); handled {
 		return err
 	}
-	if router.config.OnShortcut != nil && platform.ShortcutCandidate(keyEvent) && !router.text.ownsChord(keyEvent) {
-		frame, handled, err := router.config.OnShortcut(keyEvent)
+	shortcutEvent := keyEvent
+	if router.config.OnShortcut != nil && key == input.KeyUnknown {
+		shortcutEvent.Text = keymap.shortcutText(event.Detail, event.State)
+	}
+	if shortcutEvent.Key == input.KeySpace {
+		shortcutEvent.Key, shortcutEvent.Text = input.KeyUnknown, " "
+	}
+	if shortcutEvent.Modifiers&(input.ModifierControl|input.ModifierMeta) != 0 &&
+		router.config.OnShortcut != nil && platform.ShortcutCandidate(shortcutEvent) &&
+		event.State&(keymap.level3Mask()|keymap.masks.modeSwitch) == 0 &&
+		!(router.text != nil && router.text.state.Composing) && !router.text.ownsChord(keyEvent) {
+		frame, handled, err := router.config.OnShortcut(shortcutEvent)
 		if err := router.presentFrame(frame, err); err != nil {
 			return err
 		}
@@ -242,10 +258,15 @@ func (router eventRouter) key(keymap *xcbKeymap, event *xcbInputEvent, repeat bo
 	}
 	// An input method gets the key first, and answers later; a key it does not
 	// take comes back through deliverKey, in the order it was typed.
-	if router.ime != nil && router.ime.processKey(keysym, event, keyEvent) {
+	// Preserve the layout's shortcut identity across an asynchronous IME reply,
+	// while keeping AltGr and Mode_switch entirely on the text path.
+	if event.State&(keymap.level3Mask()|keymap.masks.modeSwitch) != 0 {
+		shortcutEvent = platform.KeyEvent{}
+	}
+	if router.ime != nil && router.ime.processKeyWithShortcut(keysym, event, keyEvent, shortcutEvent) {
 		return nil
 	}
-	return router.deliverTyped(keyEvent, keysym)
+	return router.deliverTypedWithShortcut(keyEvent, keysym, shortcutEvent)
 }
 
 // modifierPress handles a modifier press: a terminal that asked for
@@ -257,6 +278,15 @@ func (router eventRouter) modifierPress(keyEvent platform.KeyEvent, keysym, scan
 		return false, nil
 	}
 	if !router.wantsKeyReleases() {
+		if router.wantsModifierTap(keyEvent.Key) {
+			// The input method has had the key; the runtime is told as well so it can
+			// tell a modifier pressed on its own.
+			keyEvent.Code, keyEvent.Text, keyEvent.Typed = scancode, "", ""
+			if bit := modifierBit(keysym, keyEvent.Key); bit != 0 {
+				keyEvent.Modifiers |= bit
+			}
+			return true, router.deliverReleaseToApplication(keyEvent)
+		}
 		return true, nil
 	}
 	// AltGr and Mode_switch are not Alt: delivering them with Alt set would
@@ -303,11 +333,18 @@ func (router eventRouter) deliverRelease(keyEvent platform.KeyEvent) error {
 // the Compose key, which turn a sequence of keys into one character, and then
 // delivers it. A key that is part of a sequence delivers nothing itself.
 func (router eventRouter) deliverTyped(keyEvent platform.KeyEvent, keysym uint32) error {
+	return router.deliverTypedWithShortcut(keyEvent, keysym, keyEvent)
+}
+
+func (router eventRouter) deliverTypedWithShortcut(keyEvent platform.KeyEvent, keysym uint32, shortcut platform.KeyEvent) error {
+	composing := router.text != nil && router.text.state.Composing
+	composedText := router.text != nil && router.text.compose.pending()
 	if router.text != nil {
 		compose := &router.text.compose
 		if keyEvent.Modifiers&(input.ModifierControl|input.ModifierAlt|input.ModifierMeta) != 0 {
 			compose.reset()
 		} else if composed, handled := compose.feed(keysym); handled {
+			composedText = true
 			if composed == "" {
 				return nil
 			}
@@ -315,6 +352,21 @@ func (router eventRouter) deliverTyped(keyEvent platform.KeyEvent, keysym uint32
 			if keyEvent.Typed != "" || keyEvent.Code != 0 {
 				keyEvent.Typed = composed
 			}
+		}
+	}
+	// This path runs only after the input method declines the key. A character
+	// produced by Compose/dead keys remains text even if it is one bound key.
+	if shortcut.Key == input.KeySpace {
+		shortcut.Key, shortcut.Text = input.KeyUnknown, " "
+	}
+	if !composing && !composedText && shortcut.Modifiers&(input.ModifierControl|input.ModifierMeta) == 0 &&
+		router.config.OnShortcut != nil && platform.ShortcutCandidate(shortcut) && !router.text.ownsChord(keyEvent) {
+		frame, handled, err := router.config.OnShortcut(shortcut)
+		if err := router.presentFrame(frame, err); err != nil {
+			return err
+		}
+		if handled {
+			return nil
 		}
 	}
 	return router.deliverKey(keyEvent)
@@ -329,7 +381,7 @@ func (router eventRouter) release(keymap *xcbKeymap, event *xcbInputEvent) error
 	// that is ISO_Level3_Shift, which is not Alt.
 	keysym := keymap.keysym(event.Detail, event.State&^keymap.level3Mask())
 	modifiers := router.releaseModifiers(xcbModifiers(event.State), key, keysym, uint32(event.Detail))
-	if !router.wantsKeyReleases() || router.config.OnKey == nil {
+	if !router.wantsKeyReleases() && !router.wantsModifierTap(key) || router.config.OnKey == nil {
 		return nil
 	}
 	return router.deliverReleaseToApplication(platform.KeyEvent{Key: key, Modifiers: modifiers, Release: true, Code: uint32(event.Detail)})
@@ -360,20 +412,20 @@ func (router eventRouter) deliverReleaseToApplication(keyEvent platform.KeyEvent
 	return router.presentFrame(frame, err)
 }
 
-func xcbPointerButton(button uint8) ui.PointerButton {
+func xcbPointerButton(button uint8) gfx.PointerButton {
 	switch button {
 	case xcbButtonLeft:
-		return ui.PointerButtonPrimary
+		return gfx.PointerButtonPrimary
 	case xcbButtonRight:
-		return ui.PointerButtonSecondary
+		return gfx.PointerButtonSecondary
 	case xcbButtonMiddle:
-		return ui.PointerButtonMiddle
+		return gfx.PointerButtonMiddle
 	case xcbButtonBack:
-		return ui.PointerButtonBack
+		return gfx.PointerButtonBack
 	case xcbButtonForward:
-		return ui.PointerButtonForward
+		return gfx.PointerButtonForward
 	default:
-		return ui.PointerButtonNone
+		return gfx.PointerButtonNone
 	}
 }
 

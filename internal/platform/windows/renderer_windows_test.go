@@ -4,6 +4,7 @@ import (
 	"testing"
 	"unsafe"
 
+	"github.com/vivaui/viva/gfx"
 	"github.com/vivaui/viva/internal/platform"
 	"github.com/vivaui/viva/internal/render"
 	"github.com/vivaui/viva/internal/scene"
@@ -158,7 +159,8 @@ func TestGroupTextLayersStable(t *testing.T) {
 		{label: platform.TextLabel{Value: "layer one", Layer: 1}},
 		{label: platform.TextLabel{Value: "second layer zero", Layer: 0}},
 	}
-	got := groupTextLayers(labels, nil)
+	frame := []int{0, 1, 2, 3, 4}
+	got := groupTextLayers(labels, frame, nil)
 	want := []int{1, 4, 3, 0, 2}
 	for index := range want {
 		if got[index] != want[index] {
@@ -169,22 +171,24 @@ func TestGroupTextLayersStable(t *testing.T) {
 
 func TestGroupCompositingLayersInterleavesByLayer(t *testing.T) {
 	rectangles := render.GroupBatches(nil, layered(2, 0, 1, 0))
+	// Labels arrive in paint order, saying how many shapes came before each:
+	// one after the first shape, two after the second, two after the third.
 	labels := []labelTexture{
-		{label: platform.TextLabel{Value: "layer one", Layer: 1}},
-		{label: platform.TextLabel{Value: "first layer zero", Layer: 0}},
-		{label: platform.TextLabel{Value: "layer two", Layer: 2}},
-		{label: platform.TextLabel{Value: "second layer zero", Layer: 0}},
+		{label: platform.TextLabel{Value: "layer one", Layer: 1, ShapesBefore: 1}},
+		{label: platform.TextLabel{Value: "first layer zero", Layer: 0, ShapesBefore: 2}},
+		{label: platform.TextLabel{Value: "layer two", Layer: 2, ShapesBefore: 3}},
+		{label: platform.TextLabel{Value: "second layer zero", Layer: 0, ShapesBefore: 3}},
 	}
-	order := groupTextLayers(labels, nil)
+	order := groupTextLayers(labels, []int{0, 1, 2, 3}, nil)
 	got := groupCompositingLayers(rectangles, labels, order, nil)
 	want := []compositingBatch{
 		{Kind: compositeRectangles, Layer: 0, First: 1, Count: 1},
-		{Kind: compositeRectangles, Layer: 0, First: 3, Count: 1},
 		{Kind: compositeText, Layer: 0, First: 0, Count: 2},
-		{Kind: compositeRectangles, Layer: 1, First: 2, Count: 1},
+		{Kind: compositeRectangles, Layer: 0, First: 3, Count: 1},
 		{Kind: compositeText, Layer: 1, First: 2, Count: 1},
-		{Kind: compositeRectangles, Layer: 2, First: 0, Count: 1},
+		{Kind: compositeRectangles, Layer: 1, First: 2, Count: 1},
 		{Kind: compositeText, Layer: 2, First: 3, Count: 1},
+		{Kind: compositeRectangles, Layer: 2, First: 0, Count: 1},
 	}
 	if len(got) != len(want) {
 		t.Fatalf("got %d batches, want %d: %+v", len(got), len(want), got)
@@ -196,18 +200,115 @@ func TestGroupCompositingLayersInterleavesByLayer(t *testing.T) {
 	}
 }
 
-func TestRendererTruncatesLabelState(t *testing.T) {
+func TestRendererClosesLabelsRemovedFromTheFrame(t *testing.T) {
 	renderer := renderer{labels: []labelTexture{{label: platform.TextLabel{Value: "retained"}}, {label: platform.TextLabel{Value: "removed"}}}}
 	if err := renderer.apply(platform.Frame{TextLabels: []platform.TextLabel{}}); err != nil {
 		t.Fatal(err)
 	}
-	if len(renderer.labels) != 0 {
-		t.Fatal("empty label update did not clear labels")
-	}
-	for _, label := range renderer.labels[:cap(renderer.labels)] {
+	for _, label := range renderer.labels {
 		if label.label.Value != "" {
 			t.Fatal("removed text retained by backing array")
 		}
+	}
+	if len(renderer.labelFree) != len(renderer.labels) {
+		t.Fatalf("free slots = %d, want all %d", len(renderer.labelFree), len(renderer.labels))
+	}
+}
+
+func TestRendererReusesAMovedLabelByIdentity(t *testing.T) {
+	first := platform.TextLabel{Value: "first", Width: 30, Height: 10, Identity: gfx.TextIdentity{Owner: 1, Item: 11}}
+	second := platform.TextLabel{Value: "second", Y: 10, Width: 30, Height: 10, Identity: gfx.TextIdentity{Owner: 1, Item: 12}}
+	var renderer renderer
+	if err := renderer.apply(platform.Frame{TextLabels: []platform.TextLabel{first, second}}); err != nil {
+		t.Fatal(err)
+	}
+	firstSlot, secondSlot := renderer.labelFrame[0], renderer.labelFrame[1]
+	renderer.labels[firstSlot].stale = false
+	renderer.labels[secondSlot].stale = false
+
+	// The screen scrolled: the second row is now at the top.
+	movedSecond, movedFirst := second, first
+	movedSecond.Y, movedFirst.Y = 0, 10
+	if err := renderer.apply(platform.Frame{TextLabels: []platform.TextLabel{movedSecond, movedFirst}}); err != nil {
+		t.Fatal(err)
+	}
+	if renderer.labelFrame[0] != secondSlot || renderer.labelFrame[1] != firstSlot {
+		t.Fatalf("slots after the move = %v, want %d then %d", renderer.labelFrame, secondSlot, firstSlot)
+	}
+	if renderer.labels[secondSlot].stale || renderer.labels[firstSlot].stale {
+		t.Fatal("a moved label was marked for rasterization")
+	}
+}
+
+func TestRendererDoesNotShareSlotsAcrossOwners(t *testing.T) {
+	first := platform.TextLabel{Value: "same", Width: 30, Height: 10, Identity: gfx.TextIdentity{Owner: 1, Item: 7}}
+	other := platform.TextLabel{Value: "same", Width: 30, Height: 10, Identity: gfx.TextIdentity{Owner: 2, Item: 7}}
+	var renderer renderer
+	if err := renderer.apply(platform.Frame{TextLabels: []platform.TextLabel{first}}); err != nil {
+		t.Fatal(err)
+	}
+	firstSlot := renderer.labelFrame[0]
+	renderer.labels[firstSlot].stale = false
+	if err := renderer.apply(platform.Frame{TextLabels: []platform.TextLabel{other}}); err != nil {
+		t.Fatal(err)
+	}
+	if renderer.labelFrame[0] == firstSlot {
+		t.Fatal("the same item number under another owner reused the retained slot")
+	}
+	otherSlot := renderer.labelFrame[0]
+	renderer.labels[otherSlot].stale = false
+	if err := renderer.apply(platform.Frame{TextLabels: []platform.TextLabel{other}}); err != nil {
+		t.Fatal(err)
+	}
+	if renderer.labelFrame[0] != otherSlot || renderer.labels[otherSlot].stale {
+		t.Fatal("an unchanged identity did not keep its texture")
+	}
+}
+
+func TestRendererKeepsThePositionalMatchWithoutIdentity(t *testing.T) {
+	first := platform.TextLabel{Value: "first", Width: 30, Height: 10}
+	second := platform.TextLabel{Value: "second", Y: 10, Width: 30, Height: 10}
+	var renderer renderer
+	if err := renderer.apply(platform.Frame{TextLabels: []platform.TextLabel{first, second}}); err != nil {
+		t.Fatal(err)
+	}
+	slots := append([]int(nil), renderer.labelFrame...)
+	renderer.labels[slots[0]].stale = false
+	renderer.labels[slots[1]].stale = false
+
+	// No identity means the frame index, as before: the slots stay put and the
+	// content comparison alone decides whether the textures are still valid.
+	first.Value, second.Value = "first changed", "second changed"
+	if err := renderer.apply(platform.Frame{TextLabels: []platform.TextLabel{first, second}}); err != nil {
+		t.Fatal(err)
+	}
+	if len(renderer.labelFrame) != len(slots) {
+		t.Fatalf("positional slots = %v, want %v", renderer.labelFrame, slots)
+	}
+	for index := range slots {
+		if renderer.labelFrame[index] != slots[index] {
+			t.Fatalf("positional slots = %v, want %v", renderer.labelFrame, slots)
+		}
+	}
+	if !renderer.labels[slots[0]].stale || !renderer.labels[slots[1]].stale {
+		t.Fatal("changed content at the same position was not marked stale")
+	}
+}
+
+func TestRendererRedrawsChangedContentUnderOneIdentity(t *testing.T) {
+	label := platform.TextLabel{Value: "before", Width: 30, Height: 10, Identity: gfx.TextIdentity{Owner: 1, Item: 7}}
+	var renderer renderer
+	if err := renderer.apply(platform.Frame{TextLabels: []platform.TextLabel{label}}); err != nil {
+		t.Fatal(err)
+	}
+	slot := renderer.labelFrame[0]
+	renderer.labels[slot].stale = false
+	label.Value = "after"
+	if err := renderer.apply(platform.Frame{TextLabels: []platform.TextLabel{label}}); err != nil {
+		t.Fatal(err)
+	}
+	if renderer.labelFrame[0] != slot || !renderer.labels[slot].stale {
+		t.Fatal("changed content under one identity kept the old texture")
 	}
 }
 
@@ -269,5 +370,57 @@ func TestLabelScissorFollowsTheCanvasClipAtTheTargetScale(t *testing.T) {
 	clipped.Clip.X = 300
 	if _, visible = labelScissor(clipped, 2, 400, 200); visible {
 		t.Fatal("a clip outside the target is visible")
+	}
+}
+
+// A label whose text changes keeps its texture: the next draw rewrites the
+// pixels in place when the size is unchanged. Destroying and making a texture
+// for every changed row leaves the graphics driver holding the destroyed ones.
+func TestChangedLabelKeepsItsTextureAndIsMarkedStale(t *testing.T) {
+	label := labelTexture{label: platform.TextLabel{Value: "one", Width: 50, Height: 20, FontSize: 12}, texture: 1, view: 2, scale: 2, width: 100, height: 40}
+	moved := label.label
+	moved.X = 9
+	label.update(moved)
+	if label.stale {
+		t.Fatal("moving a label marked its texture stale")
+	}
+	changed := moved
+	changed.Value = "two"
+	label.update(changed)
+	if !label.stale || label.texture != 1 || label.view != 2 || label.width != 100 {
+		t.Fatalf("a changed label has stale=%v texture=%d view=%d width=%d, want it stale with its texture kept", label.stale, label.texture, label.view, label.width)
+	}
+	// The handles above are not real objects: forget them before dropping.
+	label.texture, label.view = 0, 0
+	label.dropTexture()
+	if label.width != 0 || label.stale || label.label.Value != "two" {
+		t.Fatal("dropTexture did not reset the texture state, or lost the label")
+	}
+}
+
+// A grid line's texture covers its runs and a little more, never the whole
+// width of a mostly empty row, and never more than the label itself.
+func TestGridInkWidthStopsNearTheLastRun(t *testing.T) {
+	runs := []gfx.TextRun{{Column: 0, Cells: 5}, {Column: 5, Cells: 7}}
+	const cell, scale = 8, 2
+	ink := gridInkWidth(runs, cell, scale)
+	if ink < 12*cell*scale {
+		t.Fatalf("ink width %d does not hold the 12 cells of the runs", ink)
+	}
+	if ink >= 200*cell*scale {
+		t.Fatalf("ink width %d is as wide as an empty row", ink)
+	}
+	typed := append(append([]gfx.TextRun(nil), runs...), gfx.TextRun{Column: 12, Cells: 1})
+	if gridInkWidth(typed, cell, scale) != ink {
+		t.Fatal("one more typed character changed the texture width, so every key would make a new texture")
+	}
+	label := labelTexture{label: platform.TextLabel{Value: "x", Mono: true, Runs: runs, CellWidth: cell, Width: 100 * cell, Height: 20, FontSize: 12}}
+	skip, width, ok := label.window(scale)
+	if !ok || skip != 0 || width != ink {
+		t.Fatalf("window = %d, %d, %v, want 0, %d, true", skip, width, ok, ink)
+	}
+	label.label.Width = 4
+	if _, width, _ = label.window(scale); width > 4*scale {
+		t.Fatalf("a narrow label got a texture %d wide, wider than itself", width)
 	}
 }

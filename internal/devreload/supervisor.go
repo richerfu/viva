@@ -8,8 +8,8 @@ import (
 	"time"
 
 	"github.com/vivaui/viva/app"
+	"github.com/vivaui/viva/gfx"
 	"github.com/vivaui/viva/internal/reloadwire"
-	"github.com/vivaui/viva/ui"
 )
 
 type supervisor struct {
@@ -34,22 +34,28 @@ func newSupervisor(worker *workerProcess, request reloadwire.PaintRequest, snaps
 }
 
 func (value *supervisor) hostConfig() app.Config {
-	return app.Config{
+	config := app.Config{
 		Title: value.window.Title, Width: value.window.Width, Height: value.window.Height,
 		MinWidth: value.window.MinWidth, MinHeight: value.window.MinHeight,
 		WindowMode: app.WindowMode(value.window.WindowMode), TitlebarHeight: float32(value.window.TitlebarHeight),
-		ClearColor: app.Color{Red: value.window.ClearRed, Green: value.window.ClearGreen, Blue: value.window.ClearBlue, Alpha: value.window.ClearAlpha},
-		Paint:      value.paint, OnPointer: value.pointer,
+		TrafficLightScale: value.window.TrafficLightScale,
+		ClearColor:        app.Color{Red: value.window.ClearRed, Green: value.window.ClearGreen, Blue: value.window.ClearBlue, Alpha: value.window.ClearAlpha},
+		Paint:             value.paint, OnPointer: value.pointer,
 		OnKey: value.key, OnShortcut: value.shortcut, OnScroll: value.scroll,
 		OnCloseRequest: value.requestClose, Invalidator: &value.invalidator,
 	}
+	if value.window.HasModifierTap {
+		config.OnModifierTap = value.modifierTap
+	}
+	return config
 }
 
-func (value *supervisor) paint(canvas *ui.Canvas, size ui.Size) {
+func (value *supervisor) paint(canvas *gfx.Canvas, size gfx.Size) {
 	if id, ok := canvas.ClickTarget(); ok {
 		// The event pass of a click: the application's state lives in the worker,
 		// which runs the pass there. Nothing is drawn; the host repaints next.
-		value.click(id)
+		info, _ := canvas.ClickInfo()
+		value.click(id, info)
 		return
 	}
 	request := reloadwire.PaintRequest{
@@ -86,84 +92,100 @@ func (value *supervisor) paint(canvas *ui.Canvas, size ui.Size) {
 	if listens {
 		// The worker's paint reads clicks, so every click goes to it. The host
 		// cannot see which controls ask, so it declares that it listens.
-		canvas.Clicked(ui.ID{})
+		canvas.Clicked(gfx.ID{})
 	}
 }
 
-func (value *supervisor) click(id ui.ID) {
+func (value *supervisor) click(id gfx.ID, info gfx.ClickInfo) {
 	value.mu.Lock()
 	defer value.mu.Unlock()
 	if value.active == nil || !value.active.config.HasClick {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	err := value.active.client.Click(ctx, id)
+	err := value.active.client.Click(ctx, id, info)
 	cancel()
 	if err != nil {
 		value.reportErrorLocked(fmt.Errorf("click worker: %w", err))
 	}
 }
 
-func (value *supervisor) pointer(event ui.PointerEvent) ui.EventResult {
+func (value *supervisor) pointer(event gfx.PointerEvent) gfx.EventResult {
 	value.mu.Lock()
 	defer value.mu.Unlock()
 	if value.active == nil || !value.active.config.HasPointer {
-		return ui.EventResult{}
+		return gfx.EventResult{}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	result, err := value.active.client.Pointer(ctx, event)
 	cancel()
 	if err != nil {
 		value.reportErrorLocked(fmt.Errorf("pointer worker: %w", err))
-		return ui.EventResult{}
+		return gfx.EventResult{}
 	}
 	return result
 }
 
-func (value *supervisor) key(event ui.KeyEvent) ui.EventResult {
+func (value *supervisor) key(event gfx.KeyEvent) gfx.EventResult {
 	value.mu.Lock()
 	defer value.mu.Unlock()
 	if value.active == nil || !value.active.config.HasKey {
-		return ui.EventResult{}
+		return gfx.EventResult{}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	result, err := value.active.client.Key(ctx, event)
 	cancel()
 	if err != nil {
 		value.reportErrorLocked(fmt.Errorf("key worker: %w", err))
-		return ui.EventResult{}
+		return gfx.EventResult{}
 	}
 	return result
 }
 
-func (value *supervisor) shortcut(event ui.KeyEvent) ui.EventResult {
+func (value *supervisor) shortcut(event gfx.KeyEvent) gfx.EventResult {
 	value.mu.Lock()
 	defer value.mu.Unlock()
 	if value.active == nil || !value.active.config.HasShortcut {
-		return ui.EventResult{}
+		return gfx.EventResult{}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	result, err := value.active.client.Shortcut(ctx, event)
 	cancel()
 	if err != nil {
 		value.reportErrorLocked(fmt.Errorf("shortcut worker: %w", err))
-		return ui.EventResult{}
+		return gfx.EventResult{}
 	}
 	return result
 }
 
-func (value *supervisor) scroll(event ui.ScrollEvent) ui.EventResult {
+func (value *supervisor) scroll(event gfx.ScrollEvent) gfx.EventResult {
 	value.mu.Lock()
 	defer value.mu.Unlock()
 	if value.active == nil || !value.active.config.HasScroll {
-		return ui.EventResult{}
+		return gfx.EventResult{}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	result, err := value.active.client.Scroll(ctx, event)
 	cancel()
 	if err != nil {
 		value.reportErrorLocked(fmt.Errorf("scroll worker: %w", err))
-		return ui.EventResult{}
+		return gfx.EventResult{}
+	}
+	return result
+}
+
+func (value *supervisor) modifierTap(event gfx.ModifierTapEvent) gfx.EventResult {
+	value.mu.Lock()
+	defer value.mu.Unlock()
+	if value.active == nil || !value.active.config.HasModifierTap {
+		return gfx.EventResult{}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	result, err := value.active.client.ModifierTap(ctx, event)
+	cancel()
+	if err != nil {
+		value.reportErrorLocked(fmt.Errorf("modifier tap worker: %w", err))
+		return gfx.EventResult{}
 	}
 	return result
 }
@@ -282,7 +304,7 @@ func (value *supervisor) clearErrorLocked() { value.lastError = "" }
 
 func compatibleWindow(current, next reloadwire.WindowConfig) error {
 	if current.Title != next.Title || current.Width != next.Width || current.Height != next.Height ||
-		current.WindowMode != next.WindowMode || current.TitlebarHeight != next.TitlebarHeight || current.ClearRed != next.ClearRed ||
+		current.WindowMode != next.WindowMode || current.TitlebarHeight != next.TitlebarHeight || current.TrafficLightScale != next.TrafficLightScale || current.ClearRed != next.ClearRed ||
 		current.ClearGreen != next.ClearGreen || current.ClearBlue != next.ClearBlue || current.ClearAlpha != next.ClearAlpha {
 		return fmt.Errorf("candidate changed immutable window configuration; restart viva dev")
 	}

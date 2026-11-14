@@ -17,8 +17,8 @@ import (
 	"sync/atomic"
 	"unsafe"
 
+	"github.com/vivaui/viva/gfx"
 	"github.com/vivaui/viva/internal/platform"
-	"github.com/vivaui/viva/ui"
 )
 
 var ErrPermissionDenied = errors.New("darwin: permission denied")
@@ -121,6 +121,28 @@ func pasteboardImagePNG(name *C.char) ([]byte, error) {
 	return nil, systemError("read clipboard image", nativeError)
 }
 
+// ClipboardFiles returns the paths of the files the general pasteboard holds:
+// the file URLs a Finder copy leaves there.
+func ClipboardFiles() ([]string, error) { return pasteboardFiles(nil) }
+
+func pasteboardFiles(name *C.char) ([]string, error) {
+	var result C.viva_system_string_array
+	var nativeError *C.char
+	switch C.viva_system_clipboard_files(name, C.size_t(platform.MaxClipboardFiles), &result, &nativeError) {
+	case 0:
+		defer C.viva_system_free_string_array(result)
+		items := unsafe.Slice((**C.char)(unsafe.Pointer(result.items)), int(result.count))
+		paths := make([]string, len(items))
+		for index, item := range items {
+			paths[index] = C.GoString(item)
+		}
+		return paths, nil
+	case 1:
+		return nil, platform.ErrNoClipboardFiles
+	}
+	return nil, systemError("read clipboard files", nativeError)
+}
+
 // ReduceMotion reports the system "Reduce motion" accessibility preference.
 func ReduceMotion() bool {
 	return C.viva_system_reduce_motion() != 0
@@ -179,7 +201,7 @@ func vivaSystemAppearanceChanged() {
 // lastCursorShape is the highest shape number the native side knows. A number
 // beyond it is refused here, without a trip to the main thread, which the native
 // side would also refuse with the same words.
-const lastCursorShape = 10
+const lastCursorShape = 11
 
 func SetCursorShape(shape uint8) error {
 	if shape > lastCursorShape {
@@ -194,7 +216,7 @@ func SetCursorShape(shape uint8) error {
 
 // SetCursorImage makes the picture the pointer over the app's windows, as many points big as it
 // was made for: its own pixels, not resampled, which AppKit draws at the screen's density.
-func SetCursorImage(image *ui.CursorImage) error {
+func SetCursorImage(image *gfx.CursorImage) error {
 	width, height, hotX, hotY, pixels := platform.CursorPixels(image, image.Scale(), true)
 	var nativeError *C.char
 	status := C.viva_system_set_cursor_image(C.int(width), C.int(height), C.int(hotX), C.int(hotY),
@@ -272,54 +294,79 @@ func OpenDirectory(options OpenDirectoryOptions) (string, bool, error) {
 }
 
 func SaveFile(options SaveFileOptions) (string, bool, error) {
+	path, _, canceled, err := saveFile(options, "", false)
+	return path, canceled, err
+}
+
+func SaveFileWithCheckbox(options SaveFileOptions, label string, initial bool) (string, bool, bool, error) {
+	return saveFile(options, label, initial)
+}
+
+func saveFile(options SaveFileOptions, checkboxLabel string, initial bool) (string, bool, bool, error) {
 	title, err := systemCString("save file title", options.Title)
 	if err != nil {
-		return "", false, err
+		return "", false, false, err
 	}
 	defer C.free(unsafe.Pointer(title))
 	name, err := systemCString("suggested file name", options.SuggestedName)
 	if err != nil {
-		return "", false, err
+		return "", false, false, err
 	}
 	defer C.free(unsafe.Pointer(name))
 	defaultExtension, err := normalizeExtension(options.DefaultExtension)
 	if err != nil {
-		return "", false, fmt.Errorf("darwin: default extension: %w", err)
+		return "", false, false, fmt.Errorf("darwin: default extension: %w", err)
 	}
 	nativeDefaultExtension, err := systemCString("default extension", defaultExtension)
 	if err != nil {
-		return "", false, err
+		return "", false, false, err
 	}
 	defer C.free(unsafe.Pointer(nativeDefaultExtension))
 	extensions, err := allowedExtensions(options.Filters)
 	if err != nil {
-		return "", false, err
+		return "", false, false, err
 	}
 	nativeExtensions, freeExtensions, err := systemCStrings("file extension", extensions)
 	if err != nil {
-		return "", false, err
+		return "", false, false, err
 	}
 	defer freeExtensions()
+	var nativeLabel *C.char
+	if checkboxLabel != "" {
+		nativeLabel, err = systemCString("save checkbox label", checkboxLabel)
+		if err != nil {
+			return "", false, false, err
+		}
+		defer C.free(unsafe.Pointer(nativeLabel))
+	}
 	var path *C.char
 	var nativeError *C.char
-	status := C.viva_system_save_file(
+	var selected C.int
+	initialChecked := C.int(0)
+	if initial {
+		initialChecked = 1
+	}
+	status := C.viva_system_save_file_with_checkbox(
 		title,
 		name,
 		nativeDefaultExtension,
 		nativeStringPointer(nativeExtensions),
 		C.size_t(len(nativeExtensions)),
+		nativeLabel,
+		initialChecked,
+		&selected,
 		&path,
 		&nativeError,
 	)
 	runtime.KeepAlive(nativeExtensions)
 	if status == 1 {
-		return "", true, nil
+		return "", false, true, nil
 	}
 	if status != 0 {
-		return "", false, systemError("save file", nativeError)
+		return "", false, false, systemError("save file", nativeError)
 	}
 	defer C.viva_system_free(unsafe.Pointer(path))
-	return C.GoString(path), false, nil
+	return C.GoString(path), selected != 0, false, nil
 }
 
 func OpenURL(target string) error {
@@ -331,6 +378,19 @@ func OpenURL(target string) error {
 	var nativeError *C.char
 	if C.viva_system_open_url(nativeTarget, &nativeError) != 0 {
 		return systemError("open external URL", nativeError)
+	}
+	return nil
+}
+
+func RevealPath(path string) error {
+	nativePath, err := systemCString("reveal path", path)
+	if err != nil {
+		return err
+	}
+	defer C.free(unsafe.Pointer(nativePath))
+	var nativeError *C.char
+	if C.viva_system_reveal_path(nativePath, &nativeError) != 0 {
+		return systemError("reveal path", nativeError)
 	}
 	return nil
 }

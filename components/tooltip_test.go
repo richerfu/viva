@@ -1,32 +1,38 @@
 package components
 
 import (
+	"strings"
 	"testing"
 	"time"
 
-	"github.com/vivaui/viva/ui"
+	"github.com/vivaui/viva/gfx"
 )
 
 func TestTooltipPositionsOnEverySideAndUsesLayer(t *testing.T) {
-	viewport := ui.Rect{Width: 600, Height: 400}
-	anchor := ui.Rect{X: 260, Y: 180, Width: 80, Height: 32}
+	viewport := gfx.Rect{Width: 600, Height: 400}
+	anchor := gfx.Rect{X: 260, Y: 180, Width: 80, Height: 32}
 	tests := []struct {
 		side  TooltipSide
-		check func(ui.Rect) bool
+		check func(gfx.Rect) bool
 	}{
-		{side: TooltipTop, check: func(bounds ui.Rect) bool { return bounds.Y+bounds.Height == anchor.Y-TooltipDefaultSideOffset }},
-		{side: TooltipRight, check: func(bounds ui.Rect) bool { return bounds.X == anchor.X+anchor.Width+TooltipDefaultSideOffset }},
-		{side: TooltipBottom, check: func(bounds ui.Rect) bool { return bounds.Y == anchor.Y+anchor.Height+TooltipDefaultSideOffset }},
-		{side: TooltipLeft, check: func(bounds ui.Rect) bool { return bounds.X+bounds.Width == anchor.X-TooltipDefaultSideOffset }},
+		{side: TooltipTop, check: func(bounds gfx.Rect) bool { return bounds.Y+bounds.Height == anchor.Y-TooltipDefaultSideOffset }},
+		{side: TooltipRight, check: func(bounds gfx.Rect) bool { return bounds.X == anchor.X+anchor.Width+TooltipDefaultSideOffset }},
+		{side: TooltipBottom, check: func(bounds gfx.Rect) bool { return bounds.Y == anchor.Y+anchor.Height+TooltipDefaultSideOffset }},
+		{side: TooltipLeft, check: func(bounds gfx.Rect) bool { return bounds.X+bounds.Width == anchor.X-TooltipDefaultSideOffset }},
 	}
 	for _, test := range tests {
-		var canvas ui.Canvas
-		bounds := BeginTooltip(&canvas, ui.DarkTheme(), viewport, anchor, TooltipOptions{Layer: 9, Side: test.side}).Paint("More information")
+		var canvas gfx.Canvas
+		bounds := BeginTooltip(&canvas, gfx.DarkTheme(), viewport, anchor, TooltipOptions{Layer: 9, Side: test.side}).Paint("More information")
 		if !test.check(bounds) {
 			t.Fatalf("side %d bounds = %+v", test.side, bounds)
 		}
-		if len(canvas.Rectangles()) != 1+tooltipArrowSteps || canvas.Texts()[0].Layer != 9 {
-			t.Fatalf("tooltip commands = %+v / %+v", canvas.Rectangles(), canvas.Texts())
+		if len(canvas.Rectangles()) != 1 || len(canvas.Triangles()) != 1 || canvas.Texts()[0].Layer != 9 {
+			t.Fatalf("tooltip commands = %+v / %+v / %+v", canvas.Rectangles(), canvas.Triangles(), canvas.Texts())
+		}
+		for _, triangle := range canvas.Triangles() {
+			if triangle.Layer != 9 {
+				t.Fatalf("tooltip triangle left layer 9: %+v", triangle)
+			}
 		}
 		for _, rectangle := range canvas.Rectangles() {
 			if rectangle.Layer != 9 {
@@ -40,23 +46,23 @@ func TestTooltipPositionsOnEverySideAndUsesLayer(t *testing.T) {
 }
 
 func TestTooltipExplicitSideOffsetOverridesTheDefault(t *testing.T) {
-	var canvas ui.Canvas
-	anchor := ui.Rect{X: 260, Y: 180, Width: 80, Height: 32}
-	bounds := BeginTooltip(&canvas, ui.DarkTheme(), ui.Rect{Width: 600, Height: 400}, anchor, TooltipOptions{Layer: 1, Side: TooltipBottom, SideOffset: 2}).Paint("Hint")
+	var canvas gfx.Canvas
+	anchor := gfx.Rect{X: 260, Y: 180, Width: 80, Height: 32}
+	bounds := BeginTooltip(&canvas, gfx.DarkTheme(), gfx.Rect{Width: 600, Height: 400}, anchor, TooltipOptions{Layer: 1, Side: TooltipBottom, SideOffset: 2}).Paint("Hint")
 	if bounds.Y != anchor.Y+anchor.Height+2 {
 		t.Fatalf("bounds = %+v, want a 2px gap", bounds)
 	}
 }
 
 func TestTooltipHonorsMaxWidthAndDisabledState(t *testing.T) {
-	var canvas ui.Canvas
-	bounds := BeginTooltip(&canvas, ui.LightTheme(), ui.Rect{Width: 300, Height: 200}, ui.Rect{X: 120, Y: 100, Width: 20, Height: 20}, TooltipOptions{Layer: 1, MaxWidth: 96}).Paint("A deliberately long tooltip label")
+	var canvas gfx.Canvas
+	bounds := BeginTooltip(&canvas, gfx.LightTheme(), gfx.Rect{Width: 300, Height: 200}, gfx.Rect{X: 120, Y: 100, Width: 20, Height: 20}, TooltipOptions{Layer: 1, MaxWidth: 96}).Paint("A deliberately long tooltip label")
 	if bounds.Width != 96 {
 		t.Fatalf("tooltip width = %v, want 96", bounds.Width)
 	}
 	canvas.Reset()
-	bounds = BeginTooltip(&canvas, ui.LightTheme(), ui.Rect{Width: 300, Height: 200}, ui.Rect{X: 120, Y: 100, Width: 20, Height: 20}, TooltipOptions{Layer: 1}).Disabled().Paint("Hidden")
-	if bounds != (ui.Rect{}) || len(canvas.Rectangles()) != 0 || len(canvas.Texts()) != 0 {
+	bounds = BeginTooltip(&canvas, gfx.LightTheme(), gfx.Rect{Width: 300, Height: 200}, gfx.Rect{X: 120, Y: 100, Width: 20, Height: 20}, TooltipOptions{Layer: 1}).Disabled().Paint("Hidden")
+	if bounds != (gfx.Rect{}) || len(canvas.Rectangles()) != 0 || len(canvas.Texts()) != 0 {
 		t.Fatalf("disabled tooltip painted: %+v", bounds)
 	}
 }
@@ -92,27 +98,61 @@ func TestTooltipStateAndDeadlinesAreAllocationFree(t *testing.T) {
 }
 
 func TestTooltipWrapsALabelWiderThanItsMaximum(t *testing.T) {
-	var canvas ui.Canvas
-	viewport, anchor := ui.Rect{Width: 600, Height: 400}, ui.Rect{X: 260, Y: 180, Width: 80, Height: 32}
-	one := BeginTooltip(&canvas, ui.DarkTheme(), viewport, anchor, TooltipOptions{Layer: 1, MaxWidth: 120}).Paint("Short")
+	var canvas gfx.Canvas
+	viewport, anchor := gfx.Rect{Width: 600, Height: 400}, gfx.Rect{X: 260, Y: 180, Width: 80, Height: 32}
+	one := BeginTooltip(&canvas, gfx.DarkTheme(), viewport, anchor, TooltipOptions{Layer: 1, MaxWidth: 120}).Paint("Short")
 	canvas.Reset()
-	wrapped := BeginTooltip(&canvas, ui.DarkTheme(), viewport, anchor, TooltipOptions{Layer: 1, MaxWidth: 120}).Paint("A label that is far wider than the tooltip may be")
+	wrapped := BeginTooltip(&canvas, gfx.DarkTheme(), viewport, anchor, TooltipOptions{Layer: 1, MaxWidth: 120}).Paint("A label that is far wider than the tooltip may be")
 	if wrapped.Width != 120 || wrapped.Height <= one.Height || len(canvas.Texts()) < 2 {
 		t.Fatalf("wrapped tooltip %+v (%d lines) next to %+v", wrapped, len(canvas.Texts()), one)
 	}
 }
 
+func TestTooltipKeepsAnUnbrokenLabelWholeWhenItWraps(t *testing.T) {
+	var canvas gfx.Canvas
+	label := strings.Repeat("long-file-name-part-", 12) + ".txt"
+	BeginTooltip(&canvas, gfx.DarkTheme(), gfx.Rect{Width: 600, Height: 400}, gfx.Rect{X: 260, Y: 180, Width: 80, Height: 32}, TooltipOptions{}).Paint(label)
+	var painted string
+	for _, text := range canvas.Texts() {
+		if strings.ContainsRune(text.Value, '…') {
+			t.Fatalf("the tooltip dropped part of the name: %q", text.Value)
+		}
+		if text.Style.Size != gfx.DarkTheme().Metrics.FontSizeS || text.Style.Weight != gfx.WeightRegular {
+			t.Fatalf("line is not measured with the tooltip's text style: %+v", text)
+		}
+		painted += text.Value
+	}
+	if painted != label || len(canvas.Texts()) < 2 {
+		t.Fatalf("painted = %q, want all of %q in multiple lines", painted, label)
+	}
+}
+
+func BenchmarkTooltipLongUnbrokenLabel(b *testing.B) {
+	var canvas gfx.Canvas
+	label := strings.Repeat("long-file-name-part-", 12) + ".txt"
+	theme := gfx.DarkTheme()
+	viewport := gfx.Rect{Width: 600, Height: 400}
+	anchor := gfx.Rect{X: 260, Y: 180, Width: 80, Height: 32}
+	b.ReportAllocs()
+	for b.Loop() {
+		canvas.Reset()
+		BeginTooltip(&canvas, theme, viewport, anchor, TooltipOptions{}).Paint(label)
+	}
+}
+
 func TestTooltipOpensOnTheOtherSideWhenThereIsNoRoomAndItsArrowFollows(t *testing.T) {
-	var canvas ui.Canvas
-	viewport, anchor := ui.Rect{Width: 600, Height: 400}, ui.Rect{X: 260, Y: 8, Width: 80, Height: 32}
-	bounds := BeginTooltip(&canvas, ui.DarkTheme(), viewport, anchor, TooltipOptions{Layer: 1, Side: TooltipTop}).Paint("Hint")
+	var canvas gfx.Canvas
+	viewport, anchor := gfx.Rect{Width: 600, Height: 400}, gfx.Rect{X: 260, Y: 8, Width: 80, Height: 32}
+	bounds := BeginTooltip(&canvas, gfx.DarkTheme(), viewport, anchor, TooltipOptions{Layer: 1, Side: TooltipTop}).Paint("Hint")
 	if bounds.Y < anchor.Y+anchor.Height {
 		t.Fatalf("tooltip %+v overlaps its anchor %+v instead of going below it", bounds, anchor)
 	}
 	arrowAboveBody := false
-	for _, rectangle := range canvas.Rectangles() {
-		if rectangle.Bounds.Y < bounds.Y && rectangle.Bounds.Y >= anchor.Y+anchor.Height {
-			arrowAboveBody = true
+	for _, triangle := range canvas.Triangles() {
+		for _, point := range triangle.Points {
+			if point.Y < bounds.Y && point.Y >= anchor.Y+anchor.Height {
+				arrowAboveBody = true
+			}
 		}
 	}
 	if !arrowAboveBody {

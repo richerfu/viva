@@ -1,20 +1,22 @@
 package components
 
 import (
+	"encoding/csv"
+	"math"
 	"slices"
 	"strings"
 	"testing"
 
-	"github.com/vivaui/viva/ui"
+	"github.com/vivaui/viva/gfx"
 )
 
 func TestTableUsesHorizontalRulesAndOfficialRowStates(t *testing.T) {
-	theme := ui.LightTheme()
+	theme := gfx.LightTheme()
 	columns := []TableColumn{{Width: 120}, {Width: 90, Alignment: TableAlignCenter}, {Alignment: TableAlignRight}}
-	var canvas ui.Canvas
-	table := BeginTable(&canvas, theme, ui.Rect{Width: 320, Height: 140}, columns)
+	var canvas gfx.Canvas
+	table := BeginTable(&canvas, theme, gfx.Rect{Width: 320, Height: 140}, columns)
 	table.Header([]string{"Name", "State", "Total"})
-	table.RowState(ui.Item(7), []string{"Ada", "Active", "$42"}, TableRowState{Expanded: true})
+	table.RowState(gfx.Item(7), []string{"Ada", "Active", "$42"}, TableRowState{Expanded: true})
 	table.Footer([]string{"", "Total", "$42"})
 	table.Caption("Current members")
 	if len(canvas.Hits()) != 1 || canvas.Hits()[0].Label != "Ada" {
@@ -33,14 +35,88 @@ func TestTableUsesHorizontalRulesAndOfficialRowStates(t *testing.T) {
 	}
 }
 
+func TestTableFontSizeAndCellPaddingOverrideBodyAndHeader(t *testing.T) {
+	theme := gfx.LightTheme()
+	const size, padding = float32(12.5), float32(12)
+	columns := []TableColumn{{Width: 160}}
+	var canvas gfx.Canvas
+	table := BeginTable(&canvas, theme, gfx.Rect{Width: 160, Height: 120}, columns).
+		FontSize(size).CellPadding(padding)
+	table.Header([]string{"Heading"})
+	table.Row(gfx.Item(1), []string{"Value"}, false)
+
+	texts := canvas.Texts()
+	if len(texts) != 2 {
+		t.Fatalf("table painted %d texts, want the header and body cell: %+v", len(texts), texts)
+	}
+	for _, text := range texts {
+		if text.Style.Size != size {
+			t.Errorf("%q is painted at %v px, want %v", text.Value, text.Style.Size, size)
+		}
+		if text.Bounds.X != padding {
+			t.Errorf("%q starts at x=%v, want the cell padding %v", text.Value, text.Bounds.X, padding)
+		}
+		if want := columns[0].Width - 2*padding; text.Bounds.Width != want {
+			t.Errorf("%q has %v px of room, want %v", text.Value, text.Bounds.Width, want)
+		}
+	}
+}
+
+func TestTableTypographyDefaultsToTheTheme(t *testing.T) {
+	theme := gfx.DarkTheme()
+	columns := []TableColumn{{Width: 160}}
+	var canvas gfx.Canvas
+	table := BeginTable(&canvas, theme, gfx.Rect{Width: 160, Height: 120}, columns).
+		FontSize(0).CellPadding(0)
+	table.Header([]string{"Heading"})
+	table.Row(gfx.Item(1), []string{"Value"}, false)
+
+	texts := canvas.Texts()
+	if len(texts) != 2 {
+		t.Fatalf("table painted %d texts, want the header and body cell: %+v", len(texts), texts)
+	}
+	for _, text := range texts {
+		if text.Style.Size != theme.Metrics.FontSizeM {
+			t.Errorf("%q is painted at %v px, want the theme's %v", text.Value, text.Style.Size, theme.Metrics.FontSizeM)
+		}
+		if text.Bounds.X != theme.Metrics.GapItem {
+			t.Errorf("%q starts at x=%v, want the theme's %v", text.Value, text.Bounds.X, theme.Metrics.GapItem)
+		}
+		if want := columns[0].Width - 2*theme.Metrics.GapItem; text.Bounds.Width != want {
+			t.Errorf("%q has %v px of room, want %v", text.Value, text.Bounds.Width, want)
+		}
+	}
+}
+
+func TestTableFontSizeAndCellPaddingOverrideSortableHeader(t *testing.T) {
+	theme := gfx.LightTheme()
+	const size, padding = float32(12.5), float32(12)
+	columns := []TableColumn{{Width: 160}}
+	var canvas gfx.Canvas
+	table := BeginTable(&canvas, theme, gfx.Rect{Width: 160, Height: 120}, columns).
+		FontSize(size).CellPadding(padding)
+	table.SortableHeader([]TableHeader{{Label: "Heading"}})
+
+	texts := canvas.Texts()
+	if len(texts) != 1 {
+		t.Fatalf("sortable header painted %d texts, want one: %+v", len(texts), texts)
+	}
+	if texts[0].Style.Size != size || texts[0].Bounds.X != padding {
+		t.Fatalf("sortable header text is %+v, want size %v at x=%v", texts[0], size, padding)
+	}
+	if want := columns[0].Width - 2*padding; texts[0].Bounds.Width != want {
+		t.Fatalf("sortable header has %v px of room, want %v", texts[0].Bounds.Width, want)
+	}
+}
+
 func TestTableCommandStreamIsStable(t *testing.T) {
 	columns := []TableColumn{{Width: 100}, {Width: 0}}
-	var canvas ui.Canvas
+	var canvas gfx.Canvas
 	paint := func() {
 		canvas.Reset()
-		table := BeginTable(&canvas, ui.DarkTheme(), ui.Rect{Width: 240, Height: 100}, columns)
+		table := BeginTable(&canvas, gfx.DarkTheme(), gfx.Rect{Width: 240, Height: 100}, columns)
 		table.Header([]string{"Key", "Value"})
-		table.Row(ui.Item(1), []string{"Region", "Europe"}, true)
+		table.Row(gfx.Item(1), []string{"Region", "Europe"}, true)
 	}
 	paint()
 	rectangles := slices.Clone(canvas.Rectangles())
@@ -54,12 +130,12 @@ func TestTableCommandStreamIsStable(t *testing.T) {
 
 func TestTableRowLayoutReturnsReusableCellGeometry(t *testing.T) {
 	columns := []TableColumn{{Width: 80}, {Width: 120, Inset: 22}, {Width: 0}}
-	storage := make([]ui.Rect, 0, len(columns))
-	var canvas ui.Canvas
-	table := BeginTable(&canvas, ui.DarkTheme(), ui.Rect{X: 10, Y: 20, Width: 300, Height: 80}, columns)
+	storage := make([]gfx.Rect, 0, len(columns))
+	var canvas gfx.Canvas
+	table := BeginTable(&canvas, gfx.DarkTheme(), gfx.Rect{X: 10, Y: 20, Width: 300, Height: 80}, columns)
 	table.Header([]string{"", "Name", "Size"})
-	layout := table.RowLayout(ui.Item(7), []string{"", "notes.txt", "12 B"}, TableRowState{Selected: true}, storage)
-	if layout.Bounds != (ui.Rect{X: 10, Y: 20 + TableHeaderHeight(ui.DarkTheme()), Width: 300, Height: TableRowHeight(ui.DarkTheme())}) || len(layout.Cells) != 3 {
+	layout := table.RowLayout(gfx.Item(7), []string{"", "notes.txt", "12 B"}, TableRowState{Selected: true}, storage)
+	if layout.Bounds != (gfx.Rect{X: 10, Y: 20 + TableHeaderHeight(gfx.DarkTheme()), Width: 300, Height: TableRowHeight(gfx.DarkTheme())}) || len(layout.Cells) != 3 {
 		t.Fatalf("row layout = %+v", layout)
 	}
 	if layout.Cells[0].Width != 80 || layout.Cells[1].X != 90 || layout.Cells[1].Width != 120 || layout.Cells[2].Width != 100 {
@@ -76,12 +152,12 @@ func TestTableRowLayoutReturnsReusableCellGeometry(t *testing.T) {
 }
 
 func TestTableEndsCellsThatDoNotFitInAnEllipsis(t *testing.T) {
-	theme := ui.DarkTheme()
+	theme := gfx.DarkTheme()
 	columns := []TableColumn{{Width: 70}, {Width: 70, Alignment: TableAlignRight}, {Width: 0}}
-	var canvas ui.Canvas
-	table := BeginTable(&canvas, theme, ui.Rect{Width: 300, Height: 120}, columns)
+	var canvas gfx.Canvas
+	table := BeginTable(&canvas, theme, gfx.Rect{Width: 300, Height: 120}, columns)
 	table.Header([]string{"Marker / hash", "Key", "Comment"})
-	table.Row(ui.Item(1), []string{"@cert-authority", "ssh-ed25519", "short"}, false)
+	table.Row(gfx.Item(1), []string{"@cert-authority", "ssh-ed25519", "short"}, false)
 	texts := canvas.Texts()
 	if len(texts) != 6 {
 		t.Fatalf("texts = %+v", texts)
@@ -101,40 +177,368 @@ func TestTableEndsCellsThatDoNotFitInAnEllipsis(t *testing.T) {
 	}
 }
 
+func TestTableCopySelectionUsesCompleteTruncatedCells(t *testing.T) {
+	theme := gfx.DarkTheme()
+	longValue := strings.Repeat("long-environment-value-", 12)
+	rows := [][]string{
+		{"LONG", longValue},
+		{"SHORT", "value"},
+	}
+	columns := []TableColumn{{Width: 100}, {Width: 160}}
+	expected := "Variable\tValue\nLONG\t" + longValue + "\nSHORT\tvalue"
+	bounds := gfx.Rect{X: 20, Y: 30, Width: 260, Height: 200}
+	var canvas gfx.Canvas
+	table := BeginTable(&canvas, theme, bounds, columns)
+	table.Selection = TableSelection{
+		Enabled: true,
+		Anchor:  0,
+		Focus:   len(expected),
+	}
+	table.Header([]string{"Variable", "Value"})
+	for index, row := range rows {
+		table.Row(gfx.Item(9+index), row, false)
+	}
+
+	if table.TextLen() != len(expected) {
+		t.Fatalf("text length = %d, want %d", table.TextLen(), len(expected))
+	}
+	if got := table.SelectedText(table.Selection); got != expected {
+		t.Fatalf("selected text = %q, want %q", got, expected)
+	}
+	if hits := canvas.Hits(); len(hits) != 2 || hits[0].ID != gfx.Item(9) || hits[1].ID != gfx.Item(10) {
+		t.Fatalf("table hits = %+v", hits)
+	}
+	selectedBackground := false
+	for _, rectangle := range canvas.Rectangles() {
+		if rectangle.Color == theme.Selection {
+			selectedBackground = true
+			break
+		}
+	}
+	if !selectedBackground {
+		t.Fatal("selection did not paint using the semantic selection color")
+	}
+	if !strings.Contains(strings.Join(tableTextValues(canvas.Texts()), " "), "…") {
+		t.Fatal("long cell was not visually truncated")
+	}
+}
+
+func TestTableCopySelectionMapsPointerToCellText(t *testing.T) {
+	theme := gfx.DarkTheme()
+	bounds := gfx.Rect{X: 10, Y: 20, Width: 300, Height: 180}
+	columns := []TableColumn{{Width: 100}, {Width: 0}}
+	rows := [][]string{{"FIRST", strings.Repeat("x", 80)}, {"SECOND", "tail"}}
+	var canvas gfx.Canvas
+	table := BeginTable(&canvas, theme, bounds, columns)
+	table.Selection.Enabled = true
+	table.Header([]string{"Variable", "Value"})
+	for _, row := range rows {
+		table.Row(gfx.ID{}, row, false)
+	}
+
+	firstRowY := bounds.Y + TableHeaderHeight(theme) + 2
+	offset, ok := table.OffsetAt(gfx.Point{X: bounds.X + theme.Metrics.GapItem, Y: firstRowY})
+	firstRowStart := len("Variable\tValue\n")
+	secondRowStart := len("Variable\tValue\nFIRST\t" + strings.Repeat("x", 80) + "\n")
+	if !ok || offset < firstRowStart || offset >= secondRowStart {
+		t.Fatalf("first cell offset = %d, %v", offset, ok)
+	}
+	lastRowY := bounds.Y + TableHeaderHeight(theme) + TableRowHeight(theme) + 2
+	lastValueStart := len("Variable\tValue\nFIRST\t" + strings.Repeat("x", 80) + "\nSECOND\t")
+	offset, ok = table.OffsetAt(gfx.Point{
+		X: bounds.X + columns[0].Width + theme.Metrics.GapItem + 1,
+		Y: lastRowY,
+	})
+	if !ok || offset < lastValueStart || offset > table.TextLen() {
+		t.Fatalf("last cell offset = %d, want within %d..%d (%v)",
+			offset, lastValueStart, table.TextLen(), ok)
+	}
+}
+
+func TestTableCopySelectionClampsReversedRange(t *testing.T) {
+	var canvas gfx.Canvas
+	table := BeginTable(&canvas, gfx.DarkTheme(), gfx.Rect{Width: 300, Height: 120},
+		[]TableColumn{{Width: 100}, {Width: 0}})
+	table.Selection.Enabled = true
+	table.Header([]string{"A", "B"})
+	table.Row(gfx.ID{}, []string{"one", "two"}, false)
+	got := table.SelectedText(TableSelection{Anchor: 1000, Focus: -10})
+	if got != "A\tB\none\ttwo" {
+		t.Fatalf("reversed selection = %q", got)
+	}
+}
+
+func TestTableCopySelectionClampsInsideUnicode(t *testing.T) {
+	var canvas gfx.Canvas
+	table := BeginTable(&canvas, gfx.DarkTheme(), gfx.Rect{Width: 300, Height: 120},
+		[]TableColumn{{Width: 100}, {Width: 0}})
+	table.Selection.Enabled = true
+	table.Header([]string{"名称", "值"})
+	table.Row(gfx.ID{}, []string{"中文", "测试"}, false)
+	got := table.SelectedText(TableSelection{Anchor: 3, Focus: table.TextLen() - 1})
+	if got != "称\t值\n中文\t测" {
+		t.Fatalf("unicode selection = %q", got)
+	}
+}
+
+func TestTableCopySelectionSerializesEmbeddedTSVDelimiters(t *testing.T) {
+	var canvas gfx.Canvas
+	table := BeginTable(&canvas, gfx.DarkTheme(), gfx.Rect{Width: 400, Height: 200},
+		[]TableColumn{{Width: 120}, {Width: 0}})
+	table.Selection.Enabled = true
+	table.Header([]string{"Variable", "Value"})
+	rows := [][]string{
+		{"TAB", "a\tb"},
+		{"LINES", "line one\nline two\rreturn"},
+		{"QUOTES", `"quoted""value"`},
+		{"UNICODE", "中文"},
+	}
+	for _, row := range rows {
+		table.Row(gfx.ID{}, row, false)
+	}
+
+	got := table.SelectedText(TableSelection{Anchor: 0, Focus: table.TextLen()})
+	reader := csv.NewReader(strings.NewReader(got))
+	reader.Comma = '\t'
+	reader.FieldsPerRecord = -1
+	records, err := reader.ReadAll()
+	if err != nil {
+		t.Fatalf("quoted TSV did not parse: %v\n%s", err, got)
+	}
+	want := append([][]string{{"Variable", "Value"}}, rows...)
+	if !slices.EqualFunc(records, want, slices.Equal) {
+		t.Fatalf("quoted TSV = %#v, want %#v\n%s", records, want, got)
+	}
+}
+
+func TestTableCopySelectionMapsQuotedVisibleTextToSerializedOffset(t *testing.T) {
+	theme := gfx.DarkTheme()
+	bounds := gfx.Rect{X: 10, Y: 20, Width: 300, Height: 160}
+	value := `a"b`
+	var canvas gfx.Canvas
+	table := BeginTable(&canvas, theme, bounds, []TableColumn{{Width: 80}, {Width: 0}})
+	table.Selection.Enabled = true
+	table.Header([]string{"Key", "Value"})
+	table.Row(gfx.ID{}, []string{"QUOTE", value}, false)
+
+	cell := table.text.cells[len(table.text.cells)-1]
+	prefixWidth := canvas.TextWidthWeight(`a"`, theme.Metrics.FontSizeM, gfx.WeightRegular)
+	offset, ok := table.OffsetAt(gfx.Point{
+		X: cell.textX + prefixWidth,
+		Y: cell.bounds.Y + 2,
+	})
+	want := cell.contentLo + len(`a"`) + 1 // the literal quote occupies two TSV bytes
+	if !ok || offset != want {
+		t.Fatalf("quoted pointer offset = %d, want %d (%v)", offset, want, ok)
+	}
+}
+
+func TestTableCopySelectionIncludesQuotesWhenDraggingAWholeSpecialCell(t *testing.T) {
+	theme := gfx.DarkTheme()
+	bounds := gfx.Rect{X: 10, Y: 20, Width: 300, Height: 160}
+	var canvas gfx.Canvas
+	table := BeginTable(&canvas, theme, bounds, []TableColumn{{Width: 100}, {Width: 0}})
+	table.Selection.Enabled = true
+	table.Header([]string{"Key", "Value"})
+	table.Row(gfx.ID{}, []string{"QUOTE", "a\tb"}, false)
+
+	first, second := table.text.cells[2], table.text.cells[3]
+	start, ok := table.OffsetAt(gfx.Point{X: first.textX, Y: first.bounds.Y + 2})
+	if !ok {
+		t.Fatal("start of row did not map")
+	}
+	end, ok := table.OffsetAt(gfx.Point{X: second.bounds.Right() - 1, Y: second.bounds.Y + 2})
+	if !ok {
+		t.Fatal("end of row did not map")
+	}
+	got := table.SelectedText(TableSelection{Anchor: start, Focus: end})
+	if got != "QUOTE\t\"a\tb\"" {
+		t.Fatalf("dragged row = %q", got)
+	}
+}
+
+func TestTableCopySelectionIncludesQuotesForRTLSpecialCells(t *testing.T) {
+	theme := gfx.DarkTheme()
+	var canvas gfx.Canvas
+	table := BeginTable(&canvas, theme, gfx.Rect{Width: 300, Height: 160},
+		[]TableColumn{{Width: 100}, {Width: 0}})
+	table.Selection.Enabled = true
+	table.Header([]string{"Key", "Value"})
+	table.Row(gfx.ID{}, []string{"RTL", "שלום\tעולם"}, false)
+
+	second := table.text.cells[3]
+	start, ok := table.OffsetAt(gfx.Point{X: second.textX + second.textWidth - 1, Y: second.bounds.Y + 2})
+	if !ok {
+		t.Fatal("RTL row start did not map")
+	}
+	end, ok := table.OffsetAt(gfx.Point{X: second.textX + 1, Y: second.bounds.Y + 2})
+	if !ok {
+		t.Fatal("RTL row end did not map")
+	}
+	got := table.SelectedText(TableSelection{Anchor: start, Focus: end})
+	if got != "\"שלום\tעולם\"" {
+		t.Fatalf("dragged RTL row = %q", got)
+	}
+}
+
+func TestTableCopySelectionColorsOnlySelectedText(t *testing.T) {
+	theme := gfx.DarkTheme()
+	var canvas gfx.Canvas
+	table := BeginTable(&canvas, theme, gfx.Rect{Width: 300, Height: 120},
+		[]TableColumn{{Width: 100}, {Width: 0}})
+	table.Selection = TableSelection{
+		Enabled: true,
+		Anchor:  len("Name\tValue\nkey\t") + 1,
+		Focus:   len("Name\tValue\nkey\t") + 3,
+	}
+	table.Header([]string{"Name", "Value"})
+	table.Row(gfx.ID{}, []string{"key", "abcdef"}, false)
+
+	normal, selected := false, false
+	for _, text := range canvas.Texts() {
+		if text.Value != "abcdef" {
+			continue
+		}
+		normal = normal || text.Style.Color == theme.Foreground
+		selected = selected || text.Style.Color == theme.SelectionForeground && text.HasClip
+	}
+	if !normal || !selected {
+		t.Fatalf("cell text colors: normal=%v selected=%v texts=%+v", normal, selected, canvas.Texts())
+	}
+}
+
+func TestTableCopySelectionIncludesSortableHeaderAndFooter(t *testing.T) {
+	theme := gfx.DarkTheme()
+	bounds := gfx.Rect{X: 15, Y: 25, Width: 340, Height: 180}
+	var canvas gfx.Canvas
+	table := BeginTable(&canvas, theme, bounds, []TableColumn{{Width: 100}, {Width: 0}})
+	table.Selection.Enabled = true
+	table.SortableHeader([]TableHeader{
+		{ID: gfx.Item(1), Label: "Variable", Sort: TableSortAscending},
+		{Label: "Value"},
+	})
+	table.Row(gfx.ID{}, []string{"LANG", "中文"}, false)
+	table.Footer([]string{"Total", "1"})
+
+	const want = "Variable\tValue\nLANG\t中文\nTotal\t1"
+	if got := table.SelectedText(TableSelection{Anchor: 0, Focus: table.TextLen()}); got != want {
+		t.Fatalf("sortable table text = %q, want %q", got, want)
+	}
+	headerOffset, ok := table.OffsetAt(gfx.Point{
+		X: bounds.X + theme.Metrics.GapItem + 1,
+		Y: bounds.Y + theme.Metrics.ControlHeight/2,
+	})
+	if !ok || headerOffset < 0 || headerOffset >= len("Variable") {
+		t.Fatalf("sortable header offset = %d, %v", headerOffset, ok)
+	}
+	footerY := bounds.Y + TableHeaderHeight(theme) + TableRowHeight(theme) + 2
+	footerOffset, ok := table.OffsetAt(gfx.Point{X: bounds.X + theme.Metrics.GapItem + 1, Y: footerY})
+	if !ok || footerOffset < len("Variable\tValue\nLANG\t中文\n") {
+		t.Fatalf("footer offset = %d, %v", footerOffset, ok)
+	}
+}
+
+func TestTableCopySelectionUsesRTLPaintOrigin(t *testing.T) {
+	theme := gfx.DarkTheme()
+	bounds := gfx.Rect{X: 40, Y: 60, Width: 280, Height: 120}
+	var canvas gfx.Canvas
+	table := BeginTable(&canvas, theme, bounds, []TableColumn{{Width: 120}, {Width: 0}})
+	table.Selection.Enabled = true
+	table.Header([]string{"مرحبا", "Value"})
+	table.Row(gfx.ID{}, []string{"שלום", "tail"}, false)
+
+	var rtlPainted gfx.Text
+	for _, text := range canvas.Texts() {
+		if text.Value == "مرحبا" {
+			rtlPainted = text
+			break
+		}
+	}
+	if rtlPainted.Value == "" {
+		t.Fatal("RTL header was not painted")
+	}
+	rtlCell := table.text.cells[0]
+	if rtlCell.textX != rtlPainted.Bounds.X {
+		t.Fatalf("RTL paint origin = %v, selection origin = %v", rtlPainted.Bounds.X, rtlCell.textX)
+	}
+	offset, ok := table.OffsetAt(gfx.Point{
+		X: rtlCell.textX + rtlCell.textWidth - 1,
+		Y: bounds.Y + theme.Metrics.ControlHeight/2,
+	})
+	if !ok || offset > rtlCell.contentLo+1 {
+		t.Fatalf("RTL right edge offset = %d, want near logical start %d (%v)",
+			offset, rtlCell.contentLo, ok)
+	}
+	offset, ok = table.OffsetAt(gfx.Point{
+		X: rtlCell.textX + 1,
+		Y: bounds.Y + theme.Metrics.ControlHeight/2,
+	})
+	if !ok || offset < rtlCell.contentHi-1 {
+		t.Fatalf("RTL left edge offset = %d, want near logical end %d (%v)",
+			offset, rtlCell.contentHi, ok)
+	}
+}
+
 func TestTablePaintsCellsThatFitWithoutAllocating(t *testing.T) {
 	columns := []TableColumn{{Width: 120}, {Width: 0}}
-	var canvas ui.Canvas
+	var canvas gfx.Canvas
 	paint := func() {
 		canvas.Reset()
-		table := BeginTable(&canvas, ui.DarkTheme(), ui.Rect{Width: 300, Height: 120}, columns)
+		table := BeginTable(&canvas, gfx.DarkTheme(), gfx.Rect{Width: 300, Height: 120}, columns)
 		table.Header([]string{"Name", "Value"})
-		table.Row(ui.Item(1), []string{"Region", "Europe"}, false)
+		table.Row(gfx.Item(1), []string{"Region", "Europe"}, false)
 	}
 	if allocs := testing.AllocsPerRun(100, paint); allocs != 0 {
 		t.Fatalf("table of fitting cells allocated %v times per paint", allocs)
 	}
 }
 
+func TestTableSelectionWithAKeptStatePaintsWithoutAllocating(t *testing.T) {
+	columns := []TableColumn{{Width: 120}, {Width: 0}}
+	var canvas gfx.Canvas
+	state := &TableTextState{}
+	paint := func() {
+		canvas.Reset()
+		table := BeginTable(&canvas, gfx.DarkTheme(), gfx.Rect{Width: 300, Height: 120}, columns)
+		table.Selection = TableSelection{Enabled: true}
+		table.UseSelectionState(state)
+		table.Header([]string{"Name", "Value"})
+		table.Row(gfx.Item(1), []string{"Region", "Europe"}, false)
+		table.Row(gfx.Item(2), []string{"Coastline", "Barents Sea"}, false)
+	}
+	if allocs := testing.AllocsPerRun(100, paint); allocs != 0 {
+		t.Fatalf("table with a kept selection state allocated %v times per paint", allocs)
+	}
+}
+
+func tableTextValues(texts []gfx.Text) []string {
+	values := make([]string, 0, len(texts))
+	for _, text := range texts {
+		values = append(values, text.Value)
+	}
+	return values
+}
+
 func TestFitTableHeadingsWidensOnlyColumnsNarrowerThanTheirHeading(t *testing.T) {
-	theme := ui.DarkTheme()
-	var canvas ui.Canvas
+	theme := gfx.DarkTheme()
+	var canvas gfx.Canvas
 	headings := []string{"", "Marker / hash", "Key type", "Comment", "Fingerprint"}
 	columns := []TableColumn{{Width: 42}, {Width: 20}, {Width: 400}, {Width: 20, Inset: 10}, {Width: 0}}
 	FitTableHeadings(&canvas, theme, columns, headings)
 	pad := theme.Metrics.GapItem * 2
-	fitted := canvas.TextWidthWeight("Marker / hash", theme.Metrics.FontSizeM, ui.WeightMedium)
+	fitted := canvas.TextWidthWeight("Marker / hash", theme.Metrics.FontSizeM, gfx.WeightMedium)
 	if columns[0].Width != 42 || columns[2].Width != 400 || columns[4].Width != 0 {
 		t.Fatalf("columns that needed no change = %+v", columns)
 	}
 	if columns[1].Width < fitted+pad || columns[1].Width > fitted+pad+1 {
 		t.Fatalf("heading column = %v, want %v for its text and padding", columns[1].Width, fitted+pad)
 	}
-	if columns[3].Width <= canvas.TextWidthWeight("Comment", theme.Metrics.FontSizeM, ui.WeightMedium)+pad+10-1 {
+	if columns[3].Width <= canvas.TextWidthWeight("Comment", theme.Metrics.FontSizeM, gfx.WeightMedium)+pad+10-1 {
 		t.Fatalf("inset column = %v does not hold the heading after its inset", columns[3].Width)
 	}
 
 	canvas.Reset()
-	table := BeginTable(&canvas, theme, ui.Rect{Width: 800, Height: 80}, columns)
+	table := BeginTable(&canvas, theme, gfx.Rect{Width: 800, Height: 80}, columns)
 	table.Header(headings)
 	for _, text := range canvas.Texts() {
 		if strings.Contains(text.Value, "…") {
@@ -149,7 +553,7 @@ func BenchmarkTablePaint(b *testing.B) {
 		width float32
 	}{{"fitting", 400}, {"ellipsized", 60}} {
 		b.Run(bench.name, func(b *testing.B) {
-			var canvas ui.Canvas
+			var canvas gfx.Canvas
 			columns := []TableColumn{{Width: bench.width}, {Width: bench.width}, {Width: 0}}
 			rows := [][]string{
 				{"known_hosts", "ssh-ed25519", "SHA256:nThbg6kXUpJWGl7E1IGOCspRomTxdCARLviKw6E5SY8"},
@@ -158,12 +562,187 @@ func BenchmarkTablePaint(b *testing.B) {
 			b.ReportAllocs()
 			for b.Loop() {
 				canvas.Reset()
-				table := BeginTable(&canvas, ui.DarkTheme(), ui.Rect{Width: 1000, Height: 200}, columns)
+				table := BeginTable(&canvas, gfx.DarkTheme(), gfx.Rect{Width: 1000, Height: 200}, columns)
 				table.Header([]string{"Marker / hash", "Key type", "Fingerprint"})
 				for _, row := range rows {
-					table.Row(ui.Item(1), row, false)
+					table.Row(gfx.Item(1), row, false)
 				}
 			}
 		})
+	}
+}
+
+func BenchmarkTableSelectionPaint(b *testing.B) {
+	for _, bench := range []struct {
+		name  string
+		state *TableTextState
+	}{{"rebuilt", nil}, {"kept", &TableTextState{}}} {
+		b.Run(bench.name, func(b *testing.B) {
+			var canvas gfx.Canvas
+			columns := []TableColumn{{Width: 400}, {Width: 0}}
+			rows := make([][]string, 30)
+			for index := range rows {
+				rows[index] = []string{"known_hosts", "SHA256:nThbg6kXUpJWGl7E1IGOCspRomTxdCARLviKw6E5SY8"}
+			}
+			b.ReportAllocs()
+			for b.Loop() {
+				canvas.Reset()
+				table := BeginTable(&canvas, gfx.DarkTheme(), gfx.Rect{Width: 1000, Height: 2000}, columns)
+				table.Selection = TableSelection{Enabled: true}
+				table.UseSelectionState(bench.state)
+				table.Header([]string{"File", "Fingerprint"})
+				for _, row := range rows {
+					table.Row(gfx.Item(1), row, false)
+				}
+			}
+		})
+	}
+}
+
+func TestTableEndInsetReservesTrailingCellSpace(t *testing.T) {
+	theme := gfx.LightTheme()
+	const endInset = float32(28)
+	columns := []TableColumn{{Width: 240, EndInset: endInset}}
+	var canvas gfx.Canvas
+	table := BeginTable(&canvas, theme, gfx.Rect{Width: 240, Height: 120}, columns)
+	table.Header([]string{"Heading"})
+	table.Row(gfx.Item(1), []string{"a command that is too long to fit in one line"}, false)
+	want := columns[0].Width - 2*theme.Metrics.GapItem - endInset
+	for _, text := range canvas.Texts() {
+		if text.Bounds.Width != want {
+			t.Fatalf("%q has %v px of room, want %v", text.Value, text.Bounds.Width, want)
+		}
+	}
+}
+
+func TestTableEndInsetCannotMakeACellNegative(t *testing.T) {
+	theme := gfx.LightTheme()
+	columns := []TableColumn{{Width: 20, EndInset: 200}}
+	var canvas gfx.Canvas
+	table := BeginTable(&canvas, theme, gfx.Rect{Width: 20, Height: 80}, columns)
+	table.Header([]string{"H"})
+	table.Row(gfx.Item(1), []string{"value"}, false)
+	for _, text := range canvas.Texts() {
+		if text.Bounds.Width < 0 {
+			t.Fatalf("%q has negative room %v", text.Value, text.Bounds.Width)
+		}
+	}
+}
+
+func TestFitTableHeadingsIncludesTheEndInset(t *testing.T) {
+	theme := gfx.LightTheme()
+	columns := []TableColumn{{Width: 1, Inset: 6, EndInset: 40}}
+	var canvas gfx.Canvas
+	FitTableHeadings(&canvas, theme, columns[:], []string{"Command"})
+	need := float32(math.Ceil(float64(canvas.TextWidthWeight("Command", theme.Metrics.FontSizeM, gfx.WeightMedium)))) +
+		2*theme.Metrics.GapItem + 6 + 40
+	if columns[0].Width < need {
+		t.Fatalf("fitted width %v < needed %v", columns[0].Width, need)
+	}
+}
+
+func TestFitSortableTableHeadingsIncludesTheEndInset(t *testing.T) {
+	theme := gfx.LightTheme()
+	columns := []TableColumn{{Width: 1, EndInset: 40}}
+	var canvas gfx.Canvas
+	FitSortableTableHeadings(&canvas, theme, columns[:], []TableHeader{{ID: gfx.Item(1), Label: "Command"}})
+	need := float32(math.Ceil(float64(canvas.TextWidthWeight("Command", theme.Metrics.FontSizeM, gfx.WeightMedium)))) +
+		2*theme.Metrics.GapItem + 40 + tableSortIconSize + tableSortIconGap
+	if columns[0].Width < need {
+		t.Fatalf("fitted width %v < needed %v", columns[0].Width, need)
+	}
+}
+
+// lastFillCovering returns the last painted rectangle covering point, the one
+// that decides what the frame shows there.
+func lastFillCovering(rectangles []gfx.Rectangle, point gfx.Point) (gfx.Rectangle, bool) {
+	var found gfx.Rectangle
+	ok := false
+	for _, rectangle := range rectangles {
+		if point.X >= rectangle.Bounds.X && point.X < rectangle.Bounds.Right() &&
+			point.Y >= rectangle.Bounds.Y && point.Y < rectangle.Bounds.Bottom() {
+			found, ok = rectangle, true
+		}
+	}
+	return found, ok
+}
+
+func TestTableDetailContinuesUnderTheExpandedRow(t *testing.T) {
+	theme := gfx.DarkTheme()
+	columns := []TableColumn{{Width: 120}, {Width: 0}}
+	var canvas gfx.Canvas
+	table := BeginTable(&canvas, theme, gfx.Rect{Width: 400, Height: 400}, columns)
+	table.Header([]string{"Name", "Command"})
+	row := table.RowLayout(gfx.Item(1), []string{"Deploy", "for i in 1 2 3; do"}, TableRowState{Expanded: true}, nil)
+	detail := table.Detail(80)
+	if detail.Y != row.Bounds.Bottom() || detail.Height != 80 {
+		t.Fatalf("detail = %+v, want 80 px below the row bottom %v", detail, row.Bounds.Bottom())
+	}
+	// The row keeps its border at the seam, and the band below is painted on the
+	// table's background with an accent bar, not on the row's surface.
+	seam := gfx.Point{X: detail.X, Y: detail.Y - 1}
+	covering, ok := lastFillCovering(canvas.Rectangles(), seam)
+	if !ok || covering.Color != theme.Border {
+		t.Fatalf("the seam is painted %+v, want the row's border", covering)
+	}
+	body := gfx.Point{X: detail.X + tableDetailBar + 1, Y: detail.Y + detail.Height/2}
+	if fill, ok := lastFillCovering(canvas.Rectangles(), body); !ok || fill.Color != theme.Background {
+		t.Fatalf("the detail is painted %+v, want the table's background", fill)
+	}
+	bar := gfx.Point{X: detail.X + 1, Y: detail.Y + detail.Height/2}
+	fill, ok := lastFillCovering(canvas.Rectangles(), bar)
+	if !ok || fill.Color.Red != theme.Primary.Red || fill.Color.Green != theme.Primary.Green || fill.Color.Blue != theme.Primary.Blue {
+		t.Fatalf("the detail's leading bar is painted %+v, want the accent color", fill)
+	}
+	next := table.RowLayout(gfx.Item(2), []string{"Cleanup", "rm -rf build"}, TableRowState{}, nil)
+	if next.Bounds.Y != detail.Bottom() {
+		t.Fatalf("the next row starts at %v, want %v", next.Bounds.Y, detail.Bottom())
+	}
+}
+
+func TestTableDetailClipsToTheRoomLeft(t *testing.T) {
+	theme := gfx.DarkTheme()
+	columns := []TableColumn{{Width: 0}}
+	height := TableHeaderHeight(theme) + TableRowHeight(theme) + 30
+	var canvas gfx.Canvas
+	table := BeginTable(&canvas, theme, gfx.Rect{Width: 300, Height: height}, columns)
+	table.Header([]string{"Command"})
+	table.RowLayout(gfx.Item(1), []string{"x"}, TableRowState{Expanded: true}, nil)
+	detail := table.Detail(500)
+	if detail.Height != 30 || detail.Bottom() != height {
+		t.Fatalf("detail = %+v, want the 30 px left above the table's bottom %v", detail, height)
+	}
+	if after := table.Detail(30); after != (gfx.Rect{}) {
+		t.Fatalf("a detail with no room left is %+v, want nothing", after)
+	}
+}
+
+func TestTableDetailAddsNoSelectionText(t *testing.T) {
+	columns := []TableColumn{{Width: 0}}
+	var canvas gfx.Canvas
+	var state TableTextState
+	table := BeginTable(&canvas, gfx.DarkTheme(), gfx.Rect{Width: 300, Height: 300}, columns)
+	table.Selection = TableSelection{Enabled: true}
+	table.UseSelectionState(&state)
+	table.Header([]string{"Command"})
+	table.Row(gfx.Item(1), []string{"echo hi"}, false)
+	before := table.TextLen()
+	table.Detail(60)
+	if got := table.TextLen(); got != before {
+		t.Fatalf("the table text grew from %d to %d bytes: a detail is not a row", before, got)
+	}
+}
+
+func BenchmarkTableDetailPaint(b *testing.B) {
+	var canvas gfx.Canvas
+	columns := []TableColumn{{Width: 160}, {Width: 0}}
+	b.ReportAllocs()
+	for b.Loop() {
+		canvas.Reset()
+		table := BeginTable(&canvas, gfx.DarkTheme(), gfx.Rect{Width: 1000, Height: 400}, columns)
+		table.Header([]string{"Name", "Command"})
+		table.RowState(gfx.Item(1), []string{"Deploy", "for i in 1 2 3; do echo $i; done"}, TableRowState{Expanded: true})
+		table.Detail(120)
+		table.Row(gfx.Item(2), []string{"Cleanup", "rm -rf build"}, false)
 	}
 }

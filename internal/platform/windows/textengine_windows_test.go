@@ -1,18 +1,39 @@
 package windows
 
 import (
+	"fmt"
 	"math"
 	"runtime"
+	"strings"
 	"testing"
+	"unicode/utf8"
 
+	"github.com/vivaui/viva/gfx"
 	"github.com/vivaui/viva/internal/platform"
 	"github.com/vivaui/viva/internal/render"
 	"github.com/vivaui/viva/internal/textenginetest"
 	"github.com/vivaui/viva/text"
-	"github.com/vivaui/viva/ui"
 )
 
-func newTestEngine(t testing.TB) ui.TextEngine {
+var _ gfx.StyledTextEngine = (*textEngine)(nil)
+
+func TestItalicDirectWriteLineHasSeparateCacheEntry(t *testing.T) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	engine, err := theTextEngine()
+	if err != nil {
+		t.Skipf("DirectWrite unavailable: %v", err)
+	}
+	engine.mu.Lock()
+	regular, regularErr := engine.lineStyle("Italic 本文", 16, 0, false)
+	italic, italicErr := engine.lineStyle("Italic 本文", 16, 0, true)
+	engine.mu.Unlock()
+	if regularErr != nil || italicErr != nil || regular == italic {
+		t.Fatalf("DirectWrite regular/italic lines = %p/%p, errs=%v/%v", regular, italic, regularErr, italicErr)
+	}
+}
+
+func newTestEngine(t testing.TB) gfx.TextEngine {
 	t.Helper()
 	engine := TextEngine()
 	if engine == nil {
@@ -25,6 +46,28 @@ func TestTextEnginePassesTheContract(t *testing.T) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 	textenginetest.Run(t, newTestEngine(t))
+}
+
+func TestTextEngineRasterizesProportionalText(t *testing.T) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	engine, err := theTextEngine()
+	if err != nil {
+		t.Skipf("DirectWrite unavailable: %v", err)
+	}
+	bitmap, err := engine.RasterizeText("Privacy 中文", gfx.TextStyle{
+		Size: 14, Weight: gfx.WeightSemibold, Color: gfx.Color{Red: 1, Green: 1, Blue: 1, Alpha: 1},
+	}, 2, 240, 56)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ink := false
+	for index := 3; index < len(bitmap.Pix); index += 4 {
+		ink = ink || bitmap.Pix[index] != 0
+	}
+	if bitmap.Width != 240 || bitmap.Height != 56 || bitmap.Stride != 960 || !ink {
+		t.Fatalf("rasterized bitmap = %dx%d stride %d, ink=%v", bitmap.Width, bitmap.Height, bitmap.Stride, ink)
+	}
 }
 
 // The original report: a run of digits followed by Chinese text was drawn narrower than
@@ -218,7 +261,7 @@ func TestTextInputOverlayFollowsTheShapedLine(t *testing.T) {
 	defer runtime.UnlockOSThread()
 	engine := newTestEngine(t)
 	const value = "2213123中文"
-	input := platform.TextInput{X: 10, Y: 20, Width: 200, Height: 30, FontSize: 14, Color: platform.Color{Alpha: 1},
+	input := platform.TextInput{X: 10, Y: 20, Width: 200, Height: 30, FontSize: 14, Weight: gfx.WeightSemibold, Color: platform.Color{Alpha: 1},
 		State: platform.TextState{Value: value, Selection: text.Range{Start: 3, End: 8}}}
 	state := windowState{
 		textEngine: engine, textInput: input, textState: input.State, textEnabled: true, caretVisible: true,
@@ -227,17 +270,61 @@ func TestTextInputOverlayFollowsTheShapedLine(t *testing.T) {
 	if err := state.updateTextVisuals(); err != nil {
 		t.Fatal(err)
 	}
+	if state.textLabels[1].Weight != input.Weight {
+		t.Fatalf("native label weight = %v, want %v", state.textLabels[1].Weight, input.Weight)
+	}
 	// Runes 3 to 8 are bytes 3 to 10: the digits' tail and the first Chinese character.
-	start, end := engine.Caret(value, 14, 0, 3), engine.Caret(value, 14, 0, 10)
+	start, end := engine.Caret(value, 14, input.Weight, 3), engine.Caret(value, 14, input.Weight, 10)
 	if selection := state.textRectangles[0].Bounds; math.Abs(float64(selection.X-(10+start))) > 0.01 || math.Abs(float64(selection.Width-(end-start))) > 0.01 {
 		t.Errorf("selection rectangle = %+v, want x %v width %v", selection, 10+start, end-start)
 	}
 	if caret := state.textRectangles[1].Bounds; math.Abs(float64(caret.X-(10+end))) > 0.01 {
 		t.Errorf("caret x = %v, want %v", caret.X, 10+end)
 	}
-	boundary := engine.Caret(value, 14, 0, 7) // between the digits and the Chinese text
-	event, handled, err := state.textPointerEvent(platform.PointerEvent{Kind: platform.PointerDown, Button: ui.PointerButtonPrimary, X: 10 + boundary + 0.5, Y: 35})
+	boundary := engine.Caret(value, 14, input.Weight, 7) // between the digits and the Chinese text
+	event, handled, err := state.textPointerEvent(platform.PointerEvent{Kind: platform.PointerDown, Button: gfx.PointerButtonPrimary, X: 10 + boundary + 0.5, Y: 35})
 	if err != nil || !handled || event.Selection != (text.Range{Start: 7, End: 7}) {
 		t.Errorf("a click beside the boundary placed %+v (handled %v, err %v), want rune 7", event.Selection, handled, err)
+	}
+}
+
+// A source file of tens of thousands of lines, in a field that paints its own rows,
+// reached DirectWrite whole: the engine refuses text of more than 1,024 lines, and
+// the label of the native editor, drawn with it, closed the application. The field's
+// caret, selection and label are the caret's line now, and are drawn.
+func TestTextInputOfAVeryLongDocumentIsLaidOutByTheLine(t *testing.T) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	engine := newTestEngine(t)
+	var document strings.Builder
+	for line := 0; line < 27094; line++ {
+		fmt.Fprintf(&document, "line %d 中文\n", line)
+	}
+	value := document.String()
+	start := strings.Index(value, "line 20000 ")
+	caret := utf8.RuneCountInString(value[:start]) + 8
+	input := platform.TextInput{X: 10, Y: 20, Width: 400, Height: 30, FontSize: 14, Multiline: true, Placed: true, HideNativeOverlays: true,
+		Color: platform.Color{Alpha: 1}, State: platform.TextState{Value: value, Selection: text.Range{Start: caret - 2, End: caret}}}
+	state := windowState{
+		textEngine: engine, textInput: input, textState: input.State, textEnabled: true, caretVisible: true,
+		baseTextLabelCount: 1, textLabels: make([]platform.TextLabel, 2), textRectangles: make([]render.Rectangle, textRectangleCount),
+	}
+	if err := state.updateTextVisuals(); err != nil {
+		t.Fatal(err)
+	}
+	label := state.textLabels[1]
+	if label.Value != "line 20000 中文" {
+		t.Fatalf("label = %q, want the caret's line", label.Value)
+	}
+	if state.layoutLine().value != label.Value {
+		t.Fatalf("layout line = %q", state.layoutLine().value)
+	}
+	if want := engine.Caret(label.Value, 14, 0, len("line 200")); state.textCaret(14, caret) != want || want <= 0 {
+		t.Fatalf("caret x = %v, want %v", state.textCaret(14, caret), want)
+	}
+	pixels, _, done := rasterizeProportional(t, platform.TextLabel{Value: label.Value, Width: 200, Height: 30, FontSize: 14, Color: platform.Color{Alpha: 1}}, 1, 200, 30, false)
+	defer done()
+	if len(pixels) == 0 {
+		t.Fatal("the line was not drawn")
 	}
 }

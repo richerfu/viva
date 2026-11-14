@@ -12,14 +12,17 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/vivaui/viva/gfx"
+	"github.com/vivaui/viva/internal/diag"
 	"github.com/vivaui/viva/internal/ibus"
 	"github.com/vivaui/viva/internal/input"
 	"github.com/vivaui/viva/internal/platform"
-	"github.com/vivaui/viva/ui"
 )
 
 type window struct {
 	fullscreen                atomic.Bool
+	topmost                   atomic.Bool
+	topmostConfigured         atomic.Bool
 	fullscreenHandler         func(bool)
 	minimumSize               *minimumSizeCache
 	mu                        sync.Mutex
@@ -37,21 +40,30 @@ type window struct {
 	themed       *themedCursors
 	cursorsTried bool
 	// render is what application cursor pictures need, tried once; renderErr says why it is nil.
-	render        *xcbRender
-	renderTried   bool
-	renderErr     error
-	clipboard     string
-	clipboardAtom uint32
-	utf8Atom      uint32
-	textAtom      uint32
-	targetsAtom   uint32
-	ownsClipboard bool
+	render         *xcbRender
+	renderTried    bool
+	renderErr      error
+	clipboard      string
+	clipboardHTML  string
+	clipboardFiles []string
+	clipboardAtom  uint32
+	htmlAtom       uint32
+	utf8Atom       uint32
+	textAtom       uint32
+	targetsAtom    uint32
+	uriListAtom    uint32
+	gnomeFilesAtom uint32
+	ownsClipboard  bool
 	// selections is the PRIMARY selection and the streams of data too large for one
 	// property (selection_linux.go).
 	selections selectionState
 	// width and height are the window's size in device pixels, as X reports it;
 	// the application sees them divided by the display scale.
 	width, height uint32
+	// depth is the drawable depth the window was created with: the root depth,
+	// or 32 for a window whose drawn frame needs alpha. It decides how a CPU
+	// renderer sends its pixels.
+	depth uint8
 	// scaleBits is the display scale as float32 bits (zero is 1): the event loop
 	// changes it and Frame reads it from any goroutine.
 	scaleBits atomic.Uint32
@@ -69,7 +81,14 @@ type window struct {
 	// maximizeHandler is the application's callback, run on the loop.
 	maximizeHandler platform.MaximizeHandler
 	// lastFrame is the content rectangle last reported to OnFrameChange.
-	lastFrame ui.Rect
+	lastFrame       gfx.Rect
+	configureX      int16
+	configureY      int16
+	hasConfigurePos bool
+	cachedRootX     int32
+	cachedRootY     int32
+	hasCachedRoot   bool
+	backPixel       uint32
 	// pingAtom and syncRequestAtom are the WM_PROTOCOLS messages the window
 	// manager checks it is alive with and paces a resize with; syncCounter is
 	// nil without the XSYNC extension (window_sync_linux.go).
@@ -118,13 +137,14 @@ type linuxWindowState struct {
 	config                  platform.Config
 	win                     *window
 	text                    *linuxTextInput
-	renderer                *vulkanRenderer
+	renderer                windowRenderer
 	router                  eventRouter
 	pendingKeyReleaseDetail uint8
 	pendingKeyReleaseTime   uint32
 	// held is an event read ahead for key autorepeat or drag motion compression;
 	// the loop handles it next.
 	held         unsafe.Pointer
+	heldQueue    []unsafe.Pointer
 	drag         xdndDrag
 	resizeEvents uint64
 	profile      bool
@@ -138,6 +158,8 @@ type linuxWindowState struct {
 	// before the window manager mapped it is gone.
 	hidden  bool
 	exposed bool
+	// visible is the last visibility reported to OnVisibility; a window starts as visible.
+	visible bool
 }
 
 type linuxApplication struct {
@@ -173,6 +195,7 @@ const (
 	commandDesktop
 	commandEnterFullscreen
 	commandExitFullscreen
+	commandSetSize
 )
 
 type nativeWindow struct {
@@ -281,7 +304,10 @@ func (application *linuxApplication) OpenWindow(config platform.Config) (platfor
 	if err := validateConfig(config); err != nil {
 		return nil, err
 	}
-	state := &linuxWindowState{application: application, config: config, profile: os.Getenv("VIVA_PROFILE_STARTUP") != ""}
+	state := &linuxWindowState{application: application, config: config, visible: true, profile: os.Getenv("VIVA_PROFILE_STARTUP") != ""}
+	// The launcher entry the progress bar is drawn on is the desktop file of
+	// the window's class, so the entry is told which one the program is.
+	launcherProgress.noteClass(config.Class)
 	if state.profile {
 		state.started = time.Now()
 	}
@@ -299,14 +325,25 @@ func (application *linuxApplication) OpenWindow(config platform.Config) (platfor
 	textInput.bindCaretWaker(win.postCaretBlink)
 	textInput.bindScale(win.displayScale)
 	initialRectangles, initialLabels := textInput.initial()
-	renderer, err := newVulkanRenderer(win.connection, win.id, win.width, win.height, win.displayScale(), config.ClearColor, initialRectangles, initialLabels, win.margin)
+	renderer, err := newWindowPainter(win, win.displayScale(), config.ClearColor, initialRectangles, initialLabels)
 	if err != nil {
 		textInput.close()
 		win.close()
 		return nil, err
 	}
 	state.renderer = renderer
-	if win.margin > 0 && !renderer.frame.alpha {
+	if config.SetFrameInterval != nil {
+		if _, vulkan := renderer.(*vulkanRenderer); vulkan {
+			// A FIFO present blocks until the compositor takes the frame, so the
+			// display paces the window; the runtime asks for the next frame as
+			// soon as the last one is shown.
+			config.SetFrameInterval(0)
+		} else {
+			// PutImage has no display clock to block on; keep the frames at 60 Hz.
+			config.SetFrameInterval(time.Second / 60)
+		}
+	}
+	if win.margin > 0 && !renderer.alpha() {
 		// The surface cannot composite with alpha, and a transparent margin would
 		// show black: the window goes without its drawn frame.
 		win.setMargin(0)
@@ -330,14 +367,19 @@ func (application *linuxApplication) OpenWindow(config platform.Config) (platfor
 				application.atspiFrame(state, frame.Accessibility)
 			}
 			merged, dirty, err := textInput.prepare(frame)
-			if err != nil || !dirty {
-				return err
+			if err == nil && dirty {
+				var changed bool
+				if changed, err = renderer.apply(merged); err == nil && changed {
+					err = renderer.present()
+				}
 			}
-			changed, err := renderer.apply(merged)
-			if err != nil || !changed {
-				return err
+			if err == nil && config.FramePresented != nil {
+				// The frame is shown, or had nothing to show: a present-paced
+				// frame clock may ask for the next one only now, so the event
+				// loop stays idle between frames and keeps reading input.
+				config.FramePresented()
 			}
-			return renderer.present()
+			return err
 		},
 	}
 	if err := renderer.present(); err != nil {
@@ -363,7 +405,12 @@ func (application *linuxApplication) OpenWindow(config platform.Config) (platfor
 	application.retryDesktopWatch()
 	activeWindow.Store(win)
 	if state.profile {
-		fmt.Fprintf(os.Stderr, "viva_first_frame_ms=%.3f\n", float64(time.Since(state.started).Microseconds())/1000)
+		elapsed := float64(time.Since(state.started).Microseconds()) / 1000
+		fmt.Fprintf(os.Stderr, "viva_first_frame_ms=%.3f\n", elapsed)
+		if diag.Enabled(diag.Debug) {
+			diag.Report(diag.Debug, "render", "first-frame", "first frame presented",
+				diag.Float("milliseconds", elapsed))
+		}
 	}
 	if os.Getenv("VIVA_TEST_AUTOCLOSE") != "" {
 		win.postClientMessage(win.closeAtom, 0)
@@ -433,9 +480,66 @@ func (application *linuxApplication) pollTimeout() int32 {
 
 // takeHeld returns the event read ahead, once.
 func (state *linuxWindowState) takeHeld() unsafe.Pointer {
+	if state.held == nil {
+		return nil
+	}
 	event := state.held
-	state.held = nil
+	if len(state.heldQueue) > 0 {
+		state.held = state.heldQueue[0]
+		state.heldQueue[0] = nil
+		state.heldQueue = state.heldQueue[1:]
+	} else {
+		state.held = nil
+		state.heldQueue = nil
+	}
 	return event
+}
+
+// readEvent is shared by dispatch and read-ahead: replayed events precede
+// anything newly arriving from the X server, including input boundaries.
+func (state *linuxWindowState) readEvent() unsafe.Pointer {
+	if event := state.takeHeld(); event != nil {
+		return event
+	}
+	return state.win.api.pollForEvent(state.win.connection)
+}
+
+// holdEvents puts read-ahead back before the unread suffix, in its original
+// order. A single boundary with no suffix needs no queue allocation.
+func (state *linuxWindowState) holdEvents(events ...unsafe.Pointer) {
+	count := 0
+	for _, event := range events {
+		if event != nil {
+			count++
+		}
+	}
+	if count == 0 {
+		return
+	}
+	previous := state.held
+	prefix := count - 1
+	if previous != nil {
+		prefix++
+	}
+	length := len(state.heldQueue)
+	state.heldQueue = append(state.heldQueue, make([]unsafe.Pointer, prefix)...)
+	copy(state.heldQueue[prefix:], state.heldQueue[:length])
+	next := -1
+	for _, event := range events {
+		if event == nil {
+			continue
+		}
+		if next < 0 {
+			state.held = event
+			next = 0
+		} else {
+			state.heldQueue[next] = event
+			next++
+		}
+	}
+	if previous != nil {
+		state.heldQueue[next] = previous
+	}
 }
 
 // maxQueuedDragMotions bounds the queued drag positions one dispatch may
@@ -445,42 +549,131 @@ func (state *linuxWindowState) takeHeld() unsafe.Pointer {
 const maxQueuedDragMotions = 256
 
 // nextEvent returns the next event of the window, with the queued positions of
-// a primary-button drag collapsed to their latest one: an application only
-// paints the pointer where it ended up, so an obsolete position would cost a
-// frame and a present for nothing. Every other event, and a motion that moves
-// to another window, root, child, screen or set of held buttons and modifiers,
-// is a boundary and is delivered as it was read, in order.
+// a primary-button drag or window resize collapsed to their latest one: an
+// application only paints the pointer or window size where it ended up, so an
+// obsolete step would cost a frame and a present for nothing. Every other
+// event, and a motion that moves to another window, root, child, screen or set
+// of held buttons and modifiers, is a boundary and is delivered as it was
+// read, in order.
 func (state *linuxWindowState) nextEvent() unsafe.Pointer {
-	event := state.takeHeld()
+	event := state.readEvent()
 	if event == nil {
-		event = state.win.api.pollForEvent(state.win.connection)
+		return nil
 	}
-	if event == nil || (*xcbGenericEvent)(event).ResponseType&0x7f != xcbMotionNotify {
+	switch (*xcbGenericEvent)(event).ResponseType & 0x7f {
+	case xcbMotionNotify:
+		return state.coalesceMotions(event)
+	case xcbConfigureNotify:
+		return state.coalesceConfigures(event)
+	default:
 		return event
 	}
+}
+
+func (state *linuxWindowState) coalesceMotions(event unsafe.Pointer) unsafe.Pointer {
 	motion := (*xcbInputEvent)(event)
 	if motion.State&xcbButton1Mask == 0 {
 		return event
 	}
 	// Skip stale drag positions, bounding each read-ahead batch under continuous input.
 	for range maxQueuedDragMotions {
-		next := state.win.api.pollForEvent(state.win.connection)
+		next := state.readEvent()
 		if next == nil {
 			break
 		}
 		if (*xcbGenericEvent)(next).ResponseType&0x7f != xcbMotionNotify {
-			state.held = next
+			state.holdEvents(next)
 			break
 		}
 		newer := (*xcbInputEvent)(next)
 		if newer.Event != motion.Event || newer.Root != motion.Root || newer.Child != motion.Child || newer.State != motion.State || newer.SameScreen != motion.SameScreen {
-			state.held = next
+			state.holdEvents(next)
 			break
 		}
 		*motion = *newer
 		state.win.api.free(next)
 	}
 	return event
+}
+
+func (state *linuxWindowState) coalesceConfigures(event unsafe.Pointer) unsafe.Pointer {
+	configure := (*xcbConfigureEvent)(event)
+	var heldSync unsafe.Pointer
+	var heldPointers []unsafe.Pointer
+	finish := func(boundary unsafe.Pointer) unsafe.Pointer {
+		if len(heldPointers) == 0 {
+			state.holdEvents(heldSync, boundary)
+		} else {
+			replay := make([]unsafe.Pointer, 0, len(heldPointers)+2)
+			replay = append(replay, heldSync)
+			replay = append(replay, heldPointers...)
+			replay = append(replay, boundary)
+			state.holdEvents(replay...)
+		}
+		return event
+	}
+	for range maxQueuedDragMotions {
+		next := state.readEvent()
+		if next == nil {
+			break
+		}
+		switch (*xcbGenericEvent)(next).ResponseType & 0x7f {
+		case xcbConfigureNotify:
+			newer := (*xcbConfigureEvent)(next)
+			if newer.Window != configure.Window {
+				return finish(next)
+			}
+			if heldSync != nil {
+				state.win.protocolMessage((*xcbClientEvent)(heldSync))
+				state.win.api.free(heldSync)
+				heldSync = nil
+			}
+			// Only stale positions are obsolete. Enter and Leave change hover
+			// state that no later motion necessarily restores, so they replay
+			// in order after the merged configure.
+			kept := heldPointers[:0]
+			for _, pointer := range heldPointers {
+				if (*xcbGenericEvent)(pointer).ResponseType&0x7f == xcbMotionNotify {
+					state.win.api.free(pointer)
+				} else {
+					kept = append(kept, pointer)
+				}
+			}
+			clear(heldPointers[len(kept):])
+			heldPointers = kept
+			*configure = *newer
+			state.win.api.free(next)
+		case xcbExpose:
+			expose := (*xcbExposeEvent)(next)
+			if expose.Window == state.win.id && !state.hidden && state.exposed {
+				state.win.api.free(next)
+				continue
+			}
+			return finish(next)
+		case xcbClientMessage:
+			message := (*xcbClientEvent)(next)
+			if message.Window == state.win.id && message.Format == 32 && message.Type == state.win.wmProtocols &&
+				state.win.syncRequestAtom != 0 && binary.LittleEndian.Uint32(message.Data[:4]) == state.win.syncRequestAtom && state.win.syncCounter != nil {
+				if heldSync != nil {
+					state.win.protocolMessage((*xcbClientEvent)(heldSync))
+					state.win.api.free(heldSync)
+				}
+				heldSync = next
+				continue
+			}
+			return finish(next)
+		case xcbMotionNotify, xcbEnterNotify, xcbLeaveNotify:
+			input := (*xcbInputEvent)(next)
+			if input.Event == state.win.id {
+				heldPointers = append(heldPointers, next)
+				continue
+			}
+			return finish(next)
+		default:
+			return finish(next)
+		}
+	}
+	return finish(nil)
 }
 
 // syncMaximized reads the window's maximized state from the window manager
@@ -538,7 +731,24 @@ func (application *linuxApplication) closeWindow(target *linuxWindowState) {
 		target.config.Waker.Unbind()
 	}
 	if target.profile {
-		fmt.Fprintf(os.Stderr, "viva_gpu_submissions=%d\nviva_gpu_full_rebuilds=%d\nviva_gpu_partial_updates=%d\nviva_resize_events=%d\nviva_goroutines=%d\n", target.renderer.submissions, target.renderer.rebuilds, target.renderer.partials, target.resizeEvents, runtime.NumGoroutine())
+		stats := target.renderer.stats()
+		fmt.Fprintf(os.Stderr, "viva_renderer=%s\n", stats.backend)
+		if stats.backend == "vulkan" {
+			fmt.Fprintf(os.Stderr, "viva_gpu_submissions=%d\nviva_gpu_full_rebuilds=%d\nviva_gpu_partial_updates=%d\n", stats.presents, stats.rebuilds, stats.partials)
+		} else {
+			fmt.Fprintf(os.Stderr, "viva_cpu_presents=%d\nviva_cpu_full_paints=%d\nviva_cpu_partial_paints=%d\n", stats.presents, stats.rebuilds, stats.partials)
+		}
+		fmt.Fprintf(os.Stderr, "viva_resize_events=%d\nviva_goroutines=%d\n", target.resizeEvents, runtime.NumGoroutine())
+		if diag.Enabled(diag.Debug) {
+			goroutines := runtime.NumGoroutine()
+			diag.Report(diag.Debug, "render", "window-stats", "window closed",
+				diag.String("renderer", stats.backend),
+				diag.Int("presents", int64(stats.presents)),
+				diag.Int("full_rebuilds", int64(stats.rebuilds)),
+				diag.Int("partial_updates", int64(stats.partials)),
+				diag.Int("resize_events", int64(target.resizeEvents)),
+				diag.Int("goroutines", int64(goroutines)))
+		}
 	}
 	if target.router.ime != nil {
 		target.router.ime.close()
@@ -548,6 +758,12 @@ func (application *linuxApplication) closeWindow(target *linuxWindowState) {
 		target.win.api.free(target.held)
 		target.held = nil
 	}
+	for _, event := range target.heldQueue {
+		if event != nil && target.win.api != nil {
+			target.win.api.free(event)
+		}
+	}
+	target.heldQueue = nil
 	target.win.saveClipboardToManager()
 	target.renderer.close()
 	target.text.close()
@@ -576,6 +792,14 @@ func (application *linuxApplication) fail(err error) {
 	application.closeAll()
 }
 
+func (win *window) configureRootOrigin() (int32, int32) {
+	if !win.hasCachedRoot {
+		win.cachedRootX, win.cachedRootY = win.rootOrigin()
+		win.hasCachedRoot = true
+	}
+	return win.cachedRootX, win.cachedRootY
+}
+
 // reportFrame tells the application where its content area is now, in logical
 // pixels. It asks the X server for the window's origin inside the frame the
 // window manager may have put it in, and reports only changes.
@@ -587,9 +811,10 @@ func (state *linuxWindowState) reportFrame() (int32, int32, bool) {
 	if config.OnFrameChange == nil || win.frame.maximized || win.fullscreen.Load() {
 		return 0, 0, false
 	}
-	x, y := win.contentOrigin()
+	rx, ry := win.configureRootOrigin()
+	x, y := rx+int32(win.margin), ry+int32(win.margin)
 	scale := win.displayScale()
-	frame := ui.Rect{
+	frame := gfx.Rect{
 		X: float32(x) / scale, Y: float32(y) / scale,
 		Width: float32(contentSize(win.width, win.margin)) / scale, Height: float32(contentSize(win.height, win.margin)) / scale,
 	}
@@ -614,6 +839,14 @@ func (state *linuxWindowState) handleEvent(event unsafe.Pointer) (bool, error) {
 	switch kind {
 	case xcbDestroyNotify:
 		return true, nil
+	case xcbMapNotify, xcbUnmapNotify:
+		// Mapped is what the user can see here: the window manager unmaps a minimized window
+		// and one that is on a desktop that is not showing. A compositor can hide a window
+		// that is mapped and covered without telling it; that is not reported.
+		if mapped := kind == xcbMapNotify; (*xcbMapEvent)(event).Window == win.id && config.OnVisibility != nil && state.visible != mapped {
+			state.visible = mapped
+			config.OnVisibility(mapped)
+		}
 	case xcbClientMessage:
 		message := (*xcbClientEvent)(event)
 		switch {
@@ -622,7 +855,7 @@ func (state *linuxWindowState) handleEvent(event unsafe.Pointer) (bool, error) {
 		case message.Format == 32 && message.Window == win.id && message.Type == win.closeAtom:
 			return true, nil
 		case message.Format == 32 && message.Window == win.id && message.Type == win.commandAtom:
-			return false, state.command(binary.LittleEndian.Uint32(message.Data[:4]))
+			return false, state.command(binary.LittleEndian.Uint32(message.Data[:4]), message.Data[:])
 		case message.Format == 32 && message.Window == win.id && message.Type == win.caretAtom:
 			generation := binary.LittleEndian.Uint32(message.Data[:4])
 			if frame, changed := textInput.blinkCaret(generation); changed {
@@ -681,9 +914,32 @@ func (state *linuxWindowState) handleEvent(event unsafe.Pointer) (bool, error) {
 	case xcbConfigureNotify:
 		configure := (*xcbConfigureEvent)(event)
 		width, height := uint32(configure.Width), uint32(configure.Height)
+		if renderer != nil {
+			// Capabilities can be shared with this configure's resize only. An
+			// obsolete event may need no resize; a later present must then query
+			// the surface again instead of rebuilding for these old dimensions.
+			renderer.forgetSurfaceCapabilities()
+			defer renderer.forgetSurfaceCapabilities()
+		}
+		moved := !win.hasConfigurePos || configure.X != win.configureX || configure.Y != win.configureY
+		if configure.Window == win.id {
+			win.configureX, win.configureY, win.hasConfigurePos = configure.X, configure.Y, true
+			if configure.ResponseType&0x80 != 0 {
+				win.cachedRootX, win.cachedRootY, win.hasCachedRoot = int32(configure.X), int32(configure.Y), true
+			} else if moved {
+				win.hasCachedRoot = false
+			}
+			if width > 0 && height > 0 && (width != win.width || height != win.height) {
+				if sw, sh := renderer.surfaceSize(width, height); sw > 0 && sh > 0 {
+					width, height = sw, sh
+				}
+			}
+		} else {
+			win.hasCachedRoot = false
+		}
 		marginChanged := false
 		maximizedChanged := false
-		if win.frame.stateAtom != 0 {
+		if win.frame.stateAtom != 0 && (win.frame.maximizePending || win.frameWanted || configure.Window != win.id) {
 			var err error
 			maximizedChanged, err = state.syncMaximized()
 			if err != nil {
@@ -700,9 +956,6 @@ func (state *linuxWindowState) handleEvent(event unsafe.Pointer) (bool, error) {
 		resized := false
 		if width > 0 && height > 0 && (width != win.width || height != win.height || marginChanged || state.frameGeometryDirty) {
 			win.width, win.height = width, height
-			if err := renderer.resize(width, height); err != nil {
-				return false, err
-			}
 			if err := state.resized(); err != nil {
 				return false, err
 			}
@@ -715,14 +968,16 @@ func (state *linuxWindowState) handleEvent(event unsafe.Pointer) (bool, error) {
 				_ = router.present(frame)
 			}
 		}
-		if win.tracker != nil && win.tracker.followsPosition() {
+		if (moved || resized) && win.tracker != nil && win.tracker.followsPosition() {
 			// A window dragged to another monitor may be on another scale.
 			if err := state.refreshScale(false); err != nil {
 				return false, err
 			}
 		}
-		x, y, frameKnown := state.reportFrame()
+		// A scale change can present another frame. Acknowledge the configure
+		// only after that frame succeeds too.
 		win.answerSync()
+		x, y, frameKnown := state.reportFrame()
 		if frameKnown {
 			win.updateMinimumSizeAt(config, x, y, true)
 		} else {
@@ -794,6 +1049,10 @@ func (state *linuxWindowState) handleEvent(event unsafe.Pointer) (bool, error) {
 		// and the virtual details accompany a change that happened elsewhere and
 		// must not forget keys held here.
 		keyboardFocus := focus.Detail == xcbNotifyAncestor || focus.Detail == xcbNotifyNonlinear
+		// The same details, outside a grab, are the window becoming active.
+		if realFocus && keyboardFocus && config.OnActivate != nil {
+			config.OnActivate()
+		}
 		if keyboardFocus {
 			// A key pressed or released while another window or a grab held the
 			// keyboard left no event here. The server's bitmap says which keys
@@ -850,7 +1109,7 @@ func (state *linuxWindowState) handleEvent(event unsafe.Pointer) (bool, error) {
 	case xcbExpose:
 		if (state.hidden || !state.exposed) && (*xcbExposeEvent)(event).Count == 0 {
 			state.hidden, state.exposed = false, true
-			return false, renderer.present()
+			return false, renderer.presentFull()
 		}
 	case xcbSelectionRequest:
 		return false, win.handleSelectionRequest((*xcbSelectionRequestEvent)(event))
@@ -860,10 +1119,12 @@ func (state *linuxWindowState) handleEvent(event unsafe.Pointer) (bool, error) {
 	return false, nil
 }
 
-// resized tells the application the window's logical size and presents the frame
-// it answers with. The renderer already has the device size.
+// resized tells the application the window's logical size, updates the scene
+// and swapchain for the new device size, and presents the frame it answers with.
 func (state *linuxWindowState) resized() error {
 	win, config, renderer := state.win, state.config, state.renderer
+	deviceWidth, deviceHeight := renderer.deviceSize()
+	willResizeSwapchain := win.width > 0 && win.height > 0 && (win.width != deviceWidth || win.height != deviceHeight)
 	if config.OnResize != nil {
 		frame, err := config.OnResize(win.logicalSize())
 		if err == nil {
@@ -871,10 +1132,27 @@ func (state *linuxWindowState) resized() error {
 			var dirty bool
 			merged, dirty, err = state.text.prepare(frame)
 			if err == nil && dirty {
-				_, err = renderer.apply(merged)
+				if willResizeSwapchain {
+					_, err = renderer.stage(merged)
+				} else {
+					_, err = renderer.apply(merged)
+				}
 			}
 		}
 		if err != nil {
+			return err
+		}
+	}
+	if !win.frameWanted && win.connection != 0 && win.id != 0 {
+		if first, ok := renderer.firstRectangle(); ok && first.Kind == 0 && first.Radius == 0 && first.Bounds.X <= 0 && first.Bounds.Y <= 0 && first.Color.Alpha >= 1 {
+			if pixel := clearPixel(platform.Color{Red: float64(first.Color.Red), Green: float64(first.Color.Green), Blue: float64(first.Color.Blue), Alpha: 1}); pixel != win.backPixel {
+				win.backPixel = pixel
+				win.api.changeWindow(win.connection, win.id, xcbCWBackPixel, &pixel)
+			}
+		}
+	}
+	if willResizeSwapchain {
+		if err := renderer.resize(win.width, win.height); err != nil {
 			return err
 		}
 	}
@@ -893,11 +1171,12 @@ func (state *linuxWindowState) refreshScale(reload bool) error {
 		return nil
 	}
 	if reload {
+		win.hasCachedRoot = false
 		win.tracker.reload()
 		// The look, the motion preference or the fonts may be what changed.
 		state.application.announce(win.tracker.publish())
 	}
-	x, y := win.rootOrigin()
+	x, y := win.configureRootOrigin()
 	if win.tracker.followsPosition() || reload {
 		win.tracker.reloadMonitors()
 	}
@@ -936,6 +1215,19 @@ func (state *linuxWindowState) applyScale(scale float32) error {
 	win.api.configureWindow(win.connection, win.id, xcbConfigWindowWidth|xcbConfigWindowHeight, &size[0])
 	win.api.flush(win.connection)
 	return state.resized()
+}
+
+func clearPixel(color platform.Color) uint32 {
+	channel := func(v float64) uint32 {
+		if !(v > 0) {
+			return 0
+		}
+		if v >= 1 {
+			return 255
+		}
+		return uint32(math.Round(v * 255))
+	}
+	return channel(color.Red)<<16 | channel(color.Green)<<8 | channel(color.Blue)
 }
 
 func validateConfig(config platform.Config) error {
@@ -1030,14 +1322,17 @@ func openWindow(config platform.Config) (*window, error) {
 	if config.OnKey != nil || config.OnShortcut != nil {
 		eventMask |= xcbEventKeyPress | xcbEventKeyRelease
 	}
-	values := [2]uint32{win.screen.BlackPixel, eventMask}
+	win.backPixel = clearPixel(config.ClearColor)
+	values := [3]uint32{win.backPixel, xcbGravityNorthWest, eventMask}
 	x, y := win.panelOrigin(config)
 	if win.frameWanted {
 		win.createFrameWindow(frameVisual, eventMask, x, y)
+		win.depth = 32
 		win.setFrameExtents(win.margin)
 		win.updateInputRegion()
 	} else {
-		api.createWindow(connection, xcbCopyFromParent, win.id, win.screen.Root, x, y, uint16(win.width), uint16(win.height), 0, xcbWindowClassInput, win.screen.RootVisual, xcbCWBackPixel|xcbCWEventMask, &values[0])
+		api.createWindow(connection, xcbCopyFromParent, win.id, win.screen.Root, x, y, uint16(win.width), uint16(win.height), 0, xcbWindowClassInput, win.screen.RootVisual, xcbCWBackPixel|xcbCWBitGravity|xcbCWEventMask, &values[0])
+		win.depth = win.screen.RootDepth
 	}
 	if config.WindowMode != platform.WindowTitled {
 		motifHints, atomErr := api.atom(connection, "_MOTIF_WM_HINTS")
@@ -1174,6 +1469,25 @@ func (win *window) postClientMessage(atom, value uint32) {
 	win.api.flush(win.connection)
 }
 
+func (win *window) postClientSize(width, height uint32) {
+	win.mu.Lock()
+	defer win.mu.Unlock()
+	if win.connection == 0 || win.commandAtom == 0 {
+		return
+	}
+	event := xcbClientEvent{
+		ResponseType: xcbClientMessage,
+		Format:       32,
+		Window:       win.id,
+		Type:         win.commandAtom,
+	}
+	binary.LittleEndian.PutUint32(event.Data[0:4], commandSetSize)
+	binary.LittleEndian.PutUint32(event.Data[4:8], width)
+	binary.LittleEndian.PutUint32(event.Data[8:12], height)
+	win.api.sendEvent(win.connection, 0, win.id, 0, (*byte)(unsafe.Pointer(&event)))
+	win.api.flush(win.connection)
+}
+
 func (win *window) close() {
 	win.mu.Lock()
 	defer win.mu.Unlock()
@@ -1287,15 +1601,15 @@ func (state *linuxWindowState) releaseScancodes(scancodes []uint32) error {
 // reports whether the key is really up, for a terminal that wants releases.
 func (state *linuxWindowState) keyReleased(release *xcbInputEvent) bool {
 	ime := state.router.ime
-	wanted := state.router.wantsKeyReleases()
+	wanted := state.router.wantsKeyReleases() || state.router.wantsModifierTap(state.win.keymap.key(release.Detail))
 	if (ime == nil || !ime.active) && !wanted {
 		// No delivery path runs for this release; forget the key here so it
 		// cannot linger as held when a terminal takes over.
 		state.router.modifierKeys.release(uint32(release.Detail))
 		return false
 	}
-	if next := state.win.api.pollForEvent(state.win.connection); next != nil {
-		state.held = next
+	if next := state.readEvent(); next != nil {
+		state.holdEvents(next)
 		if (*xcbGenericEvent)(next).ResponseType&0x7f == xcbKeyPress {
 			press := (*xcbInputEvent)(next)
 			if press.Detail == release.Detail && press.Time == release.Time {

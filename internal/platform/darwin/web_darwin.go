@@ -3,7 +3,7 @@
 package darwin
 
 /*
-#cgo LDFLAGS: -framework Cocoa -framework WebKit -framework QuartzCore
+#cgo LDFLAGS: -framework Cocoa -framework WebKit -framework QuartzCore -framework Network
 #include <stdlib.h>
 #include "web_darwin.h"
 */
@@ -12,13 +12,15 @@ import "C"
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"slices"
 	"strings"
+	"sync"
 	"unsafe"
 
+	"github.com/vivaui/viva/gfx"
 	"github.com/vivaui/viva/internal/platform"
 	"github.com/vivaui/viva/internal/render"
-	"github.com/vivaui/viva/ui"
 )
 
 // Web pages inside the window (ADR 0064): WKWebView, one per page, subviews of the window's Metal
@@ -36,7 +38,7 @@ type webState struct {
 	rects      []platform.NativeView
 	rectangles []render.Rectangle
 	labels     []platform.TextLabel
-	cuts       []ui.Rect
+	cuts       []gfx.Rect
 	scratch    []C.double
 }
 
@@ -49,7 +51,7 @@ type darwinWeb struct {
 	closed bool
 	// placed is where the page was last put, to leave AppKit alone when nothing changed.
 	placed  platform.NativeView
-	cutsSet []ui.Rect
+	cutsSet []gfx.Rect
 	shown   bool
 }
 
@@ -65,6 +67,16 @@ func newWebState(run *runState, host *platform.WebHost, initial []platform.Nativ
 
 // open is WebHost.Open.
 func (w *webState) open(config platform.WebViewConfig) (platform.WebView, error) {
+	direct := C.int(0)
+	if config.Proxy != "" {
+		if config.Proxy != platform.WebProxyDirect {
+			return nil, fmt.Errorf("%w: macOS cannot hold a page to a SOCKS5 proxy", platform.ErrWebViewUnsupported)
+		}
+		if C.viva_web_direct_supported() == 0 {
+			return nil, fmt.Errorf("%w: direct web networking requires macOS 14 or newer", platform.ErrWebViewUnsupported)
+		}
+		direct = 1
+	}
 	if w.run.closed || w.token == nil {
 		return nil, platform.ErrWebViewUnsupported
 	}
@@ -87,10 +99,20 @@ func (w *webState) open(config platform.WebViewConfig) (platform.WebView, error)
 		scheme = C.CString(config.Scheme.Name)
 		defer C.free(unsafe.Pointer(scheme))
 	}
-	script := C.CString(platform.WebBridgeScript)
+	scriptText := platform.WebBridgeScript
+	mainFrameOnly := C.int(0)
+	if config.BridgeMainFrameOnly {
+		scriptText = platform.WebBridgeMainFrameOnlyScript
+		mainFrameOnly = 1
+	}
+	script := C.CString(scriptText)
 	defer C.free(unsafe.Pointer(script))
+	var ephemeral C.int
+	if config.Ephemeral {
+		ephemeral = 1
+	}
 	var failure *C.char
-	native := C.viva_web_open(view, C.uint32_t(config.ID), C.uintptr_t(w.run.callbackHandle), url, html, base, script, scheme, &failure)
+	native := C.viva_web_open(view, C.uint32_t(config.ID), C.uintptr_t(w.run.callbackHandle), url, html, base, script, mainFrameOnly, scheme, ephemeral, direct, &failure)
 	if native == nil {
 		message := "the page could not be created"
 		if failure != nil {
@@ -99,6 +121,7 @@ func (w *webState) open(config platform.WebViewConfig) (platform.WebView, error)
 		}
 		return nil, fmt.Errorf("darwin: %s", message)
 	}
+	C.viva_web_set_top_corner_radius(native, C.double(config.TopCornerRadius))
 	page := &darwinWeb{state: w, id: config.ID, native: native, config: config}
 	w.pages[config.ID] = page
 	w.layout(true)
@@ -239,6 +262,8 @@ func (w *webState) layout(force bool) {
 func (w *webState) closeAll() {
 	for _, page := range w.pages {
 		page.closed = true
+		// An answer still being made would otherwise message a task of a view that no longer exists.
+		C.viva_web_cancel_scheme_tasks(page.native)
 	}
 	clear(w.pages)
 }
@@ -267,20 +292,110 @@ func vivaWebLoad(handle C.uintptr_t, id C.uint32_t, phase C.int, url *C.char) {
 	page.config.OnLoad(platform.WebLoad{Phase: platform.WebLoadPhase(phase), URL: C.GoString(url)})
 }
 
-//export vivaWebServe
-func vivaWebServe(handle C.uintptr_t, id C.uint32_t, scheme, path *C.char, mime **C.char, data **C.uchar, length *C.size_t) C.int {
+// vivaWebNavigate asks the application about a navigation before WebKit makes it. It answers 1 to
+// allow, which is what an application that set no Navigate wants.
+//
+//export vivaWebNavigate
+func vivaWebNavigate(handle C.uintptr_t, id C.uint32_t, url *C.char, mainFrame, userGesture C.int) C.int {
 	page := pageOf(handle, id)
-	if page == nil || page.config.Scheme == nil || page.config.Scheme.Serve == nil ||
+	if page == nil || page.config.Navigate == nil {
+		return 1
+	}
+	navigation := platform.WebNavigation{
+		URL:         C.GoString(url),
+		MainFrame:   mainFrame != 0,
+		UserGesture: userGesture != 0,
+	}
+	if !page.config.Navigate(navigation) {
+		return 0
+	}
+	return 1
+}
+
+// vivaWebNewWindow asks the application about a window.open or target=_blank. It answers 1 when the
+// address was handed to the system's browser, and 0 otherwise; the page itself is never opened in
+// the window.
+//
+//export vivaWebNewWindow
+func vivaWebNewWindow(handle C.uintptr_t, id C.uint32_t, url *C.char) C.int {
+	page := pageOf(handle, id)
+	if page == nil || page.config.NewWindow == nil {
+		return 0
+	}
+	address := C.GoString(url)
+	if !page.config.NewWindow(address) || !platform.OpenableURL(address) {
+		return 0
+	}
+	_ = OpenURL(address)
+	return 1
+}
+
+// vivaWebDownload asks the application about a download before its body is written. It answers 1
+// to allow and 0 otherwise, which is what an application that set no Download wants.
+//
+//export vivaWebDownload
+func vivaWebDownload(handle C.uintptr_t, id C.uint32_t, url *C.char) C.int {
+	page := pageOf(handle, id)
+	if page == nil || page.config.Download == nil {
+		return 0
+	}
+	if !page.config.Download(C.GoString(url)) {
+		return 0
+	}
+	return 1
+}
+
+// vivaWebDownloadPath is where a download the application allowed is saved: a free name under
+// folder, or under the user's downloads folder when the platform names none. The caller frees the
+// result.
+//
+//export vivaWebDownloadPath
+func vivaWebDownloadPath(folder, suggested, address *C.char) *C.char {
+	directory := C.GoString(folder)
+	if directory == "" {
+		directory = platform.DownloadsFolder()
+	}
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		return nil
+	}
+	name := platform.DownloadFileName(C.GoString(suggested), C.GoString(address))
+	return C.CString(platform.FreeDownloadPath(directory, name))
+}
+
+//export vivaWebServe
+func vivaWebServe(handle C.uintptr_t, id C.uint32_t, scheme, path *C.char, status *C.int, headers **C.char, data **C.uchar, length *C.size_t) C.int {
+	page := pageOf(handle, id)
+	if page == nil || page.config.Scheme == nil ||
 		!strings.EqualFold(page.config.Scheme.Name, C.GoString(scheme)) {
 		return 0
 	}
-	contentType, body, ok := page.config.Scheme.Serve(C.GoString(path))
-	if !ok {
+	response, found := platform.ServeWebScheme(page.config.Scheme, C.GoString(path))
+	answer := platform.AnswerWebResponse(response, found)
+	*status = C.int(answer.Status)
+	*headers = C.CString(answer.HeaderBlock())
+	*data = (*C.uchar)(C.CBytes(answer.Body))
+	*length = C.size_t(len(answer.Body))
+	return 1
+}
+
+//export vivaWebServeAsync
+func vivaWebServeAsync(handle C.uintptr_t, id C.uint32_t, scheme, path *C.char, request C.uint64_t) C.int {
+	page := pageOf(handle, id)
+	if page == nil || page.config.Scheme == nil || page.config.Scheme.ServeAsync == nil ||
+		!strings.EqualFold(page.config.Scheme.Name, C.GoString(scheme)) {
 		return 0
 	}
-	*mime = C.CString(contentType)
-	*data = (*C.uchar)(C.CBytes(body))
-	*length = C.size_t(len(body))
+	serve := page.config.Scheme.ServeAsync
+	var answered sync.Once
+	serve(platform.WebRequest{Path: C.GoString(path)}, func(response platform.WebResponse) {
+		// A request has one answer: a second call has nothing left to answer into, and the bridge
+		// frees the buffers of one whose page closed meanwhile.
+		answered.Do(func() {
+			answer := platform.AnswerWebResponse(response, true)
+			C.viva_web_scheme_answer(request, C.int(answer.Status), C.CString(answer.HeaderBlock()),
+				(*C.uchar)(C.CBytes(answer.Body)), C.size_t(len(answer.Body)))
+		})
+	})
 	return 1
 }
 

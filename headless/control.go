@@ -13,7 +13,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/vivaui/viva/app"
-	"github.com/vivaui/viva/ui"
+	"github.com/vivaui/viva/gfx"
 )
 
 // Serve runs the line protocol on in and out until "quit" or the end of input.
@@ -63,11 +63,25 @@ import (
 //	                           (a dialog fading in) are played to their end first. With
 //	                           now, write the current frame as it is, so wait MS; shot
 //	                           PATH now catches an animation MS into it
-//	record DIR MS [FPS]        play MS more of animation and write it to DIR as a PNG
+//	record DIR MS [FPS] [input]
+//	                           play MS more of animation and write it to DIR as a PNG
 //	                           sequence and manifest.json, sampling FPS frames a second
 //	                           (default 60); frames that did not change are written once
-//	                           with a longer duration, and ok reports the count
+//	                           with a longer duration, and ok reports the count. With
+//	                           input, a ring where a press landed and a chip naming the
+//	                           keys typed are drawn over the frames they follow
 //	find "label"               ok id=7 x=.. y=.. w=.. h=.. label=".."
+//	                           A label argument of click, dblclick, rightclick and find may also
+//	                           be a selector: id:home/save (an identity, in full or from any "/"),
+//	                           button:Save (a name restricted to a role), checkbox: (any checkbox).
+//	tree [filter]              one line per control, back to front: role, id, label, value, state
+//	                           (focused disabled checked covered ...), position; it is what to
+//	                           read to learn what the frame can do and what to name in a selector
+//	expect CONDITION [within MS]  ok when the condition holds, else error naming what was expected
+//	                           and what the frame has; within MS waits up to MS real ms for it.
+//	                           Conditions: text T | no-text T | exists SEL | absent SEL | count SEL N |
+//	                           state SEL FLAG... | focus SEL|none | editor V|none|contains T |
+//	                           layout clean | named (see Session.Expect)
 //	hits [filter]              one line per control, then ok
 //	texts [filter]             one line per painted text, then ok
 //	layout                     one line per suspicious spot (text cut off, spilling out of its
@@ -80,6 +94,7 @@ import (
 //	clipimage [PATH|clear]     read (ok image N bytes | ok none) or replace the private clipboard's image with a PNG file
 //	openedurl                  report the last public OpenURL request
 //	openedpath                 report the last OpenPath request
+//	revealedpath               report the last RevealPath request
 //	schemehandlers [SCHEME...] declare which custom URL schemes have a registered application (none: clear)
 //	openfiles PATH...|cancel   queue the next native open-dialog result
 //	opendirectory PATH|cancel  queue the next native directory-dialog result
@@ -151,6 +166,15 @@ func execute(session *Session, line string) (reply string, quit bool) {
 			return finish(fmt.Errorf("openedpath takes no arguments"), "")
 		}
 		target, ok := session.driver.LastOpenedPath()
+		if !ok {
+			return finish(nil, " none")
+		}
+		return finish(nil, " "+strconv.Quote(target))
+	case "revealedpath":
+		if rest != "" {
+			return finish(fmt.Errorf("revealedpath takes no arguments"), "")
+		}
+		target, ok := session.driver.LastRevealedPath()
 		if !ok {
 			return finish(nil, " none")
 		}
@@ -262,7 +286,7 @@ func execute(session *Session, line string) (reply string, quit bool) {
 		}
 		return finish(err, "")
 	case "drop", "dragover", "dragleave":
-		event := ui.FileDropEvent{Phase: ui.FileDropLeave}
+		event := gfx.FileDropEvent{Phase: gfx.FileDropLeave}
 		if command != "dragleave" {
 			if len(arguments) < 2 || command == "drop" && len(arguments) < 3 {
 				return finish(fmt.Errorf("%s needs X Y%s", command, map[bool]string{true: " and at least one path"}[command == "drop"]), "")
@@ -271,9 +295,9 @@ func execute(session *Session, line string) (reply string, quit bool) {
 			if err != nil {
 				return finish(err, "")
 			}
-			event = ui.FileDropEvent{Phase: ui.FileDropOver, X: values[0], Y: values[1]}
+			event = gfx.FileDropEvent{Phase: gfx.FileDropOver, X: values[0], Y: values[1]}
 			if command == "drop" {
-				event.Phase, event.Paths = ui.FileDropDrop, arguments[2:]
+				event.Phase, event.Paths = gfx.FileDropDrop, arguments[2:]
 			}
 		}
 		accepted, err := session.Drop(event)
@@ -290,14 +314,14 @@ func execute(session *Session, line string) (reply string, quit bool) {
 		if err != nil {
 			return finish(err, "")
 		}
-		var modifiers ui.Modifiers
+		var modifiers gfx.Modifiers
 		if len(arguments) == 5 {
 			modifiers, err = parseModifiers(arguments[4])
 			if err != nil {
 				return finish(err, "")
 			}
 		}
-		return finish(session.Scroll(ui.ScrollEvent{
+		return finish(session.Scroll(gfx.ScrollEvent{
 			Modifiers: modifiers, X: values[0], Y: values[1],
 			DeltaX: values[2], DeltaY: values[3], Precise: true,
 		}), "")
@@ -382,7 +406,7 @@ func execute(session *Session, line string) (reply string, quit bool) {
 		if err != nil {
 			return finish(err, "")
 		}
-		return finish(session.driver.SetFullscreenMonitor(ui.Rect{
+		return finish(session.driver.SetFullscreenMonitor(gfx.Rect{
 			X: float32(bounds[0]), Y: float32(bounds[1]), Width: float32(bounds[2]), Height: float32(bounds[3]),
 		}), "")
 	case "wait":
@@ -430,18 +454,22 @@ func execute(session *Session, line string) (reply string, quit bool) {
 		err := session.Screenshot(arguments[0])
 		return finish(err, " "+arguments[0])
 	case "record":
-		if len(arguments) < 2 || len(arguments) > 3 {
-			return finish(fmt.Errorf("record needs a directory and a duration in ms, and optionally fps"), "")
+		if len(arguments) < 2 || len(arguments) > 4 {
+			return finish(fmt.Errorf("record needs a directory and a duration in ms, and optionally fps and input"), "")
 		}
 		milliseconds, err := strconv.ParseFloat(arguments[1], 64)
 		if err != nil {
 			return finish(fmt.Errorf("record: %q is not a number", arguments[1]), "")
 		}
 		options := RecordOptions{Duration: time.Duration(milliseconds * float64(time.Millisecond))}
-		if len(arguments) == 3 {
-			fps, err := strconv.Atoi(arguments[2])
+		for _, argument := range arguments[2:] {
+			if argument == "input" {
+				options.ShowInput = true
+				continue
+			}
+			fps, err := strconv.Atoi(argument)
 			if err != nil {
-				return finish(fmt.Errorf("record: fps %q is not a whole number", arguments[2]), "")
+				return finish(fmt.Errorf("record: %q is neither fps nor input", argument), "")
 			}
 			options.FPS = fps
 		}
@@ -454,11 +482,18 @@ func execute(session *Session, line string) (reply string, quit bool) {
 		if len(arguments) != 1 {
 			return finish(fmt.Errorf("find needs one label"), "")
 		}
-		hit, found := session.Hit(arguments[0])
-		if !found {
-			return finish(fmt.Errorf("no control labelled %q", arguments[0]), "")
+		hit, err := session.Locate(arguments[0])
+		if err != nil {
+			return finish(err, "")
 		}
 		return finish(nil, " "+describeHit(session.Snapshot().Tree, hit))
+	case "tree":
+		for _, line := range session.Tree(strings.Join(arguments, " ")) {
+			data.WriteString(line + "\n")
+		}
+		return finish(nil, "")
+	case "expect":
+		return finish(session.Expect(arguments...), "")
 	case "hits":
 		filter := strings.ToLower(strings.Join(arguments, " "))
 		for _, hit := range session.Snapshot().Hits {
@@ -507,7 +542,7 @@ func execute(session *Session, line string) (reply string, quit bool) {
 	return finish(fmt.Errorf("unknown command %q", command), "")
 }
 
-func describeHit(tree *ui.Tree, hit ui.Hit) string {
+func describeHit(tree *gfx.Tree, hit gfx.Hit) string {
 	return fmt.Sprintf("id=%s x=%g y=%g w=%g h=%g label=%q", tree.Text(hit.ID), hit.Bounds.X, hit.Bounds.Y, hit.Bounds.Width, hit.Bounds.Height, hit.Label)
 }
 
@@ -573,7 +608,7 @@ func splitArguments(text string) ([]string, error) {
 // Session for config and serves the line protocol on standard input and
 // output instead of opening a window. VIVA_HEADLESS_SCALE sets the screenshot
 // scale (default 2).
-func Run(config app.Config, canvas *ui.Canvas) error {
+func Run(config app.Config, canvas *gfx.Canvas) error {
 	options := Options{}
 	if value := os.Getenv("VIVA_HEADLESS_SCALE"); value != "" {
 		scale, err := strconv.ParseFloat(value, 64)

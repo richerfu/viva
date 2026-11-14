@@ -3,8 +3,8 @@
 package app
 
 import (
+	"github.com/vivaui/viva/gfx"
 	windowsplatform "github.com/vivaui/viva/internal/platform/windows"
-	"github.com/vivaui/viva/ui"
 )
 
 func defaultNativeClipboardText() (string, error) { return windowsplatform.ClipboardText() }
@@ -13,10 +13,14 @@ func defaultNativeHasClipboardImage() bool { return windowsplatform.HasClipboard
 
 func defaultNativeClipboardImagePNG() ([]byte, error) { return windowsplatform.ClipboardImagePNG() }
 
+func defaultNativeClipboardFiles() ([]string, error) { return windowsplatform.ClipboardFiles() }
+
+func defaultNativeSetClipboardFiles(paths []string) error { return windowsplatform.SetClipboardFiles(paths) }
+
 func defaultNativeReduceMotion() bool { return windowsplatform.ReduceMotion() }
 
 // nativeTextEngine is the platform's text engine; nil keeps the reference metrics.
-func defaultNativeTextEngine() ui.TextEngine { return windowsplatform.TextEngine() }
+func defaultNativeTextEngine() gfx.TextEngine { return windowsplatform.TextEngine() }
 
 func defaultNativePreferredLanguages() []string { return windowsplatform.PreferredLanguages() }
 
@@ -65,7 +69,27 @@ func defaultNativeSaveFile(options SaveFileOptions) (string, error) {
 	}
 	return path, err
 }
+
+func defaultNativeSaveFileWithCheckbox(options SaveFileOptions, checkbox SaveFileCheckbox) (SaveFileSelection, error) {
+	filters := make([]windowsplatform.FileFilter, len(options.Filters))
+	for index, filter := range options.Filters {
+		filters[index] = windowsplatform.FileFilter{Name: filter.Name, Pattern: filter.Pattern}
+	}
+	path, checked, canceled, err := windowsplatform.SaveFileWithCheckbox(windowsplatform.SaveFileOptions{
+		Title: options.Title, SuggestedName: options.SuggestedName,
+		DefaultExtension: options.DefaultExtension, Filters: filters,
+	}, checkbox.Label, checkbox.Checked)
+	if canceled {
+		return SaveFileSelection{}, ErrCanceled
+	}
+	if err != nil {
+		return SaveFileSelection{}, err
+	}
+	return SaveFileSelection{Path: path, Checked: checked}, nil
+}
 func defaultNativeOpenURL(target string) error { return windowsplatform.OpenURL(target) }
+
+func defaultNativeRevealPath(path string) error { return windowsplatform.RevealPath(path) }
 
 func defaultNativeOpenWith(executable, path string) error {
 	return windowsplatform.OpenWith(executable, path)
@@ -109,6 +133,6 @@ func defaultNativeSetAppearance(appearance Appearance) {
 	windowsplatform.SetAppearance(appearance == AppearanceLight, appearance == AppearanceDark)
 }
 
-func defaultNativeSetCursorImage(image *ui.CursorImage) error {
+func defaultNativeSetCursorImage(image *gfx.CursorImage) error {
 	return windowsplatform.SetCursorImage(image)
 }

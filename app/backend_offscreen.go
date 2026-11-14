@@ -7,11 +7,11 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/vivaui/viva/gfx"
 	"github.com/vivaui/viva/internal/platform"
 	"github.com/vivaui/viva/internal/raster"
 	"github.com/vivaui/viva/internal/render"
 	"github.com/vivaui/viva/internal/scene"
-	"github.com/vivaui/viva/ui"
 )
 
 // BackendOffscreenConfig describes an independent drawing target. An offscreen
@@ -111,7 +111,7 @@ func (offscreen *rasterOffscreen) Set(frame BackendFrame) error {
 				Value: value, X: input.X, Y: input.Y, Width: input.Width, Height: input.Height,
 				FontSize: input.FontSize, Weight: 400, Layer: input.Layer,
 				Mono: input.Terminal || input.MonoFace != 0, MonoFace: input.MonoFace, Color: input.Color,
-				Clipped: true, Clip: ui.Rect{X: input.X, Y: input.Y, Width: input.Width, Height: input.Height},
+				Clipped: true, Clip: gfx.Rect{X: input.X, Y: input.Y, Width: input.Width, Height: input.Height},
 			}
 			prepared, ok, err := offscreen.prepareLabel(label)
 			if err != nil {

@@ -1,9 +1,10 @@
-//go:build darwin || windows || linux || viva_custom_backend
+//go:build darwin || windows || linux || (js && wasm) || viva_custom_backend
 
 package app
 
 import (
 	"fmt"
+	"path/filepath"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -15,16 +16,27 @@ const driverSaveFileQueueSize = 8
 const driverOpenFilesQueueSize = 8
 const driverOpenDirectoryQueueSize = 8
 
+type driverGlobalBinding struct {
+	shortcut GlobalShortcut
+	pressed  func()
+}
+
 type driverSystem struct {
+	globalBindings []*driverGlobalBinding
+	globalMu       sync.Mutex
 	driver         *Driver
 	clipboardImage []byte   // PNG bytes; the clipboard holds this or text, never both
+	clipboardFiles []string // paths of copied files, held beside the text a file manager adds
+	clipboardHTML  string   // the rich flavour SetClipboardHTML last wrote beside the plain one
 	primary        string   // the primary selection (Linux only), private like the clipboard
 	schemes        []string // the URL schemes SetSchemeHandlers declared as registered
 }
 
 type driverSaveFileResponse struct {
-	path string
-	err  error
+	path         string
+	checked      bool
+	withCheckbox bool
+	err          error
 }
 
 type driverOpenFilesResponse struct {
@@ -38,13 +50,26 @@ type driverOpenDirectoryResponse struct {
 }
 
 var activeDriverSystem atomic.Pointer[driverSystem]
+
+// A worker may finish after a driver closes, or before a tool's first driver
+// opens. Once a process has installed a driver or a replacement runner, its
+// RevealPath calls must never fall through to a real file manager.
+var nonNativeSystemUsed atomic.Bool
+
+func markNonNativeSystemUsed() { nonNativeSystemUsed.Store(true) }
+
+var revealedPaths struct {
+	sync.Mutex
+	path string
+	ok   bool
+}
 var driverSystems struct {
 	sync.Mutex
 	values []*driverSystem
 }
 
 func driverClipboardText() (string, error, bool) {
-	system := activeDriverSystem.Load()
+	system := selectedDriverSystem()
 	if system == nil {
 		return "", nil, false
 	}
@@ -52,18 +77,53 @@ func driverClipboardText() (string, error, bool) {
 }
 
 func driverSetClipboardText(value string) (error, bool) {
-	system := activeDriverSystem.Load()
+	system := selectedDriverSystem()
 	if system == nil {
 		return nil, false
 	}
-	system.driver.clipboard, system.driver.system.clipboardImage = value, nil
+	system.driver.SetClipboard(value)
+	return nil, true
+}
+
+// SetClipboardHTML makes the driver's private clipboard hold both flavours of a
+// rich copy, as SetClipboardHTML does on the system clipboard: html beside alt
+// as the plain text, replacing the image and the files. An empty html writes
+// alt as plain text only, like SetClipboard.
+func (driver *Driver) SetClipboardHTML(html, alt string) {
+	driver.system.clipboardHTML = html
+	driver.clipboard, driver.system.clipboardImage, driver.system.clipboardFiles = alt, nil, nil
+}
+
+// ClipboardHTML is the rich flavour the driver's private clipboard holds, ""
+// when the last copy was plain. The string is the driver's own; do not modify
+// it.
+func (driver *Driver) ClipboardHTML() string { return driver.system.clipboardHTML }
+
+func driverSetClipboardFiles(paths []string) (error, bool) {
+	system := selectedDriverSystem()
+	if system == nil {
+		return nil, false
+	}
+	system.driver.SetClipboardFiles(paths)
+	return nil, true
+}
+
+// driverSetClipboardHTML answers the rich copy of a driver-backed run: the
+// driver's private clipboard holds html beside alt as its text, the shape the
+// native paste paths already read, and anything else copied clears both.
+func driverSetClipboardHTML(html, alt string) (error, bool) {
+	system := selectedDriverSystem()
+	if system == nil {
+		return nil, false
+	}
+	system.driver.SetClipboardHTML(html, alt)
 	return nil, true
 }
 
 // driverSetPrimarySelection and driverPrimarySelection are the primary selection of a driver-backed
 // run, which exists where the real one does, on Linux.
 func driverSetPrimarySelection(value string) (error, bool) {
-	system := activeDriverSystem.Load()
+	system := selectedDriverSystem()
 	if system == nil {
 		return nil, false
 	}
@@ -75,7 +135,7 @@ func driverSetPrimarySelection(value string) (error, bool) {
 }
 
 func driverPrimarySelection() (string, error, bool) {
-	system := activeDriverSystem.Load()
+	system := selectedDriverSystem()
 	if system == nil {
 		return "", nil, false
 	}
@@ -93,7 +153,7 @@ var driverSecrets struct {
 }
 
 func driverStoreSecret(service, account string, secret []byte) (error, bool) {
-	if activeDriverSystem.Load() == nil {
+	if selectedDriverSystem() == nil {
 		return nil, false
 	}
 	driverSecrets.Lock()
@@ -106,7 +166,7 @@ func driverStoreSecret(service, account string, secret []byte) (error, bool) {
 }
 
 func driverLoadSecret(service, account string) ([]byte, error, bool) {
-	if activeDriverSystem.Load() == nil {
+	if selectedDriverSystem() == nil {
 		return nil, nil, false
 	}
 	driverSecrets.Lock()
@@ -119,7 +179,7 @@ func driverLoadSecret(service, account string) ([]byte, error, bool) {
 }
 
 func driverDeleteSecret(service, account string) (error, bool) {
-	if activeDriverSystem.Load() == nil {
+	if selectedDriverSystem() == nil {
 		return nil, false
 	}
 	driverSecrets.Lock()
@@ -128,8 +188,28 @@ func driverDeleteSecret(service, account string) (error, bool) {
 	return nil, true
 }
 
+func driverSendNotification(notification Notification) (error, bool) {
+	system := selectedDriverSystem()
+	if system == nil {
+		return nil, false
+	}
+	system.driver.notificationMu.Lock()
+	system.driver.notifications = append(system.driver.notifications, notification)
+	system.driver.notificationMu.Unlock()
+	return nil, true
+}
+
+// Notifications returns the notifications the application sent in this
+// driver-backed run, in order. A Driver has no notification center, so sending
+// one records it instead of showing it.
+func (driver *Driver) Notifications() []Notification {
+	driver.notificationMu.Lock()
+	defer driver.notificationMu.Unlock()
+	return append([]Notification(nil), driver.notifications...)
+}
+
 func driverOpenURL(target string) (error, bool) {
-	system := activeDriverSystem.Load()
+	system := selectedDriverSystem()
 	if system == nil {
 		return nil, false
 	}
@@ -147,7 +227,7 @@ func (driver *Driver) SetSchemeHandlers(schemes ...string) {
 }
 
 func driverSchemeHandler(scheme string) (available, handled bool) {
-	system := activeDriverSystem.Load()
+	system := selectedDriverSystem()
 	if system == nil {
 		return false, false
 	}
@@ -160,7 +240,7 @@ func driverSchemeHandler(scheme string) (available, handled bool) {
 }
 
 func driverOpenPath(path string) (error, bool) {
-	system := activeDriverSystem.Load()
+	system := selectedDriverSystem()
 	if system == nil {
 		return nil, false
 	}
@@ -169,8 +249,30 @@ func driverOpenPath(path string) (error, bool) {
 	return nil, true
 }
 
+func driverRevealPath(path string) (error, bool) {
+	if selectedDriverSystem() == nil {
+		if nonNativeSystemUsed.Load() {
+			return fmt.Errorf("app: reveal needs an active headless driver: %w", ErrUnsupported), true
+		}
+		return nil, false
+	}
+	revealedPaths.Lock()
+	revealedPaths.path, revealedPaths.ok = path, true
+	revealedPaths.Unlock()
+	return nil, true
+}
+
+// LastRevealedPath returns the most recent system-wide RevealPath request in
+// this driver-backed run. The native file manager is a process-wide action, so
+// all windows of the run observe the same request. Background calls are safe.
+func (driver *Driver) LastRevealedPath() (string, bool) {
+	revealedPaths.Lock()
+	defer revealedPaths.Unlock()
+	return revealedPaths.path, revealedPaths.ok
+}
+
 func driverOpenWith(executable, path string) (error, bool) {
-	system := activeDriverSystem.Load()
+	system := selectedDriverSystem()
 	if system == nil {
 		return nil, false
 	}
@@ -180,7 +282,7 @@ func driverOpenWith(executable, path string) (error, bool) {
 }
 
 func driverOpenFiles(options OpenFileOptions) ([]string, error, bool) {
-	system := activeDriverSystem.Load()
+	system := selectedDriverSystem()
 	if system == nil {
 		return nil, nil, false
 	}
@@ -189,7 +291,7 @@ func driverOpenFiles(options OpenFileOptions) ([]string, error, bool) {
 }
 
 func driverOpenDirectory(options OpenDirectoryOptions) (string, error, bool) {
-	system := activeDriverSystem.Load()
+	system := selectedDriverSystem()
 	if system == nil {
 		return "", nil, false
 	}
@@ -198,7 +300,7 @@ func driverOpenDirectory(options OpenDirectoryOptions) (string, error, bool) {
 }
 
 func driverSaveFile(options SaveFileOptions) (string, error, bool) {
-	system := activeDriverSystem.Load()
+	system := selectedDriverSystem()
 	if system == nil {
 		return "", nil, false
 	}
@@ -206,9 +308,24 @@ func driverSaveFile(options SaveFileOptions) (string, error, bool) {
 	return path, err, true
 }
 
+func driverSaveFileWithCheckbox(options SaveFileOptions, checkbox SaveFileCheckbox) (SaveFileSelection, error, bool) {
+	system := selectedDriverSystem()
+	if system == nil {
+		return SaveFileSelection{}, nil, false
+	}
+	result, err := system.driver.saveFileWithCheckbox(options, checkbox)
+	return result, err, true
+}
+
 func (driver *Driver) registerSystem() error {
 	driver.system.driver = driver
+	nonNativeSystemUsed.Store(true)
 	driverSystems.Lock()
+	if len(driverSystems.values) == 0 {
+		revealedPaths.Lock()
+		revealedPaths.path, revealedPaths.ok = "", false
+		revealedPaths.Unlock()
+	}
 	driverSystems.values = append(driverSystems.values, &driver.system)
 	driverSystems.Unlock()
 	activeDriverSystem.Store(&driver.system)
@@ -216,6 +333,9 @@ func (driver *Driver) registerSystem() error {
 }
 
 func (driver *Driver) unregisterSystem() {
+	driver.system.globalMu.Lock()
+	driver.system.globalBindings = nil
+	driver.system.globalMu.Unlock()
 	driverSystems.Lock()
 	for index, system := range driverSystems.values {
 		if system == &driver.system {
@@ -329,6 +449,40 @@ func (driver *Driver) QueueSaveFile(path string, err error) error {
 	return nil
 }
 
+// QueueSaveFileWithCheckbox queues the response to the next SaveFileWithCheckbox
+// call, including the final checkbox state.
+func (driver *Driver) QueueSaveFileWithCheckbox(path string, checked bool, err error) error {
+	if err == nil && path == "" {
+		return fmt.Errorf("app: queued save path is empty")
+	}
+	if driver.saveFileCount == len(driver.saveFileResponses) {
+		return fmt.Errorf("app: save-file response queue is full")
+	}
+	index := (driver.saveFileHead + driver.saveFileCount) % len(driver.saveFileResponses)
+	driver.saveFileResponses[index] = driverSaveFileResponse{path: path, checked: checked, withCheckbox: true, err: err}
+	driver.saveFileCount++
+	return nil
+}
+
+// LastSaveFileCheckboxRequest reports the most recent SaveFileWithCheckbox
+// request; the bool is false when none has been made.
+func (driver *Driver) LastSaveFileCheckboxRequest() (SaveFileOptions, SaveFileCheckbox, bool) {
+	return driver.lastSaveFileRequest, driver.lastSaveFileCheckbox, driver.hasSaveFileCheckbox
+}
+
+func (driver *Driver) saveFileWithCheckbox(options SaveFileOptions, checkbox SaveFileCheckbox) (SaveFileSelection, error) {
+	driver.lastSaveFileCheckbox, driver.hasSaveFileCheckbox = checkbox, true
+	if driver.saveFileCount == 0 || !driver.saveFileResponses[driver.saveFileHead].withCheckbox {
+		driver.lastSaveFileRequest, driver.hasSaveFileRequest = options, true
+		return SaveFileSelection{}, ErrNoDriverResponse
+	}
+	response := driver.takeSaveFileResponse(options)
+	if response.err != nil {
+		return SaveFileSelection{}, response.err
+	}
+	return SaveFileSelection{Path: response.path, Checked: response.checked}, nil
+}
+
 // LastSaveFileRequest returns the most recent SaveFile options observed by
 // driver. The returned Filters slice is borrowed from the application call.
 func (driver *Driver) LastSaveFileRequest() (SaveFileOptions, bool) {
@@ -336,22 +490,31 @@ func (driver *Driver) LastSaveFileRequest() (SaveFileOptions, bool) {
 }
 
 func (driver *Driver) saveFile(options SaveFileOptions) (string, error) {
+	if driver.saveFileCount > 0 && driver.saveFileResponses[driver.saveFileHead].withCheckbox {
+		driver.lastSaveFileRequest, driver.hasSaveFileRequest = options, true
+		return "", ErrNoDriverResponse
+	}
+	response := driver.takeSaveFileResponse(options)
+	return response.path, response.err
+}
+
+func (driver *Driver) takeSaveFileResponse(options SaveFileOptions) driverSaveFileResponse {
 	driver.lastSaveFileRequest = options
 	driver.hasSaveFileRequest = true
 	if driver.saveFileCount == 0 {
-		return "", ErrNoDriverResponse
+		return driverSaveFileResponse{err: ErrNoDriverResponse}
 	}
 	response := driver.saveFileResponses[driver.saveFileHead]
 	driver.saveFileResponses[driver.saveFileHead] = driverSaveFileResponse{}
 	driver.saveFileHead = (driver.saveFileHead + 1) % len(driver.saveFileResponses)
 	driver.saveFileCount--
-	return response.path, response.err
+	return response
 }
 
 // driverClipboardImage answers the clipboard-image reads of a driver-backed
 // run from the driver's private clipboard.
 func driverClipboardImage() (png []byte, err error, handled bool) {
-	system := activeDriverSystem.Load()
+	system := selectedDriverSystem()
 	if system == nil {
 		return nil, nil, false
 	}
@@ -374,10 +537,55 @@ func (driver *Driver) SetClipboardImage(png []byte) error {
 		return err
 	}
 	driver.system.clipboardImage = append([]byte(nil), png...)
-	driver.clipboard = ""
+	driver.system.clipboardFiles = nil
+	driver.clipboard, driver.system.clipboardHTML = "", ""
 	return nil
 }
 
 // ClipboardImage returns the PNG the driver's private clipboard holds, or nil.
 // The slice is the driver's own; do not modify it.
 func (driver *Driver) ClipboardImage() []byte { return driver.system.clipboardImage }
+
+// driverClipboardFiles answers the clipboard-file reads of a driver-backed run
+// from the driver's private clipboard.
+func driverClipboardFiles() (paths []string, err error, handled bool) {
+	system := selectedDriverSystem()
+	if system == nil {
+		return nil, nil, false
+	}
+	if len(system.clipboardFiles) == 0 {
+		return nil, ErrNoFiles, true
+	}
+	return append([]string(nil), system.clipboardFiles...), nil, true
+}
+
+// SetClipboardFiles replaces the driver's private clipboard with copied files,
+// as a file manager would. Like Finder and Explorer it keeps the files' names
+// as the clipboard's text, so a reader that asks for text first sees why files
+// are asked for first; the image it held is gone. The paths are copied and cut
+// at MaxClipboardFiles. No paths empties the clipboard of files.
+func (driver *Driver) SetClipboardFiles(paths []string) {
+	if len(paths) == 0 {
+		driver.system.clipboardFiles = nil
+		return
+	}
+	paths = paths[:min(len(paths), MaxClipboardFiles)]
+	driver.system.clipboardFiles = append([]string(nil), paths...)
+	driver.system.clipboardImage = nil
+	names := make([]byte, 0, 64)
+	for index, path := range paths {
+		if index > 0 {
+			names = append(names, '\n')
+		}
+		names = append(names, filepath.Base(path)...)
+	}
+	driver.clipboard, driver.system.clipboardHTML = string(names), ""
+}
+
+// A selected native backend owns services even while a headless Driver exists.
+func selectedDriverSystem() *driverSystem {
+	if selectedBackend() != nil {
+		return nil
+	}
+	return activeDriverSystem.Load()
+}

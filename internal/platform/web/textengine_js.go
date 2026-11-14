@@ -3,7 +3,11 @@
 package web
 
 import (
+	"fmt"
 	"syscall/js"
+
+	"github.com/vivaui/viva/gfx"
+	"github.com/vivaui/viva/internal/bidi"
 )
 
 // domMeasurer is the browser as a lineMeasurer. Widths come from Canvas 2D
@@ -13,10 +17,11 @@ import (
 // Both set their font only when it changes, and the Range is only used the first time a
 // caret, selection or click asks about a line.
 type domMeasurer struct {
-	document js.Value
-	context  js.Value // Canvas 2D context of an off-screen canvas
-	font     string
-	rtl      bool
+	document      js.Value
+	context       js.Value // Canvas 2D context of an off-screen canvas
+	rasterContext js.Value // separate off-screen context: resizing it must not reset measurement state
+	font          string
+	rtl           bool
 
 	ruler      js.Value // hidden element, created on first use
 	node       js.Value // its text node
@@ -42,10 +47,58 @@ func newDOMMeasurer(document js.Value) *domMeasurer {
 		})
 		fonts.Call("addEventListener", "loadingdone", measurer.listener)
 	}
+	fontInvalidators = append(fontInvalidators, measurer.forget)
 	return measurer
 }
 
 func (measurer *domMeasurer) setInvalidate(invalidate func()) { measurer.invalidate = invalidate }
+
+func (measurer *domMeasurer) rasterizeText(value string, style gfx.TextStyle, scale float32, width, height int) (gfx.Bitmap, error) {
+	if width <= 0 || height <= 0 || width > 16384 || height > 16384 || width*height > 16*1024*1024 || scale <= 0 {
+		return gfx.Bitmap{}, fmt.Errorf("web: invalid text bitmap size or scale")
+	}
+	if !measurer.rasterContext.Truthy() {
+		measurer.rasterContext = measurer.document.Call("createElement", "canvas").Call("getContext", "2d")
+	}
+	context := measurer.rasterContext
+	canvas := context.Get("canvas")
+	canvas.Set("width", width)
+	canvas.Set("height", height)
+	context.Set("textBaseline", "alphabetic")
+	context.Set("textAlign", "left")
+	context.Set("direction", "ltr")
+	context.Set("fillStyle", cssColor(style.Color))
+	if bidi.BaseDirection(value) == bidi.RTL {
+		context.Set("direction", "rtl")
+	}
+
+	context.Set("font", cssFont(style.Size*scale, 0))
+	metrics := context.Call("measureText", "Ag")
+	ascent := metrics.Get("fontBoundingBoxAscent").Float()
+	descent := metrics.Get("fontBoundingBoxDescent").Float()
+	if ascent <= 0 {
+		ascent = metrics.Get("actualBoundingBoxAscent").Float()
+		descent = metrics.Get("actualBoundingBoxDescent").Float()
+	}
+	baseline := (float64(height)-ascent-descent)*0.5 + ascent
+	context.Set("font", cssFontStyle(style.Size*scale, style.Weight, style.Italic))
+	context.Call("fillText", value, 0, baseline)
+
+	data := context.Call("getImageData", 0, 0, width, height).Get("data")
+	rgba := make([]byte, width*height*4)
+	if copied := js.CopyBytesToGo(rgba, data); copied != len(rgba) {
+		return gfx.Bitmap{}, fmt.Errorf("web: copy text bitmap: copied %d of %d bytes", copied, len(rgba))
+	}
+	pixels := make([]byte, len(rgba))
+	for index := 0; index < len(rgba); index += 4 {
+		alpha := int(rgba[index+3])
+		pixels[index+0] = byte(int(rgba[index+2]) * alpha / 255)
+		pixels[index+1] = byte(int(rgba[index+1]) * alpha / 255)
+		pixels[index+2] = byte(int(rgba[index+0]) * alpha / 255)
+		pixels[index+3] = rgba[index+3]
+	}
+	return gfx.Bitmap{Pix: pixels, Width: width, Height: height, Stride: width * 4}, nil
+}
 
 // forget drops everything measured so far: a font arrived, or the zoom changed.
 func (measurer *domMeasurer) forget() {
@@ -64,7 +117,11 @@ func (measurer *domMeasurer) setDirection(rtl bool) {
 }
 
 func (measurer *domMeasurer) width(value string, size, weight float32, rtl bool) float32 {
-	if font := cssFont(size, weight); font != measurer.font {
+	return measurer.widthStyle(value, size, weight, false, rtl)
+}
+
+func (measurer *domMeasurer) widthStyle(value string, size, weight float32, italic, rtl bool) float32 {
+	if font := cssFontStyle(size, weight, italic); font != measurer.font {
 		measurer.context.Set("font", font)
 		measurer.font = font
 	}
@@ -95,10 +152,14 @@ func (measurer *domMeasurer) mountRuler() {
 }
 
 func (measurer *domMeasurer) rects(value string, size, weight float32, rtl bool, bounds []int32, lefts, rights []float32) {
+	measurer.rectsStyle(value, size, weight, false, rtl, bounds, lefts, rights)
+}
+
+func (measurer *domMeasurer) rectsStyle(value string, size, weight float32, italic, rtl bool, bounds []int32, lefts, rights []float32) {
 	if !measurer.ruler.Truthy() {
 		measurer.mountRuler()
 	}
-	if font := cssFont(size, weight); font != measurer.rulerFont {
+	if font := cssFontStyle(size, weight, italic); font != measurer.rulerFont {
 		measurer.ruler.Get("style").Set("font", font)
 		measurer.rulerFont = font
 	}

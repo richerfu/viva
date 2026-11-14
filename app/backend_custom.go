@@ -3,12 +3,12 @@
 package app
 
 import (
+	"github.com/vivaui/viva/gfx"
 	"github.com/vivaui/viva/internal/platform"
-	"github.com/vivaui/viva/ui"
 )
 
 func defaultNativeReduceMotion() bool                                  { return false }
-func defaultNativeTextEngine() ui.TextEngine                           { return nil }
+func defaultNativeTextEngine() gfx.TextEngine                          { return nil }
 func defaultNativePreferredLanguages() []string                        { return nil }
 func defaultNativeClipboardText() (string, error)                      { return "", ErrUnsupported }
 func defaultNativeSetClipboardText(value string) error                 { return ErrUnsupported }
@@ -16,7 +16,7 @@ func defaultNativeHasClipboardImage() bool                             { return 
 func defaultNativeClipboardImagePNG() ([]byte, error)                  { return nil, ErrUnsupported }
 func defaultNativeOnClipboardChange(notify func()) error               { return ErrUnsupported }
 func defaultNativeSetCursor(cursor Cursor) error                       { return ErrUnsupported }
-func defaultNativeSetCursorImage(image *ui.CursorImage) error          { return ErrUnsupported }
+func defaultNativeSetCursorImage(image *gfx.CursorImage) error         { return ErrUnsupported }
 func defaultNativeOpenFiles(options OpenFileOptions) ([]string, error) { return nil, ErrUnsupported }
 func defaultNativeOpenDirectory(options OpenDirectoryOptions) (string, error) {
 	return "", ErrUnsupported
@@ -48,3 +48,19 @@ func defaultNativeHighContrast() bool                                 { return f
 
 func defaultRunNative(platform.Config) error                      { return ErrUnsupported }
 func defaultRunNativeApplication(platform.ApplicationStart) error { return ErrUnsupported }
+
+func defaultNativeClipboardFiles() ([]string, error) { return nil, ErrUnsupported }
+
+func defaultNativeSetClipboardFiles(paths []string) error { return ErrUnsupported }
+
+func defaultNativeSetClipboardHTML(html, alt string) error { return ErrUnsupported }
+
+func defaultNativeSaveFileWithCheckbox(options SaveFileOptions, checkbox SaveFileCheckbox) (SaveFileSelection, error) {
+	return SaveFileSelection{}, ErrUnsupported
+}
+
+func defaultNativeRevealPath(path string) error { return ErrUnsupported }
+
+func defaultNativeRegisterGlobalShortcut(s GlobalShortcut, pressed func()) (func(), error) {
+	return nil, ErrUnsupported
+}

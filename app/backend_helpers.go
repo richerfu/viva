@@ -1,8 +1,9 @@
 package app
 
 import (
+	"github.com/vivaui/viva/gfx"
 	"github.com/vivaui/viva/internal/platform"
-	"github.com/vivaui/viva/ui"
+	"github.com/vivaui/viva/internal/textmetrics"
 )
 
 // BackendLabelBaseline and the terminal helpers share the layout conventions
@@ -12,13 +13,13 @@ func BackendLabelBaseline(height int, size float64) int {
 }
 
 func BackendTerminalPreeditCellWidth(size float32) float32 {
-	return platform.TerminalPreeditCellWidth(size)
+	return size * textmetrics.MonoAdvance
 }
 
 func BackendTerminalPreeditColumn(value string, offset int) int {
 	return platform.TerminalPreeditColumn(value, offset)
 }
 
-func BackendTerminalPreeditRuns(dst []ui.TextRun, value string, color ui.Color) []ui.TextRun {
+func BackendTerminalPreeditRuns(dst []gfx.TextRun, value string, color gfx.Color) []gfx.TextRun {
 	return platform.TerminalPreeditRuns(dst, value, color)
 }

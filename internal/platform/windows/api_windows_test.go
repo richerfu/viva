@@ -29,13 +29,16 @@ func TestNativeStructureABI(t *testing.T) {
 		{"NOTIFYICONDATAW", unsafe.Sizeof(notifyIconData{}), 976},
 		{"NOTIFYICONIDENTIFIER", unsafe.Sizeof(notifyIconIdentifier{}), 40},
 		{"ICONINFO", unsafe.Sizeof(iconInfo{}), 32},
+		{"SHFILEINFOW", unsafe.Sizeof(shFileInfo{}), 696},
+		{"BITMAP", unsafe.Sizeof(gdiBitmap{}), 32},
+		{"MONO BITMAPINFO", unsafe.Sizeof(monoBitmapInfo{}), 48},
 		{"BITMAPV4HEADER", unsafe.Sizeof(bitmapV4Header{}), 108},
 		{"MONITORINFO", unsafe.Sizeof(monitorInfo{}), 40},
 		{"D3D11_BUFFER_DESC", unsafe.Sizeof(bufferDesc{}), 24},
 		{"D3D11_TEXTURE2D_DESC", unsafe.Sizeof(textureDesc{}), 44},
 		{"D3D11_SUBRESOURCE_DATA", unsafe.Sizeof(resourceData{}), 16},
 		{"D3D11_SHADER_RESOURCE_VIEW_DESC", unsafe.Sizeof(resourceViewDesc{}), 24},
-		{"DXGI_SWAP_CHAIN_DESC", unsafe.Sizeof(swapDesc{}), 72},
+		{"DXGI_SWAP_CHAIN_DESC1", unsafe.Sizeof(swapChainDesc1{}), 48},
 		{"D3D11_RENDER_TARGET_BLEND_DESC", unsafe.Sizeof(renderBlend{}), 32},
 		{"D3D11_BLEND_DESC", unsafe.Sizeof(blendDesc{}), 264},
 		{"D3D11_RASTERIZER_DESC", unsafe.Sizeof(rasterDesc{}), 40},
@@ -52,7 +55,7 @@ func TestNativeStructureABI(t *testing.T) {
 			t.Errorf("%s: size %d, want %d", layout.name, layout.size, layout.want)
 		}
 	}
-	if unsafe.Offsetof(swapDesc{}.Window) != 48 || unsafe.Offsetof(windowClass{}.Name) != 64 || unsafe.Offsetof(message{}.First) != 16 || unsafe.Offsetof(resourceData{}.Pitch) != 8 || unsafe.Offsetof(notifyIconData{}.Info) != 304 || unsafe.Offsetof(notifyIconData{}.BalloonIcon) != 968 {
+	if unsafe.Offsetof(swapChainDesc1{}.Scaling) != 32 || unsafe.Offsetof(windowClass{}.Name) != 64 || unsafe.Offsetof(message{}.First) != 16 || unsafe.Offsetof(resourceData{}.Pitch) != 8 || unsafe.Offsetof(notifyIconData{}.Info) != 304 || unsafe.Offsetof(notifyIconData{}.BalloonIcon) != 968 {
 		t.Fatal("native member alignment mismatch")
 	}
 	wantTextureIID := guid{0x6f15aaf2, 0xd208, 0x4e89, [8]byte{0x9a, 0xb4, 0x48, 0x95, 0x35, 0xd3, 0x4f, 0x9c}}
@@ -69,6 +72,22 @@ func TestCopyUTF16Bounds(t *testing.T) {
 	copyUTF16(destination[:], "abcdef")
 	if destination[3] != 0 || syscall.UTF16ToString(destination[:]) != "abc" {
 		t.Fatalf("truncated UTF-16 = %#v", destination)
+	}
+}
+
+func TestNotificationIconCarriesABalloonWithoutShowingATrayEntry(t *testing.T) {
+	data := notificationIconData(42, 7, "Motty", "Motty is still running")
+	if data.Flags&notifyInfo == 0 || data.Flags&notifyState == 0 {
+		t.Fatalf("notification flags = %#x", data.Flags)
+	}
+	if data.State != notifyHidden || data.StateMask != notifyHidden {
+		t.Fatalf("notification state = %#x mask=%#x", data.State, data.StateMask)
+	}
+	if syscall.UTF16ToString(data.Tip[:]) != "Motty" ||
+		syscall.UTF16ToString(data.InfoTitle[:]) != "Motty" ||
+		syscall.UTF16ToString(data.Info[:]) != "Motty is still running" {
+		t.Fatalf("notification text = tip %q title %q body %q",
+			syscall.UTF16ToString(data.Tip[:]), syscall.UTF16ToString(data.InfoTitle[:]), syscall.UTF16ToString(data.Info[:]))
 	}
 }
 

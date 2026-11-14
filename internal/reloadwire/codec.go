@@ -5,11 +5,11 @@ import (
 	"fmt"
 	"math"
 
-	"github.com/vivaui/viva/ui"
+	"github.com/vivaui/viva/gfx"
 )
 
 const (
-	ProtocolVersion = 20
+	ProtocolVersion = 28
 	MaxFrameBytes   = 32 << 20
 	MaxStateBytes   = 8 << 20
 	maxItems        = 200_000
@@ -31,6 +31,7 @@ const (
 	messageKey
 	messageShortcut
 	messageScroll
+	messageModifierTap
 	messageError = 0x7fff
 	responseFlag = 0x8000
 )
@@ -44,18 +45,21 @@ type WindowConfig struct {
 	WindowMode uint8
 	// TitlebarHeight is Config.TitlebarHeight rounded to whole logical pixels.
 	TitlebarHeight uint16
-	ClearRed       float64
-	ClearGreen     float64
-	ClearBlue      float64
-	ClearAlpha     float64
-	HasClick       bool
-	HasPointer     bool
-	HasKey         bool
-	HasShortcut    bool
-	HasScroll      bool
-	HasClose       bool
-	HasSnapshot    bool
-	HasRestore     bool
+	// TrafficLightScale is Config.TrafficLightScale, or zero for the system size.
+	TrafficLightScale float32
+	ClearRed          float64
+	ClearGreen        float64
+	ClearBlue         float64
+	ClearAlpha        float64
+	HasClick          bool
+	HasPointer        bool
+	HasKey            bool
+	HasShortcut       bool
+	HasScroll         bool
+	HasModifierTap    bool
+	HasClose          bool
+	HasSnapshot       bool
+	HasRestore        bool
 }
 
 type Hello struct {
@@ -66,9 +70,9 @@ type Hello struct {
 type PaintRequest struct {
 	Width        float32
 	Height       float32
-	Hovered      ui.ID
-	Pressed      ui.ID
-	Focused      ui.ID
+	Hovered      gfx.ID
+	Pressed      gfx.ID
+	Focused      gfx.ID
 	FocusVisible bool
 	ScrollX      float32
 	ScrollY      float32
@@ -79,15 +83,21 @@ type PaintRequest struct {
 }
 
 type CanvasSnapshot struct {
-	Rectangles   []ui.Rectangle
-	Shadows      []ui.Shadow
-	Images       []ui.Image
-	Texts        []ui.Text
-	Runs         []ui.TextRun // the runs Texts refer to by RunFirst and RunCount
-	Hits         []ui.Hit
-	TrappedScope ui.ID
-	EscapeTarget ui.ID
-	InitialFocus ui.ID
+	Rectangles []gfx.Rectangle
+	// Triangles are the canvas's vector-shape triangles; every primitive's
+	// Order places it among the others in paint order.
+	Triangles []gfx.Triangle
+	Shadows   []gfx.Shadow
+	Images    []gfx.Image
+	Texts     []gfx.Text
+	Runs      []gfx.TextRun // the runs Texts refer to by RunFirst and RunCount
+	Hits      []gfx.Hit
+	// HitTexts is dense: one entry per Hits entry, zero for a hit that
+	// declared no text geometry. Placement is not carried across the wire.
+	HitTexts     []gfx.HitText
+	TrappedScope gfx.ID
+	EscapeTarget gfx.ID
+	InitialFocus gfx.ID
 	// Animating reports that a transition was still in flight, so the host
 	// must schedule another frame.
 	Animating bool
@@ -144,7 +154,7 @@ func (value *encoder) u64(number uint64) {
 }
 
 // id writes an identity as 64 bits.
-func (value *encoder) id(id ui.ID) { value.u64(id.Bits()) }
+func (value *encoder) id(id gfx.ID) { value.u64(id.Bits()) }
 
 func (value *encoder) f32(number float32) { value.u32(math.Float32bits(number)) }
 func (value *encoder) f64(number float64) { value.u64(math.Float64bits(number)) }
@@ -215,7 +225,7 @@ func (value *decoder) u64() uint64 {
 	}
 	return binary.LittleEndian.Uint64(data)
 }
-func (value *decoder) id() ui.ID { return ui.IDFromBits(value.u64()) }
+func (value *decoder) id() gfx.ID { return gfx.IDFromBits(value.u64()) }
 
 func (value *decoder) f32() float32 { return math.Float32frombits(value.u32()) }
 func (value *decoder) f64() float64 { return math.Float64frombits(value.u64()) }
@@ -266,6 +276,7 @@ func encodeWindowConfig(result *encoder, value WindowConfig) {
 	result.u32(uint32(value.MinHeight))
 	result.u8(value.WindowMode)
 	result.u16(value.TitlebarHeight)
+	result.f32(value.TrafficLightScale)
 	result.f64(value.ClearRed)
 	result.f64(value.ClearGreen)
 	result.f64(value.ClearBlue)
@@ -275,6 +286,7 @@ func encodeWindowConfig(result *encoder, value WindowConfig) {
 	result.bool(value.HasKey)
 	result.bool(value.HasShortcut)
 	result.bool(value.HasScroll)
+	result.bool(value.HasModifierTap)
 	result.bool(value.HasClose)
 	result.bool(value.HasSnapshot)
 	result.bool(value.HasRestore)
@@ -284,8 +296,9 @@ func decodeWindowConfig(value *decoder) WindowConfig {
 	return WindowConfig{
 		Title: value.string(), Width: int(value.u32()), Height: int(value.u32()),
 		MinWidth: int(value.u32()), MinHeight: int(value.u32()), WindowMode: value.u8(), TitlebarHeight: value.u16(),
-		ClearRed: value.f64(), ClearGreen: value.f64(), ClearBlue: value.f64(), ClearAlpha: value.f64(),
-		HasClick: value.bool(), HasPointer: value.bool(), HasKey: value.bool(), HasShortcut: value.bool(), HasScroll: value.bool(),
+		TrafficLightScale: value.f32(),
+		ClearRed:          value.f64(), ClearGreen: value.f64(), ClearBlue: value.f64(), ClearAlpha: value.f64(),
+		HasClick: value.bool(), HasPointer: value.bool(), HasKey: value.bool(), HasShortcut: value.bool(), HasScroll: value.bool(), HasModifierTap: value.bool(),
 		HasClose: value.bool(), HasSnapshot: value.bool(), HasRestore: value.bool(),
 	}
 }
@@ -315,7 +328,7 @@ func decodePaintRequest(data []byte) (PaintRequest, error) {
 	return result, value.finish()
 }
 
-func encodePointerEvent(value ui.PointerEvent) []byte {
+func encodePointerEvent(value gfx.PointerEvent) []byte {
 	var result encoder
 	result.u8(uint8(value.Kind))
 	result.u8(uint8(value.Button))
@@ -329,28 +342,28 @@ func encodePointerEvent(value ui.PointerEvent) []byte {
 	return result.data
 }
 
-func decodePointerEvent(data []byte) (ui.PointerEvent, error) {
+func decodePointerEvent(data []byte) (gfx.PointerEvent, error) {
 	value := decoder{data: data}
-	result := ui.PointerEvent{
-		Kind: ui.PointerEventKind(value.u8()), Button: ui.PointerButton(value.u8()), Modifiers: ui.Modifiers(value.u8()),
-		X: value.f32(), Y: value.f32(), Viewport: ui.Size{Width: value.f32(), Height: value.f32()}, Target: value.id(), Captured: value.bool(),
+	result := gfx.PointerEvent{
+		Kind: gfx.PointerEventKind(value.u8()), Button: gfx.PointerButton(value.u8()), Modifiers: gfx.Modifiers(value.u8()),
+		X: value.f32(), Y: value.f32(), Viewport: gfx.Size{Width: value.f32(), Height: value.f32()}, Target: value.id(), Captured: value.bool(),
 	}
 	if err := value.finish(); err != nil {
-		return ui.PointerEvent{}, err
+		return gfx.PointerEvent{}, err
 	}
-	if result.Kind < ui.PointerDown || result.Kind > ui.PointerExit {
-		return ui.PointerEvent{}, fmt.Errorf("invalid reload pointer event kind %d", result.Kind)
+	if result.Kind < gfx.PointerDown || result.Kind > gfx.PointerExit {
+		return gfx.PointerEvent{}, fmt.Errorf("invalid reload pointer event kind %d", result.Kind)
 	}
-	if result.Button > ui.PointerButtonForward {
-		return ui.PointerEvent{}, fmt.Errorf("invalid reload pointer button %d", result.Button)
+	if result.Button > gfx.PointerButtonForward {
+		return gfx.PointerEvent{}, fmt.Errorf("invalid reload pointer button %d", result.Button)
 	}
 	if !validModifiers(result.Modifiers) {
-		return ui.PointerEvent{}, fmt.Errorf("invalid reload pointer modifiers %d", result.Modifiers)
+		return gfx.PointerEvent{}, fmt.Errorf("invalid reload pointer modifiers %d", result.Modifiers)
 	}
 	return result, nil
 }
 
-func encodeKeyEvent(value ui.KeyEvent) []byte {
+func encodeKeyEvent(value gfx.KeyEvent) []byte {
 	var result encoder
 	result.u16(uint16(value.Key))
 	result.u8(uint8(value.Modifiers))
@@ -360,22 +373,22 @@ func encodeKeyEvent(value ui.KeyEvent) []byte {
 	return result.data
 }
 
-func decodeKeyEvent(data []byte) (ui.KeyEvent, error) {
+func decodeKeyEvent(data []byte) (gfx.KeyEvent, error) {
 	value := decoder{data: data}
-	result := ui.KeyEvent{Key: ui.Key(value.u16()), Modifiers: ui.Modifiers(value.u8()), Target: value.id(), Repeat: value.bool(), Text: value.string()}
+	result := gfx.KeyEvent{Key: gfx.Key(value.u16()), Modifiers: gfx.Modifiers(value.u8()), Target: value.id(), Repeat: value.bool(), Text: value.string()}
 	if err := value.finish(); err != nil {
-		return ui.KeyEvent{}, err
+		return gfx.KeyEvent{}, err
 	}
-	if result.Key > ui.KeyF12 {
-		return ui.KeyEvent{}, fmt.Errorf("invalid reload key %d", result.Key)
+	if result.Key > gfx.KeyF12 {
+		return gfx.KeyEvent{}, fmt.Errorf("invalid reload key %d", result.Key)
 	}
 	if !validModifiers(result.Modifiers) {
-		return ui.KeyEvent{}, fmt.Errorf("invalid reload key modifiers %d", result.Modifiers)
+		return gfx.KeyEvent{}, fmt.Errorf("invalid reload key modifiers %d", result.Modifiers)
 	}
 	return result, nil
 }
 
-func encodeScrollEvent(value ui.ScrollEvent) []byte {
+func encodeScrollEvent(value gfx.ScrollEvent) []byte {
 	var result encoder
 	result.u8(uint8(value.Modifiers))
 	result.f32(value.X)
@@ -389,22 +402,41 @@ func encodeScrollEvent(value ui.ScrollEvent) []byte {
 	return result.data
 }
 
-func decodeScrollEvent(data []byte) (ui.ScrollEvent, error) {
+func decodeScrollEvent(data []byte) (gfx.ScrollEvent, error) {
 	value := decoder{data: data}
-	result := ui.ScrollEvent{
-		Modifiers: ui.Modifiers(value.u8()), X: value.f32(), Y: value.f32(),
-		DeltaX: value.f32(), DeltaY: value.f32(), Viewport: ui.Size{Width: value.f32(), Height: value.f32()}, Target: value.id(), Precise: value.bool(),
+	result := gfx.ScrollEvent{
+		Modifiers: gfx.Modifiers(value.u8()), X: value.f32(), Y: value.f32(),
+		DeltaX: value.f32(), DeltaY: value.f32(), Viewport: gfx.Size{Width: value.f32(), Height: value.f32()}, Target: value.id(), Precise: value.bool(),
 	}
 	if err := value.finish(); err != nil {
-		return ui.ScrollEvent{}, err
+		return gfx.ScrollEvent{}, err
 	}
 	if !validModifiers(result.Modifiers) {
-		return ui.ScrollEvent{}, fmt.Errorf("invalid reload scroll modifiers %d", result.Modifiers)
+		return gfx.ScrollEvent{}, fmt.Errorf("invalid reload scroll modifiers %d", result.Modifiers)
 	}
 	return result, nil
 }
 
-func encodeEventResult(value ui.EventResult) []byte {
+func encodeModifierTapEvent(value gfx.ModifierTapEvent) []byte {
+	var result encoder
+	result.u8(uint8(value.Key))
+	result.id(value.Target)
+	return result.data
+}
+
+func decodeModifierTapEvent(data []byte) (gfx.ModifierTapEvent, error) {
+	value := decoder{data: data}
+	result := gfx.ModifierTapEvent{Key: gfx.Key(value.u8()), Target: value.id()}
+	if err := value.finish(); err != nil {
+		return gfx.ModifierTapEvent{}, err
+	}
+	if !result.Key.IsModifier() {
+		return gfx.ModifierTapEvent{}, fmt.Errorf("invalid reload modifier tap key %d", result.Key)
+	}
+	return result, nil
+}
+
+func encodeEventResult(value gfx.EventResult) []byte {
 	var result encoder
 	result.id(value.Focus)
 	result.bool(value.Handled)
@@ -412,20 +444,22 @@ func encodeEventResult(value ui.EventResult) []byte {
 	result.bool(value.Blur)
 	result.bool(value.FocusVisible)
 	result.string(value.ClipboardText)
+	result.bool(value.ContinueTraversal)
+	result.id(value.Activate)
 	return result.data
 }
 
-func decodeEventResult(data []byte) (ui.EventResult, error) {
+func decodeEventResult(data []byte) (gfx.EventResult, error) {
 	value := decoder{data: data}
-	result := ui.EventResult{
+	result := gfx.EventResult{
 		Focus: value.id(), Handled: value.bool(), Repaint: value.bool(), Blur: value.bool(), FocusVisible: value.bool(),
-		ClipboardText: value.string(),
+		ClipboardText: value.string(), ContinueTraversal: value.bool(), Activate: value.id(),
 	}
 	return result, value.finish()
 }
 
-func validModifiers(value ui.Modifiers) bool {
-	const supported = ui.ModifierShift | ui.ModifierControl | ui.ModifierAlt | ui.ModifierMeta
+func validModifiers(value gfx.Modifiers) bool {
+	const supported = gfx.ModifierShift | gfx.ModifierControl | gfx.ModifierAlt | gfx.ModifierMeta
 	return value&^supported == 0
 }
 
@@ -439,6 +473,23 @@ func encodeCanvas(value CanvasSnapshot) ([]byte, error) {
 		result.u16(rectangle.Layer)
 		encodeRect(&result, rectangle.ClipOf)
 		result.bool(rectangle.HasClip)
+		result.u32(rectangle.Order)
+	}
+	result.u32(uint32(len(value.Triangles)))
+	for _, triangle := range value.Triangles {
+		for _, point := range triangle.Points {
+			result.f32(point.X)
+			result.f32(point.Y)
+		}
+		encodeColor(&result, triangle.Color)
+		encodeColor(&result, triangle.Shade[0])
+		encodeColor(&result, triangle.Shade[1])
+		result.bool(triangle.Shaded)
+		result.u16(triangle.Layer)
+		result.u8(triangle.EdgeMask)
+		encodeRect(&result, triangle.ClipOf)
+		result.bool(triangle.HasClip)
+		result.u32(triangle.Order)
 	}
 	result.u32(uint32(len(value.Shadows)))
 	for _, shadow := range value.Shadows {
@@ -452,8 +503,7 @@ func encodeCanvas(value CanvasSnapshot) ([]byte, error) {
 		result.u16(shadow.Layer)
 		encodeRect(&result, shadow.ClipOf)
 		result.bool(shadow.HasClip)
-		result.u32(shadow.RectsBefore)
-		result.u32(shadow.TrianglesBefore)
+		result.u32(shadow.Order)
 	}
 	result.u32(uint32(len(value.Images)))
 	for _, image := range value.Images {
@@ -468,6 +518,7 @@ func encodeCanvas(value CanvasSnapshot) ([]byte, error) {
 		result.u16(image.Layer)
 		encodeRect(&result, image.ClipOf)
 		result.bool(image.HasClip)
+		result.u32(image.Order)
 	}
 	result.u32(uint32(len(value.Runs)))
 	for _, run := range value.Runs {
@@ -486,6 +537,7 @@ func encodeCanvas(value CanvasSnapshot) ([]byte, error) {
 		encodeRect(&result, text.Bounds)
 		result.f32(text.Style.Size)
 		result.f32(text.Style.Weight)
+		result.bool(text.Style.Italic)
 		encodeColor(&result, text.Style.Color)
 		result.bool(text.Style.Mono)
 		result.u16(uint16(text.Style.MonoFace))
@@ -495,9 +547,26 @@ func encodeCanvas(value CanvasSnapshot) ([]byte, error) {
 		result.u16(text.Layer)
 		encodeRect(&result, text.ClipOf)
 		result.bool(text.HasClip)
+		result.u32(text.Order)
+		result.u32(text.Identity.Owner)
+		result.u64(text.Identity.Item)
+		result.bool(text.HasQuad)
+		if text.HasQuad {
+			for _, point := range text.Quad {
+				result.f32(point.X)
+				result.f32(point.Y)
+			}
+			for _, tint := range text.Tint {
+				encodeColor(&result, tint)
+			}
+		}
 	}
 	result.u32(uint32(len(value.Hits)))
-	for _, hit := range value.Hits {
+	for index, hit := range value.Hits {
+		var text gfx.HitText
+		if index < len(value.HitTexts) {
+			text = value.HitTexts[index]
+		}
 		result.id(hit.ID)
 		encodeRect(&result, hit.Bounds)
 		result.string(hit.Label)
@@ -517,9 +586,10 @@ func encodeCanvas(value CanvasSnapshot) ([]byte, error) {
 		result.bool(hit.Autofocus)
 		result.bool(hit.Block)
 		result.bool(hit.MovesWindow)
-		encodeRect(&result, hit.TextBounds)
-		result.f32(hit.TextSize)
-		encodeColor(&result, hit.TextColor)
+		encodeRect(&result, text.Bounds)
+		result.f32(text.Size)
+		encodeColor(&result, text.Color)
+		result.f32(text.Weight)
 	}
 	result.id(value.TrappedScope)
 	result.id(value.EscapeTarget)
@@ -533,34 +603,50 @@ func decodeCanvas(data []byte) (CanvasSnapshot, error) {
 	value := decoder{data: data}
 	var result CanvasSnapshot
 	rectangleCount := decodeCount(&value)
-	result.Rectangles = make([]ui.Rectangle, rectangleCount)
+	result.Rectangles = make([]gfx.Rectangle, rectangleCount)
 	for index := range result.Rectangles {
-		result.Rectangles[index] = ui.Rectangle{
+		result.Rectangles[index] = gfx.Rectangle{
 			Bounds: decodeRect(&value), Color: decodeColor(&value), Radius: value.f32(), Layer: value.u16(),
-			ClipOf: decodeRect(&value), HasClip: value.bool(),
+			ClipOf: decodeRect(&value), HasClip: value.bool(), Order: value.u32(),
 		}
 	}
+	triangleCount := decodeCount(&value)
+	result.Triangles = make([]gfx.Triangle, triangleCount)
+	for index := range result.Triangles {
+		var triangle gfx.Triangle
+		for point := range triangle.Points {
+			triangle.Points[point] = gfx.Point{X: value.f32(), Y: value.f32()}
+		}
+		triangle.Color = decodeColor(&value)
+		triangle.Shade[0], triangle.Shade[1] = decodeColor(&value), decodeColor(&value)
+		triangle.Shaded = value.bool()
+		triangle.Layer = value.u16()
+		triangle.EdgeMask = value.u8()
+		triangle.ClipOf, triangle.HasClip = decodeRect(&value), value.bool()
+		triangle.Order = value.u32()
+		result.Triangles[index] = triangle
+	}
 	shadowCount := decodeCount(&value)
-	result.Shadows = make([]ui.Shadow, shadowCount)
+	result.Shadows = make([]gfx.Shadow, shadowCount)
 	for index := range result.Shadows {
-		result.Shadows[index] = ui.Shadow{
+		result.Shadows[index] = gfx.Shadow{
 			Bounds: decodeRect(&value), Radius: value.f32(), Color: decodeColor(&value),
-			Style: ui.ShadowStyle{OffsetX: value.f32(), OffsetY: value.f32(), Blur: value.f32(), Spread: value.f32()},
+			Style: gfx.ShadowStyle{OffsetX: value.f32(), OffsetY: value.f32(), Blur: value.f32(), Spread: value.f32()},
 			Layer: value.u16(), ClipOf: decodeRect(&value), HasClip: value.bool(),
-			RectsBefore: value.u32(), TrianglesBefore: value.u32(),
+			Order: value.u32(),
 		}
 	}
 	imageCount := decodeCount(&value)
-	result.Images = make([]ui.Image, imageCount)
+	result.Images = make([]gfx.Image, imageCount)
 	for index := range result.Images {
 		pixels := value.bytes()
-		bitmap := ui.Bitmap{
+		bitmap := gfx.Bitmap{
 			Pix: pixels, Width: int(value.u32()), Height: int(value.u32()), Stride: int(value.u32()),
 			ID: value.u64(), Version: value.u32(),
 		}
-		result.Images[index] = ui.Image{
+		result.Images[index] = gfx.Image{
 			Bitmap: bitmap, Source: decodeRect(&value), Bounds: decodeRect(&value), Layer: value.u16(),
-			ClipOf: decodeRect(&value), HasClip: value.bool(),
+			ClipOf: decodeRect(&value), HasClip: value.bool(), Order: value.u32(),
 		}
 		invalid := bitmap.Width <= 0 || bitmap.Height <= 0 || bitmap.Width > MaxFrameBytes/4 || bitmap.Stride < bitmap.Width*4
 		if !invalid {
@@ -574,23 +660,23 @@ func decodeCanvas(data []byte) (CanvasSnapshot, error) {
 		}
 	}
 	runCount := decodeCount(&value)
-	result.Runs = make([]ui.TextRun, runCount)
+	result.Runs = make([]gfx.TextRun, runCount)
 	for index := range result.Runs {
-		result.Runs[index] = ui.TextRun{
+		result.Runs[index] = gfx.TextRun{
 			Column: int32(value.u32()), Bytes: int32(value.u32()), Cells: int32(value.u32()),
 			Color: decodeColor(&value), Weight: value.f32(),
 			Italic: value.bool(), Underline: value.bool(), Strike: value.bool(),
 		}
 	}
 	textCount := decodeCount(&value)
-	result.Texts = make([]ui.Text, textCount)
+	result.Texts = make([]gfx.Text, textCount)
 	for index := range result.Texts {
-		text := ui.Text{
+		text := gfx.Text{
 			Value: value.string(), Bounds: decodeRect(&value),
-			Style: ui.TextStyle{Size: value.f32(), Weight: value.f32(), Color: decodeColor(&value)},
+			Style: gfx.TextStyle{Size: value.f32(), Weight: value.f32(), Italic: value.bool(), Color: decodeColor(&value)},
 		}
 		text.Style.Mono = value.bool()
-		text.Style.MonoFace = ui.MonoFace(value.u16())
+		text.Style.MonoFace = gfx.MonoFace(value.u16())
 		text.CellWidth = value.f32()
 		text.RunFirst, text.RunCount = int32(value.u32()), int32(value.u32())
 		if text.RunFirst < 0 || text.RunCount < 0 || int64(text.RunFirst)+int64(text.RunCount) > int64(runCount) {
@@ -600,16 +686,30 @@ func decodeCanvas(data []byte) (CanvasSnapshot, error) {
 			text.RunFirst, text.RunCount = 0, 0
 		}
 		text.Layer, text.ClipOf, text.HasClip = value.u16(), decodeRect(&value), value.bool()
+		text.Order = value.u32()
+		text.Identity = gfx.TextIdentity{Owner: value.u32(), Item: value.u64()}
+		text.HasQuad = value.bool()
+		if text.HasQuad {
+			for corner := range text.Quad {
+				text.Quad[corner] = gfx.Point{X: value.f32(), Y: value.f32()}
+			}
+			for corner := range text.Tint {
+				text.Tint[corner] = decodeColor(&value)
+			}
+		}
 		result.Texts[index] = text
 	}
 	hitCount := decodeCount(&value)
-	result.Hits = make([]ui.Hit, hitCount)
+	result.Hits = make([]gfx.Hit, hitCount)
+	result.HitTexts = make([]gfx.HitText, hitCount)
 	for index := range result.Hits {
-		result.Hits[index] = ui.Hit{
+		result.Hits[index] = gfx.Hit{
 			ID: value.id(), Bounds: decodeRect(&value), Label: value.string(), Value: value.string(), Hint: value.string(),
-			Scope: value.id(), Layer: value.u16(), Role: ui.Role(value.u8()), Disabled: value.bool(), Checked: value.bool(),
+			Scope: value.id(), Layer: value.u16(), Role: gfx.Role(value.u8()), Disabled: value.bool(), Checked: value.bool(),
 			Selected: value.bool(), Expanded: value.bool(), Multiline: value.bool(), ReadOnly: value.bool(), Secure: value.bool(), Focusable: value.bool(), Autofocus: value.bool(), Block: value.bool(), MovesWindow: value.bool(),
-			TextBounds: decodeRect(&value), TextSize: value.f32(), TextColor: decodeColor(&value),
+		}
+		result.HitTexts[index] = gfx.HitText{
+			Bounds: decodeRect(&value), Size: value.f32(), Color: decodeColor(&value), Weight: value.f32(),
 		}
 	}
 	result.TrappedScope = value.id()
@@ -681,21 +781,21 @@ func decodeCount(value *decoder) int {
 	return int(count)
 }
 
-func encodeRect(result *encoder, value ui.Rect) {
+func encodeRect(result *encoder, value gfx.Rect) {
 	result.f32(value.X)
 	result.f32(value.Y)
 	result.f32(value.Width)
 	result.f32(value.Height)
 }
-func decodeRect(value *decoder) ui.Rect {
-	return ui.Rect{X: value.f32(), Y: value.f32(), Width: value.f32(), Height: value.f32()}
+func decodeRect(value *decoder) gfx.Rect {
+	return gfx.Rect{X: value.f32(), Y: value.f32(), Width: value.f32(), Height: value.f32()}
 }
-func encodeColor(result *encoder, value ui.Color) {
+func encodeColor(result *encoder, value gfx.Color) {
 	result.f32(value.Red)
 	result.f32(value.Green)
 	result.f32(value.Blue)
 	result.f32(value.Alpha)
 }
-func decodeColor(value *decoder) ui.Color {
-	return ui.Color{Red: value.f32(), Green: value.f32(), Blue: value.f32(), Alpha: value.f32()}
+func decodeColor(value *decoder) gfx.Color {
+	return gfx.Color{Red: value.f32(), Green: value.f32(), Blue: value.f32(), Alpha: value.f32()}
 }

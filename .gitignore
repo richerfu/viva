@@ -4,6 +4,7 @@
 *.dxvk-cache
 /website/node_modules/
 /website/.astro/
+/tools/webcheck/node_modules/
 
 # State left by `wrangler pages dev` when checking the deploy output locally.
 /.wrangler/
@@ -23,3 +24,6 @@
 # Binaries built inside the tool modules by `go build`.
 /tools/complexgen/complexgen
 /tools/ffi-cost/ffi-cost
+
+# A signing key written by viva update-keygen in the project root.
+/update.key

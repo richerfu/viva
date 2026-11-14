@@ -70,15 +70,18 @@ func (plan buildPlan) arguments(output string) []string {
 	return append(arguments, "-o", output, plan.pkg)
 }
 
-// environment is the process environment for go build: the target, and on
-// macOS the deployment target for the Objective-C bridge. Without it the
-// program is built for the macOS of the machine that built it and refuses to
-// start on older systems.
+// environment is the process environment for go build: the target, whether
+// that target uses cgo, and on macOS the deployment target for the
+// Objective-C bridge. Without the deployment target the program is built for
+// the macOS of the machine that built it and refuses to start on older
+// systems; without a pinned cgo setting the Linux and Windows programs link the
+// C library of whatever machine built them.
 func (plan buildPlan) environment(base []string) []string {
 	goos, goarch := plan.goTarget()
 	environment := append([]string(nil), base...)
 	environment = append(environment, "GOOS="+goos, "GOARCH="+goarch)
-	if plan.target == "darwin" {
+	switch plan.target {
+	case "darwin":
 		// The Metal bridge is Objective-C. Go turns cgo off when GOARCH differs
 		// from the host's, but on a Mac clang builds either architecture.
 		environment = append(environment, "CGO_ENABLED=1")
@@ -90,6 +93,15 @@ func (plan buildPlan) environment(base []string) []string {
 			}
 			environment = append(environment, name+"="+value)
 		}
+	case "linux", "windows":
+		// These targets reach the system through purego and the standard
+		// library's own system calls, not through cgo. Go turns cgo on by
+		// default on a machine with a C compiler, and a cgo program links the C
+		// library of the machine that built it: a Linux program built on Ubuntu
+		// then refuses to start on a distribution with an older glibc, for a
+		// capability the program does not use. Pin it off so the package is the
+		// same whichever machine built it.
+		environment = append(environment, "CGO_ENABLED=0")
 	}
 	return environment
 }
@@ -354,26 +366,38 @@ func webPage(title, wasm string) ([]byte, error) {
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <title>%s</title>
   <style>
-    html, body { margin: 0; height: 100%%; background: #1c1c1e; }
-    canvas { display: block; }
+    html, body { margin: 0; height: 100%%; background: #0e1117; overscroll-behavior: none; }
+    body { color-scheme: dark; }
+    canvas { display: block; touch-action: none; -webkit-tap-highlight-color: transparent; }
   </style>
 </head>
 <body>
   <script src="wasm_exec.js"></script>
   <script>
     const go = new Go();
-    WebAssembly.instantiateStreaming(fetch(%s), go.importObject)
-      .then((result) => go.run(result.instance))
-      .catch((e) => {
-        document.body.textContent = "Failed to load the application: " + e;
-      });
+    async function start() {
+      let result;
+      try {
+        result = await WebAssembly.instantiateStreaming(fetch(%s), go.importObject);
+      } catch (streamingError) {
+        // Static hosts often serve .wasm as application/octet-stream. Fall back
+        // to bytes instead of failing the whole page on a MIME mismatch.
+        const response = await fetch(%s);
+        if (!response.ok) throw new Error("HTTP " + response.status + " for " + %s);
+        result = await WebAssembly.instantiate(await response.arrayBuffer(), go.importObject);
+      }
+      await go.run(result.instance);
+    }
+    start().catch((e) => {
+      document.body.textContent = "Failed to load the application: " + e;
+    });
   </script>
 </body>
 </html>
-`, html.EscapeString(title), quoted)
+`, html.EscapeString(title), quoted, quoted, quoted)
 	return page.Bytes(), nil
 }
 

@@ -1,0 +1,918 @@
+package {{PACKAGE}}
+
+import (
+	"slices"
+	"sort"
+	"strconv"
+	"strings"
+	"unicode/utf8"
+
+	"github.com/vivaui/viva/gfx"
+	"github.com/vivaui/viva/text"
+)
+
+// A CodeEditor lays its text out on a grid of character cells, as a terminal
+// does: every character is one cell wide, a wide one (CJK, emoji) two, a
+// combining mark none, and a tab runs to the next tab stop. Columns, caret
+// movement, selections and indentation all become cell arithmetic, which needs no
+// text measurement and so costs the same however long the text is.
+
+// codeRow is one row of the grid: the bytes value[start:end] of one logical
+// line, which a soft wrap splits into several rows.
+type codeRow struct {
+	start, end int32 // end is before the line break that ends the line
+	lineStart  int32 // where the logical line starts
+	line       int32 // the logical line's index, from zero
+	cells      int32 // how many cells the row spans, with tabs expanded
+	shown      int32 // index into CodeEditor.shown of the row's text with its tabs expanded, or -1
+}
+
+// codeCells is how many cells r takes at column (a tab fills to the next stop).
+func codeCells(r rune, column, tabWidth int) int {
+	if r == '\t' {
+		return tabWidth - column%tabWidth
+	}
+	return text.CellWidth(r)
+}
+
+// indentationLevels is the leading cells of every line, in the displayed columns
+// the layout uses, so a representation that hides or widens a leading tab moves
+// the indent guides with the text; a blank line takes the smaller indentation of
+// its nearest text lines so guides run through it.
+//
+// The forward pass stores a blank line as -2-previous, where previous is the
+// indentation of the last text line above it (-1 when there is none), so the
+// backward pass can resolve it without a second slice.
+func indentationLevels(value string, tabWidth int, reps []CodeRepresentation) []int {
+	levels := make([]int, 0, strings.Count(value, "\n")+1)
+	previous := -1
+	for line := range strings.SplitSeq(value, "\n") {
+		column, blank := 0, true
+	leading:
+		for _, character := range line {
+			switch character {
+			case ' ', '\t':
+				column += displayCells(character, column, tabWidth, reps)
+			default:
+				blank = false
+				break leading
+			}
+		}
+		if blank {
+			levels = append(levels, -2-previous)
+			continue
+		}
+		levels = append(levels, column)
+		previous = column
+	}
+	next := -1
+	for index := len(levels) - 1; index >= 0; index-- {
+		if levels[index] >= 0 {
+			next = levels[index]
+			continue
+		}
+		above := -2 - levels[index]
+		switch {
+		case above >= 0 && next >= 0:
+			levels[index] = min(above, next)
+		case above >= 0:
+			levels[index] = above
+		case next >= 0:
+			levels[index] = next
+		default:
+			levels[index] = 0
+		}
+	}
+	return levels
+}
+
+func representationOf(reps []CodeRepresentation, character rune) (CodeRepresentation, bool) {
+	index := sort.Search(len(reps), func(index int) bool { return reps[index].Character >= character })
+	if index < len(reps) && reps[index].Character == character {
+		return reps[index], true
+	}
+	return CodeRepresentation{}, false
+}
+
+func displayCells(character rune, column, tabWidth int, reps []CodeRepresentation) int {
+	representation, represented := representationOf(reps, character)
+	return displayCellsFor(character, column, tabWidth, representation, represented)
+}
+
+func displayCellsFor(character rune, column, tabWidth int, representation CodeRepresentation, represented bool) int {
+	if !represented {
+		return codeCells(character, column, tabWidth)
+	}
+	cells := 0
+	for _, rendered := range representation.Label {
+		cells += text.CellWidth(rendered)
+	}
+	return cells
+}
+
+func decodeAt(value string, at int) (rune, int) {
+	if r := value[at]; r < utf8.RuneSelf {
+		return rune(r), 1
+	}
+	return utf8.DecodeRuneInString(value[at:])
+}
+
+// fit lays value out in rows of cols cells unless it already is.
+func (editor *CodeEditor) fit(value string, cols int, wrap bool, tabWidth int) {
+	editor.fitWithFolds(value, cols, wrap, tabWidth, nil)
+}
+
+func (editor *CodeEditor) fitWithFolds(value string, cols int, wrap bool, tabWidth int, folds []CodeEditorFoldRange) {
+	editor.fitWithRepresentations(value, cols, wrap, tabWidth, folds, nil)
+}
+
+func (editor *CodeEditor) fitWithRepresentations(value string, cols int, wrap bool, tabWidth int, folds []CodeEditorFoldRange, reps []CodeRepresentation) {
+	if editor.fitted && editor.cols == cols && editor.wrap == wrap && editor.tabWidth == tabWidth && editor.text == value && slices.Equal(editor.foldInput, folds) && slices.Equal(editor.reps, reps) {
+		return
+	}
+	editor.fitted, editor.cols, editor.wrap, editor.tabWidth, editor.text = true, cols, wrap, tabWidth, value
+	editor.foldInput = append(editor.foldInput[:0], folds...)
+	editor.reps = append(editor.reps[:0], reps...)
+	editor.folds = editor.folds[:0]
+	editor.rows = editor.rows[:0]
+	editor.indents = nil
+	editor.shown = editor.shown[:0]
+	editor.widest = 0
+	if len(value) > 1<<30 {
+		// Rows are indexed with 32 bits; a text this long is not an editor's.
+		value = ""
+		editor.text = ""
+	}
+	logicalLines := strings.Count(value, "\n") + 1
+	lastFoldEnd := -1
+	for _, fold := range folds {
+		if fold.Header < 0 || fold.Header <= lastFoldEnd || fold.LastLine <= fold.Header || fold.LastLine >= logicalLines {
+			continue
+		}
+		editor.folds = append(editor.folds, fold)
+		lastFoldEnd = fold.LastLine
+	}
+	line, foldIndex := 0, 0
+	for start := 0; ; line++ {
+		end := len(value)
+		if newline := strings.IndexByte(value[start:], '\n'); newline >= 0 {
+			end = start + newline
+		}
+		for foldIndex < len(editor.folds) && editor.folds[foldIndex].LastLine < line {
+			foldIndex++
+		}
+		hidden := false
+		if foldIndex < len(editor.folds) {
+			fold := editor.folds[foldIndex]
+			hidden = fold.Header >= 0 && fold.LastLine > fold.Header && fold.Header < line && line <= fold.LastLine
+		}
+		if !hidden {
+			editor.appendLine(value, start, end, line)
+		}
+		if end >= len(value) {
+			break
+		}
+		start = end + 1
+	}
+	editor.lineCount = line + 1
+	editor.runLine = -1
+}
+
+// SoftWrapOffsets returns byte offsets where the last painted editor would
+// wrap its text at its current content width. It does not change the live
+// editor's rows, scroll position, or selection.
+func (editor *CodeEditor) SoftWrapOffsets(dst []int) []int {
+	dst = dst[:0]
+	if !editor.painted || !editor.fitted {
+		return dst
+	}
+	rows := editor.rows
+	if !editor.wrap {
+		if editor.wrapScratch == nil {
+			editor.wrapScratch = &CodeEditor{}
+		}
+		// Lay the wrapped view out with the same folds: a hidden line has no rows,
+		// so its breaks must not be reported to a caller that turns visible soft
+		// wraps into line breaks.
+		editor.wrapScratch.fitWithRepresentations(editor.text, editor.cols, true, editor.tabWidth, editor.foldInput, editor.reps)
+		rows = editor.wrapScratch.rows
+	}
+	for index := 1; index < len(rows); index++ {
+		if rows[index].line == rows[index-1].line && rows[index].start > rows[index-1].start {
+			dst = append(dst, int(rows[index].start))
+		}
+	}
+	return dst
+}
+
+// appendLine appends the rows of the line value[start:end]. A soft wrap breaks
+// before the word that does not fit, or inside it when it is longer than a row;
+// the spaces that end a row hang past its right edge instead of wrapping.
+func (editor *CodeEditor) appendLine(value string, start, end, line int) {
+	rowStart, column := start, 0
+	wordStart, wordColumn := -1, 0
+	previousSpace := false
+	for at := start; at < end; {
+		r, size := decodeAt(value, at)
+		width := displayCells(r, column, editor.tabWidth, editor.reps)
+		space := r == ' ' || r == '\t'
+		if !space && previousSpace {
+			wordStart, wordColumn = at, column
+		}
+		if editor.wrap && !space && column+width > editor.cols && column > 0 {
+			cut, cutColumn := at, column
+			if wordStart > rowStart {
+				cut, cutColumn = wordStart, wordColumn
+			}
+			editor.addRow(value, rowStart, cut, start, line, cutColumn)
+			rowStart, wordStart = cut, -1
+			column = editor.columnBetween(value, cut, at)
+			width = displayCells(r, column, editor.tabWidth, editor.reps)
+		}
+		previousSpace = space
+		column += width
+		at += size
+	}
+	editor.addRow(value, rowStart, end, start, line, column)
+}
+
+// columnBetween is the width in cells of value[from:to] as a row beginning at
+// from lays it out.
+func (editor *CodeEditor) columnBetween(value string, from, to int) int {
+	column := 0
+	for at := from; at < to; {
+		r, size := decodeAt(value, at)
+		column += displayCells(r, column, editor.tabWidth, editor.reps)
+		at += size
+	}
+	return column
+}
+
+func (editor *CodeEditor) addRow(value string, start, end, lineStart, line, cells int) {
+	row := codeRow{start: int32(start), end: int32(end), lineStart: int32(lineStart), line: int32(line), cells: int32(cells), shown: -1}
+	if strings.IndexByte(value[start:end], '\t') >= 0 || len(editor.reps) > 0 {
+		var expanded strings.Builder
+		column, segmentStart := 0, start
+		replaced := false
+		for at := start; at < end; {
+			r, size := decodeAt(value, at)
+			width := displayCells(r, column, editor.tabWidth, editor.reps)
+			representation, represented := representationOf(editor.reps, r)
+			if represented || r == '\t' {
+				if !replaced {
+					expanded.Grow(cells + 4)
+					replaced = true
+				}
+				expanded.WriteString(value[segmentStart:at])
+				if represented {
+					expanded.WriteString(representation.Label)
+				} else {
+					for range width {
+						expanded.WriteByte(' ')
+					}
+				}
+				segmentStart = at + size
+			}
+			column += width
+			at += size
+		}
+		if replaced {
+			expanded.WriteString(value[segmentStart:end])
+			row.shown = int32(len(editor.shown))
+			editor.shown = append(editor.shown, expanded.String())
+		}
+	}
+	editor.widest = max(editor.widest, cells)
+	editor.rows = append(editor.rows, row)
+}
+
+// rowText is the text a row is drawn with: its own bytes, or with tabs expanded.
+func (editor *CodeEditor) rowText(row codeRow) string {
+	if row.shown >= 0 {
+		return editor.shown[row.shown]
+	}
+	return editor.text[row.start:row.end]
+}
+
+// firstOfLine reports whether rows[index] begins its logical line.
+func (editor *CodeEditor) firstOfLine(index int) bool {
+	return index == 0 || editor.rows[index-1].line != editor.rows[index].line
+}
+
+// softWrapped reports whether rows[index] ends where the next row of the same
+// line begins, rather than at the end of the line.
+func (editor *CodeEditor) softWrapped(index int) bool {
+	return index+1 < len(editor.rows) && editor.rows[index+1].line == editor.rows[index].line
+}
+
+// rowOf is the row the caret at offset is drawn on. A caret at a soft wrap is
+// the end of one row and the start of the next; it is drawn at the start of the
+// next unless it got to the end of the first by going there.
+func (editor *CodeEditor) rowOf(offset int) int {
+	index := sort.Search(len(editor.rows), func(i int) bool { return int(editor.rows[i].start) > offset }) - 1
+	index = max(index, 0)
+	if editor.upstream && editor.upstreamCaret == offset && index > 0 && int(editor.rows[index].start) == offset &&
+		int(editor.rows[index-1].end) == offset && editor.rows[index-1].line == editor.rows[index].line {
+		index--
+	}
+	return index
+}
+
+// columnOf is the cell column of byte offset on row, counted from its start.
+func (editor *CodeEditor) columnOf(row codeRow, offset int) int {
+	walker := columnWalker{editor: editor, row: row, at: int(row.start)}
+	return walker.column(offset)
+}
+
+// columnWalker finds the columns of increasing offsets on one row in a single
+// pass over it.
+type columnWalker struct {
+	editor *CodeEditor
+	row    codeRow
+	at     int
+	cells  int
+}
+
+func (walker *columnWalker) column(offset int) int {
+	if offset < walker.at {
+		walker.at, walker.cells = int(walker.row.start), 0
+	}
+	target := min(offset, int(walker.row.end))
+	for walker.at < target {
+		r, size := decodeAt(walker.editor.text, walker.at)
+		walker.cells += displayCells(r, walker.cells, walker.editor.tabWidth, walker.editor.reps)
+		walker.at += size
+	}
+	return walker.cells
+}
+
+// offsetAtColumn is the byte offset on row whose boundary is nearest to x, a
+// distance in cells from the start of the row.
+func (editor *CodeEditor) offsetAtColumn(row codeRow, x float32) int {
+	column := 0
+	for at := int(row.start); at < int(row.end); {
+		r, size := decodeAt(editor.text, at)
+		width := displayCells(r, column, editor.tabWidth, editor.reps)
+		if x < float32(column)+float32(width)/2 {
+			return at
+		}
+		column += width
+		at += size
+	}
+	return int(row.end)
+}
+
+// OffsetAt is the byte offset of the caret position nearest to a window point,
+// for the runtime to place the caret on a press or drag. It implements
+// gfx.TextPlacement.
+func (editor *CodeEditor) OffsetAt(point gfx.Point) (int, bool) {
+	offset, _, ok := editor.OffsetWithVirtualAt(point)
+	return offset, ok
+}
+
+// OffsetWithVirtualAt places a caret on the last-painted grid and reports the
+// number of cells beyond a hard line end. Soft-wrapped rows have no virtual space.
+func (editor *CodeEditor) OffsetWithVirtualAt(point gfx.Point) (offset, virtualCells int, ok bool) {
+	if !editor.painted || !editor.fitted || len(editor.rows) == 0 || editor.cellWidth <= 0 {
+		return 0, 0, false
+	}
+	index := int((point.Y - editor.content.Y + editor.scrollY) / editor.lineHeight)
+	if point.Y < editor.content.Y-editor.scrollY {
+		index = 0
+	}
+	index = max(0, min(index, len(editor.rows)-1))
+	row := editor.rows[index]
+	column := (point.X - editor.content.X + editor.scrollX) / editor.cellWidth
+	offset = editor.offsetAtColumn(row, column)
+	editor.setUpstream(offset, offset == int(row.end) && editor.softWrapped(index))
+	if offset == int(row.end) && !editor.softWrapped(index) {
+		virtualCells = max(0, int(min(float32(1_000_000), max(0, column+0.5)))-editor.columnOf(row, offset))
+	}
+	return offset, virtualCells, true
+}
+
+// CaretBounds is where the caret was placed, with its requested width, in window
+// coordinates; false while it is scrolled out of view. It implements
+// gfx.TextPlacement.
+func (editor *CodeEditor) CaretBounds() (gfx.Rect, bool) {
+	return editor.caretRect, editor.painted && editor.caretShown
+}
+
+func (editor *CodeEditor) setUpstream(offset int, upstream bool) {
+	editor.upstream, editor.upstreamCaret = upstream, offset
+}
+
+// arrive notes where a movement ended and returns it.
+func (editor *CodeEditor) arrive(offset int, upstream bool) int {
+	editor.setUpstream(offset, upstream)
+	editor.goalActive = false
+	return offset
+}
+
+// Move returns the byte offset of text that movement leads to from caret, laid
+// out as the last paint laid it out: Up and Down keep the column a run of them
+// began at, Home goes to the start of the row (to its first character first, in
+// the first row of a line), End to its end, and Up on the first row or Down on
+// the last go to the ends of the text. It records the column and where a caret
+// at a soft wrap is drawn, so call it for every movement and then put the caret
+// at the offset it returns. Before the first paint it returns caret.
+func (editor *CodeEditor) Move(text string, caret int, movement TextareaMovement) int {
+	caret = max(0, min(caret, len(text)))
+	switch movement {
+	case TextareaMoveTextStart:
+		return editor.arrive(0, false)
+	case TextareaMoveTextEnd:
+		return editor.arrive(len(text), false)
+	}
+	if !editor.painted || len(editor.rows) == 0 || editor.text != text {
+		return caret
+	}
+	index := editor.rowOf(caret)
+	row := editor.rows[index]
+	switch movement {
+	case TextareaMoveLineStart:
+		target := int(row.start)
+		if editor.firstOfLine(index) {
+			// The first character of the line, and from there the start of it.
+			first := int(row.start)
+			for first < int(row.end) && (editor.text[first] == ' ' || editor.text[first] == '\t') {
+				first++
+			}
+			if caret != first {
+				target = first
+			}
+		}
+		return editor.arrive(target, false)
+	case TextareaMoveLineEnd:
+		return editor.arrive(int(row.end), editor.softWrapped(index))
+	case TextareaMoveUp, TextareaMoveDown, TextareaMovePageUp, TextareaMovePageDown:
+	default:
+		return caret
+	}
+	step := 1
+	if movement == TextareaMovePageUp || movement == TextareaMovePageDown {
+		step = max(1, int(editor.content.Height/editor.lineHeight)-1)
+	}
+	if movement == TextareaMoveUp || movement == TextareaMovePageUp {
+		step = -step
+	}
+	if !editor.goalActive || editor.goalCaret != caret {
+		editor.goal = float32(editor.columnOf(row, caret))
+	}
+	target := index + step
+	var offset int
+	var upstream bool
+	switch {
+	case target < 0:
+		offset = 0
+	case target >= len(editor.rows):
+		offset = len(text)
+	default:
+		offset = editor.offsetAtColumn(editor.rows[target], editor.goal)
+		upstream = offset == int(editor.rows[target].end) && editor.softWrapped(target)
+	}
+	goal := editor.goal
+	offset = editor.arrive(offset, upstream)
+	editor.goal, editor.goalCaret, editor.goalActive = goal, offset, true
+	return offset
+}
+
+// Reveal scrolls the next paint to show the caret at offset, as if the caret had
+// just moved there.
+func (editor *CodeEditor) Reveal(offset int) {
+	editor.followed, editor.followedValid = offset, false
+}
+
+// ScrollBy scrolls the view by dx and dy pixels, right and down when positive,
+// as a wheel does. The next paint keeps the offset until the caret moves.
+func (editor *CodeEditor) ScrollBy(dx, dy float32) {
+	if !editor.painted {
+		return
+	}
+	editor.scrollY = editor.clampScrollY(editor.scrollY + dy)
+	editor.scrollX = editor.clampScrollX(editor.scrollX + dx)
+}
+
+// Scroll applies a wheel or trackpad gesture: vertical by whole rows for a
+// wheel and by the distance for a trackpad, horizontal when the text does not
+// wrap. Route the window's scroll events over the editor to it.
+func (editor *CodeEditor) Scroll(event gfx.ScrollEvent) gfx.EventResult {
+	if !editor.painted {
+		return gfx.EventResult{}
+	}
+	dx, dy := event.StepX(editor.cellWidth), event.StepY(editor.lineHeight)
+	if event.Modifiers&gfx.ModifierShift != 0 && dx == 0 {
+		dx, dy = dy, 0
+	}
+	if editor.wrap {
+		dx = 0
+	}
+	beforeX, beforeY := editor.scrollX, editor.scrollY
+	editor.ScrollBy(dx, dy)
+	if editor.scrollX == beforeX && editor.scrollY == beforeY {
+		return gfx.EventResult{}
+	}
+	return gfx.EventResult{Handled: true, Repaint: true}
+}
+
+func (editor *CodeEditor) clampScrollY(scroll float32) float32 {
+	return clampScroll(scroll, editor.maxScrollY())
+}
+
+func (editor *CodeEditor) clampScrollX(scroll float32) float32 {
+	return clampScroll(scroll, editor.maxScrollX())
+}
+
+// maxScrollY is how far the text is taller than the box.
+func (editor *CodeEditor) maxScrollY() float32 {
+	return max(0, float32(len(editor.rows))*editor.lineHeight-editor.content.Height)
+}
+
+// maxScrollX is how far the text is wider than the box. Wrapped text has no
+// horizontal scrolling: every row fits the box by construction.
+func (editor *CodeEditor) maxScrollX() float32 {
+	if editor.wrap {
+		return 0
+	}
+	return max(0, float32(editor.widest+1)*editor.cellWidth-editor.content.Width)
+}
+
+// clampScroll keeps a scroll offset inside its axis.
+func clampScroll(scroll, most float32) float32 {
+	return max(0, min(scroll, most))
+}
+
+// follow scrolls to keep the caret in view when the caret, or the row it is on,
+// is not where the last paint left it. A wheel or a drag of a scrollbar moves the
+// view and the next paint leaves it there until the caret moves.
+func (editor *CodeEditor) follow(caret, row, column int) {
+	if !editor.followedValid || editor.followed != caret || editor.followedRow != row {
+		top := float32(row) * editor.lineHeight
+		if top < editor.scrollY {
+			editor.scrollY = top
+		} else if bottom := top + editor.lineHeight; bottom > editor.scrollY+editor.content.Height {
+			editor.scrollY = bottom - editor.content.Height
+		}
+		if !editor.wrap {
+			left, right := float32(column)*editor.cellWidth, float32(column+1)*editor.cellWidth
+			if left < editor.scrollX {
+				editor.scrollX = max(0, left-editor.cellWidth*2)
+			} else if right > editor.scrollX+editor.content.Width {
+				editor.scrollX = right - editor.content.Width + editor.cellWidth*2
+			}
+		}
+	}
+	editor.followed, editor.followedRow, editor.followedValid = caret, row, true
+	editor.scrollY = editor.clampScrollY(editor.scrollY)
+	editor.scrollX = editor.clampScrollX(editor.scrollX)
+}
+
+// ScrollY is how far the text is scrolled down, in pixels, as the last paint
+// left it. A paint changes it on its own only to bring a caret that moved into
+// view, so an application that wants to follow the editor reads it after the
+// paint and compares it with what it read before.
+func (editor *CodeEditor) ScrollY() float32 { return editor.scrollY }
+
+// MaxScrollY is the largest ScrollY the last paint allows: how far the text is
+// taller than the box. It is zero before the first paint and for text that fits.
+func (editor *CodeEditor) MaxScrollY() float32 {
+	if !editor.painted {
+		return 0
+	}
+	return editor.maxScrollY()
+}
+
+// SetScrollY scrolls the next paint to y pixels from the top, as far as the text
+// allows. Unlike Reveal it does not follow the caret: the view stays where it is
+// put until the caret moves, so an application can scroll the editor to match
+// another view without the caret pulling it back. It does nothing before the
+// first paint, which is what tells the editor how tall its rows are.
+func (editor *CodeEditor) SetScrollY(y float32) {
+	if !editor.painted {
+		return
+	}
+	editor.scrollY = editor.clampScrollY(y)
+}
+
+// ScrollX is the horizontal pixel offset after the last paint.
+func (editor *CodeEditor) ScrollX() float32 { return editor.scrollX }
+
+// MaxScrollX is the largest horizontal pixel offset allowed by the last paint.
+func (editor *CodeEditor) MaxScrollX() float32 {
+	if !editor.painted {
+		return 0
+	}
+	return editor.maxScrollX()
+}
+
+// SetScrollX scrolls the next paint horizontally without moving the caret.
+func (editor *CodeEditor) SetScrollX(x float32) {
+	if !editor.painted {
+		return
+	}
+	editor.scrollX = editor.clampScrollX(x)
+}
+
+// YAtOffset is the vertical position of byte offset in the text, in pixels from
+// its top whatever the scroll: the top of the row holding offset, plus the
+// fraction of a row that offset is along that row's cells. An offset at a soft
+// wrap belongs to the row that starts there. An offset that a fold hides takes
+// the top of the fold's header row, since that row is what stands for it. It is
+// false before the first paint.
+func (editor *CodeEditor) YAtOffset(offset int) (float32, bool) {
+	if !editor.painted || !editor.fitted || len(editor.rows) == 0 || editor.lineHeight <= 0 {
+		return 0, false
+	}
+	offset = textareaBoundary(editor.text, offset)
+	index := max(sort.Search(len(editor.rows), func(i int) bool { return int(editor.rows[i].start) > offset })-1, 0)
+	row := editor.rows[index]
+	if offset > int(row.end) {
+		// The offset is not on any visible row: a fold hides it. Its own row has no
+		// position, and reporting the end of the header row would put it on the row
+		// below, so it takes the header row's top.
+		return float32(index) * editor.lineHeight, true
+	}
+	fraction := float32(0)
+	if row.cells > 0 {
+		fraction = min(1, float32(editor.columnOf(row, offset))/float32(row.cells))
+	}
+	return (float32(index) + fraction) * editor.lineHeight, true
+}
+
+// OffsetAtY is the inverse of YAtOffset: the byte offset at y pixels from the top
+// of the text, rounded down to a character boundary. A y above the text gives
+// zero and one below it the end. It is false before the first paint.
+func (editor *CodeEditor) OffsetAtY(y float32) (int, bool) {
+	if !editor.painted || !editor.fitted || len(editor.rows) == 0 || editor.lineHeight <= 0 {
+		return 0, false
+	}
+	if y <= 0 {
+		return 0, true
+	}
+	position := y / editor.lineHeight
+	if position >= float32(len(editor.rows)) {
+		return len(editor.text), true
+	}
+	index := int(position)
+	row := editor.rows[index]
+	target := int((position - float32(index)) * float32(row.cells))
+	column := 0
+	for at := int(row.start); at < int(row.end); {
+		r, size := decodeAt(editor.text, at)
+		width := displayCells(r, column, editor.tabWidth, editor.reps)
+		if column+width > target {
+			return at, true
+		}
+		column += width
+		at += size
+	}
+	return int(row.end), true
+}
+
+// LineCount is the number of logical lines of the text last painted.
+func (editor *CodeEditor) LineCount() int { return editor.lineCount }
+
+// VisibleLines is the first and last logical lines (from zero) that the last
+// paint showed at least in part, for a status bar or a minimap.
+func (editor *CodeEditor) VisibleLines() (first, last int) {
+	if !editor.painted || len(editor.rows) == 0 || editor.lineHeight <= 0 {
+		return 0, 0
+	}
+	top := max(0, min(int(editor.scrollY/editor.lineHeight), len(editor.rows)-1))
+	bottom := max(top, min(int((editor.scrollY+editor.content.Height)/editor.lineHeight), len(editor.rows)-1))
+	return int(editor.rows[top].line), int(editor.rows[bottom].line)
+}
+
+// lineNumbers keeps the text of a window of line numbers, so that painting the
+// same lines again builds no strings.
+type lineNumbers struct {
+	texts []string
+	from  int
+}
+
+// text is the number of line, counted from zero, as it is shown: one more.
+func (numbers *lineNumbers) text(line int) string {
+	if line < numbers.from || line >= numbers.from+len(numbers.texts) {
+		from := line - line%128
+		numbers.texts = numbers.texts[:0]
+		for offset := 0; offset < 384; offset++ {
+			numbers.texts = append(numbers.texts, strconv.Itoa(from+offset+1))
+		}
+		numbers.from = from
+	}
+	return numbers.texts[line-numbers.from]
+}
+
+// gridColumn is the cell column of byte offset in line, counted from its start.
+func gridColumn(line string, offset, tabWidth int) int {
+	offset = min(offset, len(line))
+	column := 0
+	for at := 0; at < offset; {
+		r, size := decodeAt(line, at)
+		column += codeCells(r, column, tabWidth)
+		at += size
+	}
+	return column
+}
+
+// gridOffset is the byte offset in line whose boundary is nearest to x, a
+// distance in cells from the start of the line.
+func gridOffset(line string, x float32, tabWidth int) int {
+	column := 0
+	for at := 0; at < len(line); {
+		r, size := decodeAt(line, at)
+		width := codeCells(r, column, tabWidth)
+		if x < float32(column)+float32(width)/2 {
+			return at
+		}
+		column += width
+		at += size
+	}
+	return len(line)
+}
+
+// gridWidth is how many cells line takes.
+func gridWidth(line string, tabWidth int) int {
+	return gridColumn(line, len(line), tabWidth)
+}
+
+// gridExpand is line with its tabs replaced by the spaces that reach the next
+// tab stop: the text a grid label shows. A line without a tab is returned as it is.
+func gridExpand(line string, tabWidth int) string {
+	if strings.IndexByte(line, '\t') < 0 {
+		return line
+	}
+	var expanded strings.Builder
+	expanded.Grow(len(line) + 3*tabWidth)
+	column := 0
+	for at := 0; at < len(line); {
+		r, size := decodeAt(line, at)
+		width := codeCells(r, column, tabWidth)
+		if r == '\t' {
+			for range width {
+				expanded.WriteByte(' ')
+			}
+		} else {
+			expanded.WriteString(line[at : at+size])
+		}
+		column += width
+		at += size
+	}
+	return expanded.String()
+}
+
+// startsWithMark reports whether the character at offset, before end, is a
+// combining mark.
+func startsWithMark(value string, offset, end int) bool {
+	if offset >= end {
+		return false
+	}
+	r, _ := decodeAt(value, offset)
+	return codeCells(r, 0, 1) == 0
+}
+
+// gridRunSpec says how gridRuns colors and windows a line. Offsets are bytes of
+// the line.
+type gridRunSpec struct {
+	tabWidth                int
+	representations         []CodeRepresentation
+	representationColor     gfx.Color
+	background              gfx.Color
+	firstColumn, lastColumn int
+	foreground              gfx.Color
+	disabled                bool
+	// highlight colors ranges of the highlighted line, in order and without
+	// overlap; highlightBase is the offset of the line's first byte in it, which
+	// is not zero for a row a soft wrap cut out of a line.
+	highlight     []CodeEditorRun
+	highlightBase int
+	// The bytes in [selectionStart, selectionEnd) are drawn in selectionForeground.
+	selectionStart, selectionEnd int
+	selectionRanges              []text.Span
+	selectionBase                int
+	selectionForeground          gfx.Color
+	selectionBackground          gfx.Color
+}
+
+// gridRuns builds the grid runs that draw the part of line in the columns
+// [firstColumn, lastColumn): the text to draw is gridExpand(line)[from:to],
+// beginning at startColumn cells from the line's start and ending at
+// endColumn. A character is one run, except that consecutive plain ASCII
+// characters of one color share one, and a combining mark belongs to the run of
+// the character before it.
+func gridRuns(dst []gfx.TextRun, line string, spec *gridRunSpec) (runs []gfx.TextRun, from, to, startColumn, endColumn int) {
+	next := 0
+	selection := 0
+	if len(spec.selectionRanges) > 0 {
+		selection = sort.Search(len(spec.selectionRanges), func(i int) bool { return spec.selectionRanges[i].End > spec.selectionBase })
+	}
+	column, offset := 0, 0
+	from = -1
+	included, ascii := true, false
+	var last gfx.Color
+	var lastItalic bool
+	for at := 0; at < len(line); {
+		r, size := decodeAt(line, at)
+		representation, represented := representationOf(spec.representations, r)
+		width := displayCellsFor(r, column, spec.tabWidth, representation, represented)
+		bytes := size
+		if represented {
+			bytes = len(representation.Label)
+		} else if r == '\t' {
+			bytes = width
+		}
+		if represented && bytes == 0 {
+			at += size
+			continue
+		}
+		if width > 0 {
+			if column >= spec.lastColumn {
+				break
+			}
+			included = column+width > spec.firstColumn
+		}
+		if included {
+			if from < 0 {
+				from, startColumn = offset, column
+			}
+			relative := at + spec.highlightBase
+			for next < len(spec.highlight) && spec.highlight[next].End <= relative {
+				next++
+			}
+			color := spec.foreground
+			italic := false
+			if represented && spec.representationColor.Alpha != 0 {
+				color = spec.representationColor
+				if spec.disabled {
+					color.Alpha *= 0.5
+				}
+			}
+			if next < len(spec.highlight) && spec.highlight[next].Start <= relative {
+				color = spec.highlight[next].Color
+				italic = spec.highlight[next].Italic
+				if spec.disabled {
+					color.Alpha *= 0.5
+				}
+			}
+			selected := at >= spec.selectionStart && at < spec.selectionEnd
+			if len(spec.selectionRanges) > 0 {
+				absolute := spec.selectionBase + at
+				for selection < len(spec.selectionRanges) && spec.selectionRanges[selection].End <= absolute {
+					selection++
+				}
+				selected = selection < len(spec.selectionRanges) && spec.selectionRanges[selection].Start <= absolute
+			}
+			if selected {
+				color = spec.selectionForeground
+			}
+			if represented && representation.Blob {
+				if selected {
+					color = spec.selectionBackground
+				} else {
+					color = spec.background
+					if spec.disabled {
+						color.Alpha *= 0.5
+					}
+				}
+			}
+			plain := !represented && (r == '\t' || r >= 0x20 && r < 0x7f && !startsWithMark(line, at+size, len(line)))
+			switch {
+			case width == 0 && len(dst) > 0:
+				dst[len(dst)-1].Bytes += int32(bytes)
+				ascii = false
+			case plain && ascii && color == last && italic == lastItalic:
+				tail := &dst[len(dst)-1]
+				tail.Bytes += int32(bytes)
+				tail.Cells += int32(width)
+			default:
+				dst = append(dst, gfx.TextRun{Column: int32(column - startColumn), Bytes: int32(bytes), Cells: int32(width), Color: color, Italic: italic})
+				ascii, last, lastItalic = plain, color, italic
+			}
+			to = offset + bytes
+			endColumn = column + width
+		}
+		column += width
+		offset += bytes
+		at += size
+	}
+	if from < 0 {
+		return dst[:0], 0, 0, 0, 0 // nothing to draw, but the caller keeps its buffer
+	}
+	return dst, from, to, startColumn, endColumn
+}
+
+// cleanHighlight keeps the runs of a highlighter that can be drawn: in order,
+// without overlap, not empty or invisible, and cut to character boundaries of
+// line. It reuses runs' array.
+func cleanHighlight(line string, runs []CodeEditorRun) []CodeEditorRun {
+	kept, previous := runs[:0], 0
+	for _, run := range runs {
+		first, last := textareaBoundary(line, run.Start), textareaBoundary(line, run.End)
+		if last <= first || first < previous || run.Color.Alpha == 0 {
+			continue
+		}
+		kept = append(kept, CodeEditorRun{Start: first, End: last, Color: run.Color, Italic: run.Italic})
+		previous = last
+	}
+	return kept
+}

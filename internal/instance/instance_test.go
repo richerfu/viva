@@ -1,8 +1,9 @@
+//go:build darwin || windows || linux
+
 package instance
 
 import (
-	"os"
-	"path/filepath"
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
@@ -53,13 +54,15 @@ func TestDifferentIDsDoNotMeetAndEmptyArgumentsWork(t *testing.T) {
 	}
 }
 
-func TestAStaleSocketIsReplaced(t *testing.T) {
+func TestAClosedClaimIsReclaimed(t *testing.T) {
 	isolate(t)
 	first, primary, _ := Claim("dev.test.stale", nil, func([]string) {})
 	if !primary {
 		t.Fatal("not primary")
 	}
-	// A process that died leaves its socket file: close the listener only.
+	// A process that died leaves its listener behind: close that only. On Windows
+	// the pipe goes with it and nothing is left; on Unix the socket file stays
+	// until the next claim replaces it.
 	first.listener.Close()
 	<-first.done
 	second, primary, err := Claim("dev.test.stale", nil, func([]string) {})
@@ -81,65 +84,30 @@ func TestOversizeAndMalformedMessagesAreRefused(t *testing.T) {
 	}
 }
 
-// isolate gives a test its own short runtime directory.
-func isolate(t *testing.T) {
-	t.Helper()
-	dir, err := os.MkdirTemp("", "gi")
-	if err != nil {
-		t.Fatal(err)
+// The claim failed twice over, and the platform's reason for the half this
+// process tried must be in the error: without it an address the system does not
+// have looked exactly like an application that was not running.
+func TestClaimFailureNamesTheListenerError(t *testing.T) {
+	cause := errors.New("socket: address family not supported")
+	err := claimFailure(`\\.\pipe\viva-test`, cause)
+	if !errors.Is(err, errNobody) {
+		t.Fatalf("the failure does not report that nobody listens: %v", err)
 	}
-	t.Cleanup(func() { os.RemoveAll(dir) })
-	t.Setenv("XDG_RUNTIME_DIR", dir)
-	t.Setenv("TMPDIR", dir)
-	t.Setenv("TEMP", dir)
-	t.Setenv("TMP", dir)
+	for _, want := range []string{"cannot claim", `\\.\pipe\viva-test`, cause.Error()} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("the failure %q does not name %q", err, want)
+		}
+	}
 }
 
-// A temporary directory too deep for a socket path must still claim: the path
-// falls back to a short one instead of failing to bind, and both launches agree
-// on it.
-func TestADeepTemporaryDirectoryStillClaims(t *testing.T) {
-	base := t.TempDir()
-	deep := filepath.Join(base, strings.Repeat("deep-directory-", 6), strings.Repeat("x", 40))
-	if err := os.MkdirAll(deep, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if len(deep) <= maxSocketPath {
-		t.Fatalf("the test needs a directory over %d bytes, got %d", maxSocketPath, len(deep))
-	}
-	t.Setenv("XDG_RUNTIME_DIR", "")
-	t.Setenv("TMPDIR", deep)
-	t.Setenv("TEMP", deep)
-	t.Setenv("TMP", deep)
-
-	path, err := socketPath("dev.test.deep")
-	if err != nil {
-		t.Fatalf("a deep temporary directory leaves no socket path: %v", err)
-	}
-	if len(path) > maxSocketPath {
-		t.Fatalf("socket path %q is %d bytes, over the %d-byte limit", path, len(path), maxSocketPath)
-	}
-	if again, err := socketPath("dev.test.deep"); err != nil || again != path {
-		t.Fatalf("the socket path is not stable: %q then %q (%v)", path, again, err)
-	}
-
-	got := make(chan []string, 1)
-	first, primary, err := Claim("dev.test.deep", nil, func(args []string) { got <- args })
-	if err != nil || !primary {
-		t.Fatalf("claim from a deep directory: primary %v, err %v", primary, err)
-	}
-	defer first.Close()
-	if second, primary, err := Claim("dev.test.deep", []string{"handoff"}, func([]string) {
-		t.Error("the second process must not serve")
-	}); err != nil || primary || second != nil {
-		t.Fatalf("second claim: primary %v, err %v", primary, err)
-	}
-	select {
-	case args := <-got:
-		if !reflect.DeepEqual(args, []string{"handoff"}) {
-			t.Fatalf("handler got %q", args)
+func BenchmarkClaimAndClose(b *testing.B) {
+	isolate(b)
+	b.ReportAllocs()
+	for b.Loop() {
+		claim, primary, err := Claim("dev.test.bench", nil, func([]string) {})
+		if err != nil || !primary {
+			b.Fatalf("claim: primary %v, err %v", primary, err)
 		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("the arguments never arrived")
+		claim.Close()
 	}
 }

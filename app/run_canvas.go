@@ -7,15 +7,17 @@ import (
 	"runtime"
 	"slices"
 	"sync"
+	"time"
 
+	"github.com/vivaui/viva/gfx"
 	"github.com/vivaui/viva/internal/platform"
-	"github.com/vivaui/viva/ui"
 )
 
 // RunCanvas presents a retained canvas and blocks until the native window
 // closes. When config.Paint is set the canvas is repainted on window resizes
 // and pointer interactions; otherwise the initial canvas stays unchanged.
-func RunCanvas(config Config, canvas *ui.Canvas) error {
+func RunCanvas(config Config, canvas *gfx.Canvas) error {
+	attendFaults()
 	normalized, err := config.normalize()
 	if err != nil {
 		return err
@@ -30,7 +32,7 @@ func RunCanvas(config Config, canvas *ui.Canvas) error {
 		return err
 	}
 	if canvas == nil {
-		canvas = &ui.Canvas{}
+		canvas = &gfx.Canvas{}
 	}
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
@@ -72,7 +74,7 @@ func RunCanvas(config Config, canvas *ui.Canvas) error {
 }
 
 // frameChangeHandler adapts the application's frame callback to the platform's.
-func frameChangeHandler(callback func(ui.Rect)) platform.FrameChangeHandler {
+func frameChangeHandler(callback func(gfx.Rect)) platform.FrameChangeHandler {
 	if callback == nil {
 		return nil
 	}
@@ -117,7 +119,20 @@ func nativeWindowConfig(normalized *Config, painter *painter) (platform.Config, 
 		}
 		frames = newFrameTimer(waker.Wake)
 		painter.scheduleFrame = frames.request
+		painter.noteFrameStart = frames.redrawing
+		painter.coalesceInput = true
 		painter.scheduleIfAnimating()
+	}
+	var setFrameInterval func(time.Duration)
+	var framePresented func()
+	if frames != nil {
+		framePresented = frames.presented
+		setFrameInterval = func(interval time.Duration) {
+			frames.setInterval(interval)
+			if waker != nil {
+				waker.SetSpacing(max(interval, minFrameInterval))
+			}
+		}
 	}
 	normalized.Web.repaintWith(painter)
 	var resizeHandler platform.ResizeHandler
@@ -125,13 +140,14 @@ func nativeWindowConfig(normalized *Config, painter *painter) (platform.Config, 
 	var keyHandler platform.KeyHandler
 	var scrollHandler platform.ScrollHandler
 	var redrawHandler platform.RedrawHandler = painter.repaint
+	var gate *visibilityGate
 	if normalized.Paint != nil || painter.controls != nil || normalized.OnResize != nil || normalized.OnFullscreen != nil {
 		resizeHandler = painter.resize
 	}
 	if normalized.Paint != nil || normalized.OnPointer != nil || normalized.TextInput != nil {
-		pointerHandler = painter.pointer
+		pointerHandler = painter.pointerEvent
 	}
-	if normalized.Paint != nil || normalized.OnKey != nil || normalized.TextInput != nil {
+	if normalized.Paint != nil || normalized.OnKey != nil || normalized.OnModifierTap != nil || normalized.TextInput != nil {
 		keyHandler = painter.key
 	}
 	if normalized.Paint != nil || normalized.OnScroll != nil {
@@ -142,7 +158,9 @@ func nativeWindowConfig(normalized *Config, painter *painter) (platform.Config, 
 		dropHandler = painter.fileDrop
 	}
 	if waker != nil {
-		redrawHandler = wakeHandler(normalized.OnWake, painter.repaint)
+		waker.SetSpacing(frameInterval)
+		gate = &visibilityGate{waker: waker}
+		redrawHandler = wakeHandler(waker, gate, normalized.OnWake, painter.repaint)
 	}
 	var closeHandler platform.CloseRequestHandler
 	if normalized.OnCloseRequest != nil {
@@ -154,10 +172,11 @@ func nativeWindowConfig(normalized *Config, painter *painter) (platform.Config, 
 		Title:     normalized.Title, Class: normalized.Class, Icon: normalized.Icon.platform(), Width: normalized.Width, Height: normalized.Height,
 		MinWidth: normalized.MinWidth, MinHeight: normalized.MinHeight,
 		Origin: normalized.originPoint(), HasOrigin: normalized.Origin != nil,
-		WindowMode:      platform.WindowMode(normalized.WindowMode),
-		WindowMaterials: normalized.windowMaterials(),
-		TitlebarHeight:  normalized.TitlebarHeight,
-		Anchor:          normalized.Anchor.rect, HasAnchor: normalized.Anchor.set,
+		WindowMode:        platform.WindowMode(normalized.WindowMode),
+		WindowMaterials:   normalized.windowMaterials(),
+		TitlebarHeight:    normalized.TitlebarHeight,
+		TrafficLightScale: normalized.TrafficLightScale,
+		Anchor:            normalized.Anchor.rect, HasAnchor: normalized.Anchor.set,
 		ClearColor: platform.Color{
 			Red: normalized.ClearColor.Red, Green: normalized.ClearColor.Green,
 			Blue: normalized.ClearColor.Blue, Alpha: normalized.ClearColor.Alpha,
@@ -170,18 +189,23 @@ func nativeWindowConfig(normalized *Config, painter *painter) (platform.Config, 
 		OnResize:         resizeHandler,
 		OnFrameChange:    frameChangeHandler(normalized.OnFrameChange),
 		OnMinimize:       minimizeHandler(normalized.OnMinimize),
+		OnVisibility:     gate.handler(),
 		OnMaximize:       maximizeHandler(normalized.OnMaximize),
 		OnFullscreen:     painter.fullscreenHandler(normalized.OnFullscreen),
 		OnReopen:         normalized.onReopen,
 		OnPointer:        pointerHandler,
 		PressAt:          painter.pressAt,
 		OnKey:            keyHandler,
+		ModifierTaps:     normalized.OnModifierTap != nil,
 		OnShortcut:       painter.shortcutHandler(normalized),
 		OnAccessibility:  painter.accessibilityHandler(normalized),
 		OnFocusLost:      painter.focusLostHandler(),
+		OnActivate:       normalized.OnActivate,
 		OnScroll:         scrollHandler,
 		OnFileDrop:       dropHandler,
 		OnRedraw:         redrawHandler,
+		SetFrameInterval: setFrameInterval,
+		FramePresented:   framePresented,
 		Waker:            waker,
 		OnCloseRequest:   closeHandler,
 		OnClosed:         normalized.OnClosed,
@@ -192,7 +216,7 @@ func nativeWindowConfig(normalized *Config, painter *painter) (platform.Config, 
 // prepareNativeWindow builds the native window for one application window. It
 // runs on the window loop's main thread, which the platform preferences it
 // reads require; a test owns the wiring through nativeWindowConfig instead.
-func prepareNativeWindow(config Config, canvas *ui.Canvas) (platform.Config, func(), error) {
+func prepareNativeWindow(config Config, canvas *gfx.Canvas) (platform.Config, func(), error) {
 	normalized, err := config.normalize()
 	if err != nil {
 		return platform.Config{}, nil, err
@@ -201,7 +225,7 @@ func prepareNativeWindow(config Config, canvas *ui.Canvas) (platform.Config, fun
 		return platform.Config{}, nil, fmt.Errorf("%w: native text input", ErrUnsupported)
 	}
 	if canvas == nil {
-		canvas = &ui.Canvas{}
+		canvas = &gfx.Canvas{}
 	}
 	var cleanupOnce sync.Once
 	var frames *frameTimer

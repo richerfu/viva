@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/vivaui/viva/ui"
+	"github.com/vivaui/viva/gfx"
 )
 
 const (
@@ -18,14 +18,15 @@ const (
 )
 
 type WorkerConfig struct {
-	lastSize     ui.Size // the size of the last paint request, for the event pass
+	lastSize     gfx.Size // the size of the last paint request, for the event pass
 	Window       WindowConfig
-	Canvas       *ui.Canvas
-	Paint        func(*ui.Canvas, ui.Size)
-	Pointer      func(ui.PointerEvent) ui.EventResult
-	Key          func(ui.KeyEvent) ui.EventResult
-	Shortcut     func(ui.KeyEvent) ui.EventResult
-	Scroll       func(ui.ScrollEvent) ui.EventResult
+	Canvas       *gfx.Canvas
+	Paint        func(*gfx.Canvas, gfx.Size)
+	Pointer      func(gfx.PointerEvent) gfx.EventResult
+	Key          func(gfx.KeyEvent) gfx.EventResult
+	Shortcut     func(gfx.KeyEvent) gfx.EventResult
+	Scroll       func(gfx.ScrollEvent) gfx.EventResult
+	ModifierTap  func(gfx.ModifierTapEvent) gfx.EventResult
 	CloseRequest func(func())
 	Snapshot     func() ([]StateSlot, error)
 	Restore      func([]StateSlot) error
@@ -63,7 +64,7 @@ func Serve(config WorkerConfig) error {
 
 	canvas := config.Canvas
 	if canvas == nil {
-		canvas = &ui.Canvas{}
+		canvas = &gfx.Canvas{}
 	}
 	base := CaptureCanvas(canvas)
 	var writeMu sync.Mutex
@@ -99,7 +100,7 @@ func Serve(config WorkerConfig) error {
 	}
 }
 
-func handleRequest(config *WorkerConfig, canvas *ui.Canvas, base CanvasSnapshot, request frame, respond func(frame) error) ([]byte, error, bool) {
+func handleRequest(config *WorkerConfig, canvas *gfx.Canvas, base CanvasSnapshot, request frame, respond func(frame) error) ([]byte, error, bool) {
 	switch request.kind {
 	case messagePaint:
 		value, err := decodePaintRequest(request.payload)
@@ -114,7 +115,7 @@ func handleRequest(config *WorkerConfig, canvas *ui.Canvas, base CanvasSnapshot,
 			// The host owns the clock: transitions advance on the frame time it sent.
 			canvas.SetClock(func() time.Duration { return time.Duration(value.Now) })
 			canvas.BeginFrame()
-			config.lastSize = ui.Size{Width: value.Width, Height: value.Height}
+			config.lastSize = gfx.Size{Width: value.Width, Height: value.Height}
 			config.Paint(canvas, config.lastSize)
 			canvas.EndFrame()
 		} else {
@@ -125,18 +126,20 @@ func handleRequest(config *WorkerConfig, canvas *ui.Canvas, base CanvasSnapshot,
 	case messageClick:
 		value := decoder{data: request.payload}
 		id := value.id()
+		info := gfx.ClickInfo{Modifiers: gfx.Modifiers(value.u32()), Clicks: int(value.u8())}
 		if err := value.finish(); err != nil {
 			return nil, err, false
 		}
 		// A paint that asks Clicked takes the click in its event pass, here in the
 		// worker, where the application's state lives.
 		if config.Paint != nil && canvas.ListensForClicks() {
-			canvas.BeginEventPass(id)
+			canvas.BeginEventPass(id, info)
 			canvas.Reset()
 			canvas.BeginFrame()
 			config.Paint(canvas, config.lastSize)
 			canvas.EndFrame()
 			canvas.EndEventPass()
+			canvas.RunAfterPaint()
 		}
 		return nil, nil, false
 	case messagePointer:
@@ -144,7 +147,7 @@ func handleRequest(config *WorkerConfig, canvas *ui.Canvas, base CanvasSnapshot,
 		if err != nil {
 			return nil, err, false
 		}
-		result := ui.EventResult{}
+		result := gfx.EventResult{}
 		if config.Pointer != nil {
 			result = config.Pointer(event)
 		}
@@ -159,6 +162,9 @@ func handleRequest(config *WorkerConfig, canvas *ui.Canvas, base CanvasSnapshot,
 			if canvas.EndPointerPass() {
 				result.Handled, result.Repaint = true, true
 			}
+			if canvas.RunAfterPaint() {
+				result.Repaint = true
+			}
 		}
 		return encodeEventResult(result), nil, false
 	case messageKey:
@@ -166,7 +172,7 @@ func handleRequest(config *WorkerConfig, canvas *ui.Canvas, base CanvasSnapshot,
 		if err != nil {
 			return nil, err, false
 		}
-		result := ui.EventResult{}
+		result := gfx.EventResult{}
 		if config.Key != nil {
 			result = config.Key(event)
 		}
@@ -176,7 +182,7 @@ func handleRequest(config *WorkerConfig, canvas *ui.Canvas, base CanvasSnapshot,
 		if err != nil {
 			return nil, err, false
 		}
-		result := ui.EventResult{}
+		result := gfx.EventResult{}
 		if config.Shortcut != nil {
 			result = config.Shortcut(event)
 		}
@@ -186,9 +192,19 @@ func handleRequest(config *WorkerConfig, canvas *ui.Canvas, base CanvasSnapshot,
 		if err != nil {
 			return nil, err, false
 		}
-		result := ui.EventResult{}
+		result := gfx.EventResult{}
 		if config.Scroll != nil {
 			result = config.Scroll(event)
+		}
+		return encodeEventResult(result), nil, false
+	case messageModifierTap:
+		event, err := decodeModifierTapEvent(request.payload)
+		if err != nil {
+			return nil, err, false
+		}
+		result := gfx.EventResult{}
+		if config.ModifierTap != nil {
+			result = config.ModifierTap(event)
 		}
 		return encodeEventResult(result), nil, false
 	case messageSnapshotState:

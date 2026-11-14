@@ -1,8 +1,8 @@
 package app
 
 import (
+	"github.com/vivaui/viva/gfx"
 	"github.com/vivaui/viva/internal/platform"
-	"github.com/vivaui/viva/ui"
 )
 
 func backendSetAutostart(entry Autostart, enabled bool) (bool, error) {
@@ -35,7 +35,7 @@ func nativeReduceMotion() bool {
 	}
 	return defaultNativeReduceMotion()
 }
-func nativeTextEngine() ui.TextEngine {
+func nativeTextEngine() gfx.TextEngine {
 	if b := selectedBackend(); b != nil {
 		return b.TextEngine()
 	}
@@ -104,7 +104,7 @@ func nativeSetCursor(cursor Cursor) error {
 	}
 	return defaultNativeSetCursor(cursor)
 }
-func nativeSetCursorImage(image *ui.CursorImage) error {
+func nativeSetCursorImage(image *gfx.CursorImage) error {
 	if b := selectedBackend(); b != nil {
 		if f := b.Services().SetCursorImage; f != nil {
 			return f(image)
@@ -339,4 +339,64 @@ func nativeRequestClipboardImage(done func([]byte, error)) {
 		return
 	}
 	defaultNativeRequestClipboardImage(done)
+}
+
+func nativeClipboardFiles() ([]string, error) {
+	if b := selectedBackend(); b != nil {
+		if f := b.Services().ClipboardFiles; f != nil {
+			return f()
+		}
+		return nil, ErrUnsupported
+	}
+	return defaultNativeClipboardFiles()
+}
+
+func nativeSetClipboardFiles(paths []string) error {
+	if b := selectedBackend(); b != nil {
+		if f := b.Services().SetClipboardFiles; f != nil {
+			return f(paths)
+		}
+		return ErrUnsupported
+	}
+	return defaultNativeSetClipboardFiles(paths)
+}
+
+func nativeSetClipboardHTML(html, alt string) error {
+	if b := selectedBackend(); b != nil {
+		if f := b.Services().SetClipboardHTML; f != nil {
+			return f(html, alt)
+		}
+		return ErrUnsupported
+	}
+	return defaultNativeSetClipboardHTML(html, alt)
+}
+
+func nativeSaveFileWithCheckbox(options SaveFileOptions, checkbox SaveFileCheckbox) (SaveFileSelection, error) {
+	if b := selectedBackend(); b != nil {
+		if f := b.Services().SaveFileWithCheckbox; f != nil {
+			return f(options, checkbox)
+		}
+		return SaveFileSelection{}, ErrUnsupported
+	}
+	return defaultNativeSaveFileWithCheckbox(options, checkbox)
+}
+
+func nativeRevealPath(path string) error {
+	if b := selectedBackend(); b != nil {
+		if f := b.Services().RevealPath; f != nil {
+			return f(path)
+		}
+		return ErrUnsupported
+	}
+	return defaultNativeRevealPath(path)
+}
+
+func nativeRegisterGlobalShortcut(s GlobalShortcut, pressed func()) (func(), error) {
+	if b := selectedBackend(); b != nil {
+		if f := b.Services().RegisterGlobalShortcut; f != nil {
+			return f(s, pressed)
+		}
+		return nil, ErrUnsupported
+	}
+	return defaultNativeRegisterGlobalShortcut(s, pressed)
 }

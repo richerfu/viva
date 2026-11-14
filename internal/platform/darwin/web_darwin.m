@@ -1,17 +1,24 @@
 #import <Cocoa/Cocoa.h>
 #import <QuartzCore/QuartzCore.h>
 #import <WebKit/WebKit.h>
+#import <Network/Network.h>
 
 #include <stdlib.h>
 #include <string.h>
 
 #include "web_darwin.h"
+#include "cursor_owner_darwin.h"
 
 // What the page does reaches Go through these (web_darwin.go).
 extern void vivaWebMessage(uintptr_t handle, uint32_t id, char *utf8);
 extern void vivaWebLoad(uintptr_t handle, uint32_t id, int phase, char *url);
-extern int vivaWebServe(uintptr_t handle, uint32_t id, char *scheme, char *path, char **mime,
-                        unsigned char **data, size_t *length);
+extern int vivaWebNavigate(uintptr_t handle, uint32_t id, char *url, int mainFrame, int userGesture);
+extern int vivaWebNewWindow(uintptr_t handle, uint32_t id, char *url);
+extern int vivaWebDownload(uintptr_t handle, uint32_t id, char *url);
+extern char *vivaWebDownloadPath(char *folder, char *suggested, char *address);
+extern int vivaWebServe(uintptr_t handle, uint32_t id, char *scheme, char *path, int *status,
+                        char **headers, unsigned char **data, size_t *length);
+extern int vivaWebServeAsync(uintptr_t handle, uint32_t id, char *scheme, char *path, uint64_t request);
 extern void vivaWebReady(uintptr_t handle);
 
 static void viva_web_main(void (^work)(void)) {
@@ -22,16 +29,46 @@ static void viva_web_main(void (^work)(void)) {
     }
 }
 
-// VivaWebBridge is everything the page may call: its script messages, its navigation, and requests
-// to its custom scheme.
-@interface VivaWebBridge : NSObject <WKScriptMessageHandler, WKNavigationDelegate, WKURLSchemeHandler> {
+// VivaWebBridge is everything the page may call: its script messages, its navigation, requests to
+// its custom scheme, and the downloads it starts.
+@interface VivaWebBridge : NSObject <WKScriptMessageHandler, WKNavigationDelegate, WKUIDelegate, WKURLSchemeHandler, WKDownloadDelegate> {
 @public
     uintptr_t _handle;
     uint32_t _id;
+    // The async requests still to be answered, by request id, and the reverse of the id by task, so
+    // stopURLSchemeTask can find one. The dictionary retains the task: a task is never messaged
+    // after it is removed from here, which is what keeps a late answer from touching a released one.
+    NSMutableDictionary<NSNumber *, id<WKURLSchemeTask>> *_tasks;
+    NSMutableDictionary<NSValue *, NSNumber *> *_taskIDs;
+    NSMutableArray<WKDownload *> *_downloads; // kept until each finishes, since WKDownload keeps a weak delegate
 }
+- (void)answerRequest:(uint64_t)request status:(int)status headers:(char *)headers data:(unsigned char *)data length:(size_t)length;
+- (void)cancelTasks;
 @end
 
+// The bridge that owns each outstanding request, and the request ids, both touched on the main thread
+// only: start and stop are main-thread calls, and an answer from Go is marshaled there first.
+static NSMutableDictionary<NSNumber *, VivaWebBridge *> *viva_web_answers;
+static uint64_t viva_web_next_request;
+
 @implementation VivaWebBridge
+
+- (instancetype)init {
+    self = [super init];
+    if (self != nil) {
+        _tasks = [[NSMutableDictionary alloc] init];
+        _taskIDs = [[NSMutableDictionary alloc] init];
+        _downloads = [[NSMutableArray alloc] init];
+    }
+    return self;
+}
+
+- (void)dealloc {
+    [_tasks release];
+    [_taskIDs release];
+    [_downloads release];
+    [super dealloc];
+}
 
 - (void)userContentController:(WKUserContentController *)controller didReceiveScriptMessage:(WKScriptMessage *)message {
     (void)controller;
@@ -44,6 +81,117 @@ static void viva_web_main(void (^work)(void)) {
 - (void)notify:(WKWebView *)web phase:(int)phase {
     NSString *address = web.URL.absoluteString;
     vivaWebLoad(_handle, _id, phase, (char *)(address != nil ? address.UTF8String : ""));
+}
+
+// The application answers before the request leaves the engine: a refused navigation fetches
+// nothing and runs no script. The navigation is decided first, and only an allowed one is put to
+// Download: a refused Navigate cancels the navigation without asking Download. A nil target frame
+// is a new window, which createWebView decides; letting the policy through fetches nothing until
+// that returns nil.
+- (void)webView:(WKWebView *)web decidePolicyForNavigationAction:(WKNavigationAction *)action decisionHandler:(void (^)(WKNavigationActionPolicy))decisionHandler {
+    (void)web;
+    if (action.targetFrame == nil) {
+        decisionHandler(WKNavigationActionPolicyAllow);
+        return;
+    }
+    NSString *address = action.request.URL.absoluteString;
+    char *url = (char *)(address != nil ? address.UTF8String : "");
+    // WKWebView has no public user-gesture flag. The navigation type is the closest it gets: a
+    // click on a link and a form submission are gestures, while a script's location change is
+    // Other. A form a script submits is therefore reported as a gesture on this engine.
+    BOOL gesture = action.navigationType == WKNavigationTypeLinkActivated || action.navigationType == WKNavigationTypeFormSubmitted;
+    if (!vivaWebNavigate(_handle, _id, url, action.targetFrame.isMainFrame ? 1 : 0, gesture ? 1 : 0)) {
+        decisionHandler(WKNavigationActionPolicyCancel);
+        return;
+    }
+    if (@available(macOS 11.3, *)) {
+        if (action.shouldPerformDownload) {
+            decisionHandler(vivaWebDownload(_handle, _id, url) ? WKNavigationActionPolicyDownload : WKNavigationActionPolicyCancel);
+            return;
+        }
+    }
+    decisionHandler(WKNavigationActionPolicyAllow);
+}
+
+// The page never opens a window of its own: an allowed window.open or target=_blank goes to the
+// system's browser, and nil refuses it before anything is fetched. This is the WKUIDelegate method
+// WebKit calls for a new window, so the bridge is the page's UIDelegate as well as its navigation
+// delegate.
+- (WKWebView *)webView:(WKWebView *)web createWebViewWithConfiguration:(WKWebViewConfiguration *)configuration forNavigationAction:(WKNavigationAction *)action windowFeatures:(WKWindowFeatures *)windowFeatures {
+    (void)web;
+    (void)configuration;
+    (void)windowFeatures;
+    NSString *address = action.request.URL.absoluteString;
+    if (address != nil) {
+        vivaWebNewWindow(_handle, _id, (char *)address.UTF8String);
+    }
+    return nil;
+}
+
+// A response WebKit cannot show, or one the server marks as an attachment, is a download the
+// application decides before its body is written.
+- (void)webView:(WKWebView *)web decidePolicyForNavigationResponse:(WKNavigationResponse *)response decisionHandler:(void (^)(WKNavigationResponsePolicy))decisionHandler {
+    (void)web;
+    NSURLResponse *nativeResponse = response.response;
+    NSHTTPURLResponse *http = [nativeResponse isKindOfClass:[NSHTTPURLResponse class]] ? (NSHTTPURLResponse *)nativeResponse : nil;
+    NSString *disposition = [http valueForHTTPHeaderField:@"Content-Disposition"];
+    BOOL attachment = disposition != nil && [disposition.lowercaseString hasPrefix:@"attachment"];
+    if (response.canShowMIMEType && !attachment) {
+        decisionHandler(WKNavigationResponsePolicyAllow);
+        return;
+    }
+    if (@available(macOS 11.3, *)) {
+        NSString *address = nativeResponse.URL.absoluteString;
+        char *url = (char *)(address != nil ? address.UTF8String : "");
+        decisionHandler(vivaWebDownload(_handle, _id, url) ? WKNavigationResponsePolicyDownload : WKNavigationResponsePolicyCancel);
+        return;
+    }
+    // WKDownload is 11.3; before it a download cannot be saved, and a page does not write files on
+    // its own, so the response is refused instead.
+    decisionHandler(WKNavigationResponsePolicyCancel);
+}
+
+// A download keeps its delegate alive from here to its last byte: the bridge holds it, because
+// WKDownload's delegate is weak.
+- (void)webView:(WKWebView *)web navigationResponse:(WKNavigationResponse *)response didBecomeDownload:(WKDownload *)download API_AVAILABLE(macos(11.3)) {
+    (void)web;
+    (void)response;
+    download.delegate = self;
+    [_downloads addObject:download];
+}
+
+- (void)webView:(WKWebView *)web navigationAction:(WKNavigationAction *)action didBecomeDownload:(WKDownload *)download API_AVAILABLE(macos(11.3)) {
+    (void)web;
+    (void)action;
+    download.delegate = self;
+    [_downloads addObject:download];
+}
+
+// The destination is a free name in the user's downloads folder, so a second download of the same
+// name never replaces the first.
+- (void)download:(WKDownload *)download decideDestinationUsingResponse:(NSURLResponse *)response suggestedFilename:(NSString *)suggestedFilename completionHandler:(void (^)(NSURL * _Nullable))completionHandler API_AVAILABLE(macos(11.3)) {
+    NSString *folder = NSSearchPathForDirectoriesInDomains(NSDownloadsDirectory, NSUserDomainMask, YES).firstObject;
+    NSString *address = response.URL.absoluteString;
+    char *path = vivaWebDownloadPath((char *)(folder != nil ? folder.UTF8String : ""),
+                                     (char *)(suggestedFilename != nil ? suggestedFilename.UTF8String : ""),
+                                     (char *)(address != nil ? address.UTF8String : ""));
+    if (path == NULL) {
+        completionHandler(nil);
+        return;
+    }
+    NSString *destination = [NSString stringWithUTF8String:path];
+    free(path);
+    completionHandler(destination != nil ? [NSURL fileURLWithPath:destination] : nil);
+}
+
+- (void)downloadDidFinish:(WKDownload *)download API_AVAILABLE(macos(11.3)) {
+    [_downloads removeObject:download];
+}
+
+- (void)download:(WKDownload *)download didFailWithError:(NSError *)error resumeData:(NSData *)resumeData API_AVAILABLE(macos(11.3)) {
+    (void)error;
+    (void)resumeData;
+    [_downloads removeObject:download];
 }
 
 - (void)webView:(WKWebView *)web didStartProvisionalNavigation:(WKNavigation *)navigation {
@@ -73,6 +221,64 @@ static void viva_web_main(void (^work)(void)) {
     [self notify:web phase:2];
 }
 
+// finishTask answers task and lets it go. headers is the header block Go resolved: one "Name: value"
+// line each.
+- (void)finishTask:(id<WKURLSchemeTask>)task status:(int)status headers:(char *)headers data:(unsigned char *)data length:(size_t)length {
+    NSMutableDictionary *fields = [NSMutableDictionary dictionary];
+    if (headers != NULL) {
+        NSString *block = [NSString stringWithUTF8String:headers];
+        for (NSString *line in [block componentsSeparatedByString:@"\r\n"]) {
+            NSRange colon = [line rangeOfString:@":"];
+            if (colon.location == NSNotFound) {
+                continue;
+            }
+            NSString *name = [[line substringToIndex:colon.location] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+            NSString *value = [[line substringFromIndex:colon.location + 1] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+            if (name.length > 0) {
+                [fields setObject:value forKey:name];
+            }
+        }
+    }
+    NSHTTPURLResponse *response = [[NSHTTPURLResponse alloc] initWithURL:task.request.URL
+                                                              statusCode:status
+                                                             HTTPVersion:@"HTTP/1.1"
+                                                            headerFields:fields];
+    [task didReceiveResponse:response];
+    [response release];
+    if (data != NULL && length > 0) {
+        [task didReceiveData:[NSData dataWithBytes:data length:length]];
+    }
+    [task didFinish];
+}
+
+// answerRequest is the answer to an async request, on the main queue. A request that was stopped is
+// no longer in the dictionaries, and its task is not touched.
+- (void)answerRequest:(uint64_t)request status:(int)status headers:(char *)headers data:(unsigned char *)data length:(size_t)length {
+    NSNumber *key = [NSNumber numberWithUnsignedLongLong:request];
+    // The task is let go of only after it is answered: removing the dictionary's reference before
+    // messaging it could release the task the last time anyone holds it.
+    id<WKURLSchemeTask> task = [[_tasks objectForKey:key] retain];
+    if (task == nil) {
+        return;
+    }
+    [_taskIDs removeObjectForKey:[NSValue valueWithNonretainedObject:task]];
+    [_tasks removeObjectForKey:key];
+    [viva_web_answers removeObjectForKey:key];
+    [self finishTask:task status:status headers:headers data:data length:length];
+    [task release];
+}
+
+// cancelTasks lets go of the requests of a page that is closing. WebKit may not stop each one, and the
+// registry would otherwise keep the bridge alive.
+- (void)cancelTasks {
+    for (NSNumber *key in _tasks) {
+        id<WKURLSchemeTask> task = [_tasks objectForKey:key];
+        [_taskIDs removeObjectForKey:[NSValue valueWithNonretainedObject:task]];
+        [viva_web_answers removeObjectForKey:key];
+    }
+    [_tasks removeAllObjects];
+}
+
 - (void)webView:(WKWebView *)web startURLSchemeTask:(id<WKURLSchemeTask>)task {
     (void)web;
     NSURL *url = task.request.URL;
@@ -80,35 +286,91 @@ static void viva_web_main(void (^work)(void)) {
     if ([path hasPrefix:@"/"]) {
         path = [path substringFromIndex:1];
     }
-    char *mime = NULL;
+    char *scheme = (char *)url.scheme.UTF8String;
+    char *chars = (char *)path.UTF8String;
+    if (viva_web_answers == nil) {
+        viva_web_answers = [[NSMutableDictionary alloc] init];
+    }
+    viva_web_next_request++;
+    uint64_t request = viva_web_next_request;
+    NSNumber *key = [NSNumber numberWithUnsignedLongLong:request];
+    // Register the task before the call: ServeAsync may close its own page, and Close cancels the
+    // tasks registered at that moment. The answer always hops to the main queue, so it is delivered
+    // after this method returns even when ServeAsync answers synchronously.
+    [_tasks setObject:task forKey:key];
+    [_taskIDs setObject:key forKey:[NSValue valueWithNonretainedObject:task]];
+    [viva_web_answers setObject:self forKey:key];
+    if (vivaWebServeAsync(_handle, _id, scheme, chars, request)) {
+        return;
+    }
+    // The scheme has no asynchronous form (or this page is not its): withdraw the registration before
+    // the synchronous answer, which finishes the task here and now.
+    [_taskIDs removeObjectForKey:[NSValue valueWithNonretainedObject:task]];
+    [_tasks removeObjectForKey:key];
+    [viva_web_answers removeObjectForKey:key];
+    int status = 404;
+    char *headers = NULL;
     unsigned char *data = NULL;
     size_t length = 0;
-    int found = vivaWebServe(_handle, _id, (char *)url.scheme.UTF8String, (char *)path.UTF8String, &mime, &data, &length);
-    NSDictionary *headers = @{
-        @"Content-Type": found && mime != NULL ? [NSString stringWithUTF8String:mime] : @"text/plain",
-        @"Content-Length": [NSString stringWithFormat:@"%zu", found ? length : (size_t)0],
-        @"Access-Control-Allow-Origin": @"*",
-    };
-    NSHTTPURLResponse *response = [[NSHTTPURLResponse alloc] initWithURL:url
-                                                              statusCode:found ? 200 : 404
-                                                             HTTPVersion:@"HTTP/1.1"
-                                                            headerFields:headers];
-    [task didReceiveResponse:response];
-    [response release];
-    if (found && length > 0) {
-        [task didReceiveData:[NSData dataWithBytes:data length:length]];
+    if (!vivaWebServe(_handle, _id, scheme, chars, &status, &headers, &data, &length)) {
+        status = 404;
+        headers = strdup("Content-Type: text/plain\r\nContent-Length: 0\r\nAccess-Control-Allow-Origin: *");
     }
-    free(mime);
+    [self finishTask:task status:status headers:headers data:data length:length];
+    free(headers);
     free(data);
-    [task didFinish];
 }
 
 - (void)webView:(WKWebView *)web stopURLSchemeTask:(id<WKURLSchemeTask>)task {
     (void)web;
-    (void)task;
+    NSValue *key = [NSValue valueWithNonretainedObject:task];
+    NSNumber *request = [_taskIDs objectForKey:key];
+    if (request == nil) {
+        return;
+    }
+    [_taskIDs removeObjectForKey:key];
+    [_tasks removeObjectForKey:request]; // releases the task: a later answer finds no entry
+    [viva_web_answers removeObjectForKey:request];
 }
 
 @end
+
+// viva_web_scheme_answer takes the answer from Go, on any thread, and touches the task on the main
+// queue only, after the page may have closed. The buffers are freed here either way.
+void viva_web_scheme_answer(uint64_t request, int status, char *headers, unsigned char *data, size_t length) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NSNumber *key = [NSNumber numberWithUnsignedLongLong:request];
+        VivaWebBridge *bridge = [viva_web_answers objectForKey:key];
+        if (bridge != nil) {
+            [bridge answerRequest:request status:status headers:headers data:data length:length];
+        }
+        free(headers);
+        free(data);
+    });
+}
+
+// Build the outline in native logical coordinates, respecting isFlipped without multiplying by display density.
+static CGPathRef viva_web_outline(NSRect bounds, CGFloat requested, BOOL flipped) {
+    CGFloat radius = MAX(0, MIN(requested, MIN(bounds.size.width / 2, bounds.size.height)));
+    CGFloat left = NSMinX(bounds), right = NSMaxX(bounds);
+    CGFloat top = flipped ? NSMinY(bounds) : NSMaxY(bounds);
+    CGFloat bottom = flipped ? NSMaxY(bounds) : NSMinY(bounds);
+    CGFloat direction = flipped ? 1 : -1;
+    CGMutablePathRef path = CGPathCreateMutable();
+    CGPathMoveToPoint(path, NULL, left + radius, top);
+    CGPathAddLineToPoint(path, NULL, right - radius, top);
+    if (radius > 0) {
+        CGPathAddArcToPoint(path, NULL, right, top, right, top + direction * radius, radius);
+    }
+    CGPathAddLineToPoint(path, NULL, right, bottom);
+    CGPathAddLineToPoint(path, NULL, left, bottom);
+    CGPathAddLineToPoint(path, NULL, left, top + direction * radius);
+    if (radius > 0) {
+        CGPathAddArcToPoint(path, NULL, left, top, left + radius, top, radius);
+    }
+    CGPathCloseSubpath(path);
+    return path;
+}
 
 // VivaWebView is a page that lies over Viva's drawing and gives way where Viva draws over it: the
 // parts in cuts are masked off, so Viva's picture shows, and do not take the pointer, so Viva does.
@@ -117,9 +379,12 @@ static void viva_web_main(void (^work)(void)) {
     NSArray<NSValue *> *_masks;  // the parts whose picture is cut away
     VivaWebBridge *_bridge;
     NSTrackingArea *_tracking;
+    CGFloat _topCornerRadius;
 }
+- (void)setTopCornerRadius:(CGFloat)radius;
 - (void)setBridge:(VivaWebBridge *)bridge;
 - (void)setCutRects:(NSArray<NSValue *> *)cuts masks:(NSArray<NSValue *> *)masks;
+- (void)cancelSchemeTasks;
 @end
 
 @implementation VivaWebView
@@ -132,14 +397,30 @@ static void viva_web_main(void (^work)(void)) {
     [super dealloc];
 }
 
+- (void)setTopCornerRadius:(CGFloat)radius {
+    _topCornerRadius = radius;
+    self.wantsLayer = YES;
+    [self applyMask];
+}
+
 - (void)setBridge:(VivaWebBridge *)bridge {
     [bridge retain];
     [_bridge release];
     _bridge = bridge;
 }
 
+- (void)cancelSchemeTasks {
+    [_bridge cancelTasks];
+}
+
 - (NSView *)hitTest:(NSPoint)point {
     // The point is in the superview's coordinates.
+    if (_topCornerRadius > 0) {
+        CGPathRef outline = viva_web_outline(self.bounds, _topCornerRadius, self.isFlipped);
+        BOOL inside = CGPathContainsPoint(outline, NULL, [self convertPoint:point fromView:self.superview], NO);
+        CGPathRelease(outline);
+        if (!inside) { return nil; }
+    }
     for (NSValue *value in _cuts) {
         if (NSPointInRect(point, value.rectValue)) {
             return nil;
@@ -152,7 +433,7 @@ static void viva_web_main(void (^work)(void)) {
     if (self.layer == nil) {
         return;
     }
-    if (_masks.count == 0) {
+    if (_masks.count == 0 && _topCornerRadius == 0) {
         self.layer.mask = nil;
         return;
     }
@@ -167,6 +448,16 @@ static void viva_web_main(void (^work)(void)) {
     mask.path = path;
     mask.fillRule = kCAFillRuleEvenOdd;
     CGPathRelease(path);
+    if (_topCornerRadius > 0) {
+        // Intersect separate masks: putting corners and menu cuts in one even-odd path
+        // would fill transparent corner areas again when a cut crosses the outline.
+        CAShapeLayer *outline = [CAShapeLayer layer];
+        outline.frame = self.layer.bounds;
+        CGPathRef rounded = viva_web_outline(self.bounds, _topCornerRadius, self.isFlipped);
+        outline.path = rounded;
+        CGPathRelease(rounded);
+        mask.mask = outline;
+    }
     self.layer.mask = mask;
 }
 
@@ -203,14 +494,43 @@ static void viva_web_main(void (^work)(void)) {
 
 // The pointer entering the page leaves Viva's drawing, which would otherwise keep the control it
 // was over hovered.
+
+- (BOOL)vivaManagesCursor {
+    return YES;
+}
+
 - (void)mouseEntered:(NSEvent *)event {
+    [super mouseEntered:event];
     [self.superview mouseExited:event];
+    // Record ownership even when the parent did not receive moved events over the child.
+    [self.superview mouseMoved:event];
+    [self.window invalidateCursorRectsForView:self.superview];
+}
+
+- (void)mouseExited:(NSEvent *)event {
+    [super mouseExited:event];
+    NSView *host = self.superview;
+    NSPoint point = [host convertPoint:event.locationInWindow fromView:nil];
+    // Restore only when returning to this host; leaving it must not override another window or application.
+    if (host.window != nil && viva_window_at_pointer() == host.window && NSPointInRect(point, host.bounds)) {
+        [host mouseMoved:event];
+    }
 }
 
 @end
 
+int viva_web_direct_supported(void) {
+#if defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 140000
+    if (@available(macOS 14.0, *)) {
+        return 1;
+    }
+#endif
+    return 0;
+}
+
 void *viva_web_open(void *view, uint32_t id, uintptr_t handle, const char *url, const char *html,
-                    const char *base, const char *script, const char *scheme, char **error) {
+                    const char *base, const char *script, int mainFrameOnly, const char *scheme, int ephemeral, int direct,
+                    char **error) {
     __block VivaWebView *web = nil;
     viva_web_main(^{
         NSView *host = (NSView *)view;
@@ -221,11 +541,30 @@ void *viva_web_open(void *view, uint32_t id, uintptr_t handle, const char *url, 
         bridge->_handle = handle;
         bridge->_id = id;
         WKWebViewConfiguration *configuration = [[WKWebViewConfiguration alloc] init];
+        if (ephemeral || direct) {
+            // Ephemeral pages keep nothing on disk. Direct pages also need a private store so
+            // their proxy policy cannot change another page's in-flight requests or data store.
+            configuration.websiteDataStore = [WKWebsiteDataStore nonPersistentDataStore];
+        }
+        if (direct) {
+#if defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 140000
+            if (@available(macOS 14.0, *)) {
+                // An empty proxyConfigurations array restores system proxies. Excluding every
+                // domain selects direct connections; the excluded endpoint is never contacted.
+                nw_endpoint_t endpoint = nw_endpoint_create_host("127.0.0.1", "9");
+                nw_proxy_config_t policy = nw_proxy_config_create_http_connect(endpoint, NULL);
+                nw_proxy_config_add_excluded_domain(policy, "*");
+                configuration.websiteDataStore.proxyConfigurations = @[policy];
+                nw_release(policy);
+                nw_release(endpoint);
+            }
+#endif
+        }
         WKUserContentController *controller = configuration.userContentController;
         [controller addScriptMessageHandler:bridge name:@"viva"];
         WKUserScript *bridgeScript = [[WKUserScript alloc] initWithSource:[NSString stringWithUTF8String:script]
                                                             injectionTime:WKUserScriptInjectionTimeAtDocumentStart
-                                                         forMainFrameOnly:NO];
+                                                         forMainFrameOnly:mainFrameOnly ? YES : NO];
         [controller addUserScript:bridgeScript];
         [bridgeScript release];
         BOOL failed = NO;
@@ -243,6 +582,7 @@ void *viva_web_open(void *view, uint32_t id, uintptr_t handle, const char *url, 
             web = [[VivaWebView alloc] initWithFrame:NSMakeRect(0, 0, 1, 1) configuration:configuration];
             [web setBridge:bridge];
             web.navigationDelegate = bridge;
+            web.UIDelegate = bridge; // createWebViewWithConfiguration is a WKUIDelegate method
             web.autoresizingMask = NSViewMinYMargin;
             web.hidden = YES;
             [host addSubview:web positioned:NSWindowAbove relativeTo:nil];
@@ -302,6 +642,10 @@ void viva_web_eval(void *web, const char *script) {
     });
 }
 
+void viva_web_set_top_corner_radius(void *web, double radius) {
+    viva_web_main(^{ [(VivaWebView *)web setTopCornerRadius:radius]; });
+}
+
 void viva_web_focus(void *web) {
     viva_web_main(^{
         VivaWebView *view = (VivaWebView *)web;
@@ -314,9 +658,17 @@ void viva_web_focus(void *web) {
 void viva_web_close(void *web) {
     viva_web_main(^{
         VivaWebView *view = (VivaWebView *)web;
+        [view cancelSchemeTasks];
         [view.configuration.userContentController removeScriptMessageHandlerForName:@"viva"];
         view.navigationDelegate = nil;
+        view.UIDelegate = nil;
         [view removeFromSuperview];
+    });
+}
+
+void viva_web_cancel_scheme_tasks(void *web) {
+    viva_web_main(^{
+        [(VivaWebView *)web cancelSchemeTasks];
     });
 }
 

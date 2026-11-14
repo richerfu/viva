@@ -14,19 +14,21 @@ import (
 	"sync/atomic"
 
 	"github.com/vivaui/viva/app"
-	"github.com/vivaui/viva/ui"
+	"github.com/vivaui/viva/gfx"
 )
 
 type applicationWindow struct {
 	fullscreen        atomic.Bool
 	fullscreenRequest atomic.Int32
-	invalidator       *app.Invalidator
-	id                uint64
-	title             string
-	panel             bool
-	hidden            bool
-	session           *Session
-	closed            func()
+	// sizeRequest is the content size SetSize queued for the loop, or nil.
+	sizeRequest atomic.Pointer[[2]int32]
+	invalidator *app.Invalidator
+	id          uint64
+	title       string
+	panel       bool
+	hidden      bool
+	session     *Session
+	closed      func()
 	// closeRequest is the application's OnCloseRequest, if it set one.
 	closeRequest func(allow func())
 }
@@ -53,20 +55,28 @@ type applicationSession struct {
 	// badge is the label the Dock was asked to show beside the icon, which
 	// SetDockBadge records and the "dockbadge" command reports.
 	badge string
+	// progress is the fraction the icon was asked to show, which SetProgress
+	// records and the "progress" command reports; a negative fraction is the
+	// absence of a bar.
+	progress float32
 	// openURL receives the links the "openurl" command delivers, as the system
 	// would deliver a registered scheme's link.
 	openURL func(string)
+	// openFile receives the documents the "openfile" command delivers, as the
+	// system would deliver a registered type's document.
+	openFile func(string)
 }
 
 func newApplicationSession(options Options) *applicationSession {
 	return &applicationSession{
 		options: options, nextID: 1, nextItem: 1,
-		windows: make(map[uint64]*applicationWindow), items: make(map[uint64]*applicationStatusItem),
+		progress: -1,
+		windows:  make(map[uint64]*applicationWindow), items: make(map[uint64]*applicationStatusItem),
 	}
 }
 
 // OpenWindow implements app.Host.
-func (application *applicationSession) OpenWindow(config app.Config, canvas *ui.Canvas, closed func()) (app.WindowControl, error) {
+func (application *applicationSession) OpenWindow(config app.Config, canvas *gfx.Canvas, closed func()) (app.WindowControl, error) {
 	entry := &applicationWindow{}
 	if config.Invalidator == nil {
 		config.Invalidator = &app.Invalidator{}
@@ -82,6 +92,11 @@ func (application *applicationSession) OpenWindow(config app.Config, canvas *ui.
 	config.OnWake = func() {
 		if request := entry.fullscreenRequest.Swap(0); request != 0 {
 			if err := entry.session.driver.SetFullscreen(request == 2); err != nil {
+				panic(err)
+			}
+		}
+		if size := entry.sizeRequest.Swap(nil); size != nil {
+			if err := entry.session.Resize(int(size[0]), int(size[1])); err != nil {
 				panic(err)
 			}
 		}
@@ -114,16 +129,31 @@ func (window *headlessWindow) Close() { window.once.Do(func() { window.applicati
 func (window *headlessWindow) Hide()  { window.application.setHidden(window.id, true) }
 
 // Frame is the window's content area where its Config.Origin put it.
-func (window *headlessWindow) Frame() (ui.Rect, bool) {
+func (window *headlessWindow) Frame() (gfx.Rect, bool) {
 	window.application.mu.Lock()
 	entry := window.application.windows[window.id]
 	window.application.mu.Unlock()
 	if entry == nil {
-		return ui.Rect{}, false
+		return gfx.Rect{}, false
 	}
 	return entry.session.driver.Frame(), true
 }
 func (window *headlessWindow) Show() { window.application.setHidden(window.id, false) }
+
+// SetSize queues a content-size request for the driver's loop, which reports
+// the granted size through OnResize.
+func (window *headlessWindow) SetSize(width, height int) error {
+	window.application.mu.Lock()
+	entry := window.application.windows[window.id]
+	window.application.mu.Unlock()
+	if entry == nil {
+		return fmt.Errorf("headless: window is closed")
+	}
+	request := [2]int32{int32(width), int32(height)}
+	entry.sizeRequest.Store(&request)
+	entry.invalidator.Invalidate()
+	return nil
+}
 
 func (window *headlessWindow) SetFullscreen(fullscreen bool) error {
 	window.application.mu.Lock()
@@ -177,11 +207,27 @@ func (application *applicationSession) SetOpenURLHandler(handler func(string)) {
 	application.mu.Unlock()
 }
 
+// SetOpenFileHandler implements the optional host capability that passes
+// documents the system opened to the application.
+func (application *applicationSession) SetOpenFileHandler(handler func(path string)) {
+	application.mu.Lock()
+	application.openFile = handler
+	application.mu.Unlock()
+}
+
 // SetDockBadge implements app.Host: it keeps the label the Dock was asked to
 // show, which the "dockbadge" command reports.
 func (application *applicationSession) SetDockBadge(text string) {
 	application.mu.Lock()
 	application.badge = text
+	application.mu.Unlock()
+}
+
+// SetProgress implements app.Host: it keeps the fraction the icon was asked to
+// show, which the "progress" command reports.
+func (application *applicationSession) SetProgress(fraction float32) {
+	application.mu.Lock()
+	application.progress = fraction
 	application.mu.Unlock()
 }
 
@@ -229,7 +275,7 @@ func (item *headlessStatusItem) Remove() {
 
 // clickStatusItem presses a status item the way the platform would: the click
 // handler runs, here on the caller's goroutine.
-func (application *applicationSession) clickStatusItem(id uint64, button ui.PointerButton) error {
+func (application *applicationSession) clickStatusItem(id uint64, button gfx.PointerButton) error {
 	application.mu.Lock()
 	item := application.items[id]
 	application.mu.Unlock()
@@ -238,7 +284,7 @@ func (application *applicationSession) clickStatusItem(id uint64, button ui.Poin
 	}
 	// With a menu the secondary press opens it, and so does the primary unless
 	// the application handles it, as a Linux desktop's tray reports it.
-	if item.menu != nil && (button != ui.PointerButtonPrimary || item.onClick == nil) {
+	if item.menu != nil && (button != gfx.PointerButtonPrimary || item.onClick == nil) {
 		return fmt.Errorf("headless: status item %d opens a menu; use statusmenu and statusselect", id)
 	}
 	if item.onClick != nil {
@@ -468,6 +514,14 @@ func executeApplication(application *applicationSession, line string) (string, b
 		label := application.badge
 		application.mu.Unlock()
 		return fmt.Sprintf("ok label=%q\n", label), false
+	case "progress":
+		if rest != "" {
+			return "error progress takes no arguments\n", false
+		}
+		application.mu.Lock()
+		fraction := application.progress
+		application.mu.Unlock()
+		return fmt.Sprintf("ok fraction=%g\n", fraction), false
 	case "openurl":
 		application.mu.Lock()
 		handler := application.openURL
@@ -477,6 +531,18 @@ func executeApplication(application *applicationSession, line string) (string, b
 			return "error openurl needs a URL\n", false
 		case handler == nil:
 			return "error the application does not take links\n", false
+		}
+		handler(rest)
+		return application.afterCommand("ok\n")
+	case "openfile":
+		application.mu.Lock()
+		handler := application.openFile
+		application.mu.Unlock()
+		switch {
+		case rest == "":
+			return "error openfile needs a path\n", false
+		case handler == nil:
+			return "error the application does not take documents\n", false
 		}
 		handler(rest)
 		return application.afterCommand("ok\n")
@@ -537,12 +603,12 @@ func executeApplication(application *applicationSession, line string) (string, b
 		if err != nil || id == 0 {
 			return "error statusclick needs a positive numeric item ID\n", false
 		}
-		button := ui.PointerButtonPrimary
+		button := gfx.PointerButtonPrimary
 		if len(fields) == 2 {
 			switch fields[1] {
 			case "primary":
 			case "secondary":
-				button = ui.PointerButtonSecondary
+				button = gfx.PointerButtonSecondary
 			default:
 				return "error statusclick button is primary or secondary\n", false
 			}
