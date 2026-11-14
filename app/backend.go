@@ -34,6 +34,7 @@ type HostedBackend interface {
 // Functions run on the backend's serial event-loop thread unless documented
 // otherwise by the corresponding public app API.
 type BackendServices struct {
+	PreventSleep           func(reason string) (release func(), err error)
 	Capabilities           func() Capabilities
 	ClipboardFiles         func() ([]string, error)
 	SetClipboardFiles      func(paths []string) error
