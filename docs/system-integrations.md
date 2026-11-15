@@ -174,3 +174,7 @@ the returned transport uses `SystemProxy`. A single `SystemProxy` URL cannot
 encode automatic failover. Host wrappers must preserve configured proxy policy,
 request cancellation and the body, and must not replay requests already sent.
 Registration opens no connection; its release function removes only that binding.
+
+Clients created before host startup select the current wrapper on each request,
+reusing its transport and connection pools. Replacing or releasing the binding
+closes retired idle connections; requests already in progress keep their transport.
