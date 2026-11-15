@@ -165,3 +165,12 @@ the full lifecycle table.
 windows. Terminal text input keeps the native contract: `TextInput.KeyReleases`
 delivers matching press/release pairs, `AltSendsEscape` is honoured, and the
 page releases held keys when it loses the keyboard or becomes hidden.
+
+
+External hosts may register `app/proxy.UseTransport` alongside `UseResolver` to
+apply an ordered proxy policy. Construct clients with `proxy.WrapTransport(nil)`,
+or pass a configured clone of `http.DefaultTransport`. Without a host wrapper,
+the returned transport uses `SystemProxy`. A single `SystemProxy` URL cannot
+encode automatic failover. Host wrappers must preserve configured proxy policy,
+request cancellation and the body, and must not replay requests already sent.
+Registration opens no connection; its release function removes only that binding.

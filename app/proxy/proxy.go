@@ -1,7 +1,7 @@
 // Package proxy reads the desktop's proxy settings. It is a package of its own
 // rather than part of app so that an application which never asks for a proxy
-// does not link net/http and its TLS stack: SystemProxy is the only entry, and
-// the environment answer is net/http's own.
+// does not link net/http and its TLS stack. SystemProxy returns one endpoint;
+// WrapTransport also supports a registered host's ordered failover policy.
 package proxy
 
 import (
