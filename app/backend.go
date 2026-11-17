@@ -145,12 +145,16 @@ type BackendApplicationStart = platform.ApplicationStart
 type BackendWindow = platform.Window
 type BackendStatusItem = platform.StatusItem
 type BackendStatusItemConfig = platform.StatusItemConfig
+type BackendMenuBarMenu = platform.MenuBarMenu
+type BackendMenuBarItem = platform.MenuBarItem
 
 const (
 	BackendPointerDown        = platform.PointerDown
 	BackendPointerMove        = platform.PointerMove
 	BackendPointerUp          = platform.PointerUp
 	BackendPointerExit        = platform.PointerExit
+	BackendPointerCancel      = platform.PointerCancel
+	BackendWindowPreview      = platform.WindowPreview
 	BackendTextSetSelection   = platform.TextSetSelection
 	BackendTextSelectAll      = platform.TextSelectAll
 	BackendTextInsert         = platform.TextInsert
